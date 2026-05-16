@@ -56,7 +56,7 @@ async function mockRuntimeAndRpc(page: Page) {
   let settingsSnapshot = { ...SETTINGS_SNAPSHOT };
   const settingsSetPayloads: Record<string, unknown>[] = [];
 
-  await page.route("**/api/runtime", async (route) => {
+  await page.route(/\/api\/runtime\/?(?:\?.*)?$/, async (route) => {
     await route.fulfill({
       contentType: "application/json; charset=utf-8",
       body: JSON.stringify({
@@ -72,7 +72,7 @@ async function mockRuntimeAndRpc(page: Page) {
     });
   });
 
-  await page.route("**/api/rpc", async (route) => {
+  await page.route(/\/api\/rpc\/?(?:\?.*)?$/, async (route) => {
     const payload = route.request().postDataJSON();
     const method = typeof payload?.method === "string" ? payload.method : "";
     const id = payload?.id ?? 1;
@@ -168,6 +168,30 @@ test("temporary Codex CLI guide close survives a hard reload in the same tab", a
   await expect(
     page.getByRole("heading", { name: "Codex CLI 首次接入引导" }),
   ).not.toBeVisible();
+});
+
+test("collapsed sidebar brand uses the app title", async ({ page }) => {
+  await mockRuntimeAndRpc(page);
+  await page.addInitScript(() => {
+    window.sessionStorage.setItem("codexmanager.codexCliGuide.sessionDismissed", "1");
+  });
+
+  await page.goto("/");
+  const brandButton = page.getByRole("button", {
+    name: "重新打开 Codex CLI 引导",
+  });
+  await expect(brandButton).toHaveAttribute("title", "重新打开 Codex CLI 引导");
+
+  await page.getByRole("button", { name: "收起侧边栏" }).click();
+
+  await expect(page.getByRole("button", { name: "CodexManager" })).toHaveAttribute(
+    "title",
+    "CodexManager",
+  );
+  await expect(page.getByRole("button", { name: "展开侧边栏" })).toHaveAttribute(
+    "title",
+    "展开侧边栏",
+  );
 });
 
 test("checking don't show again persists the guide dismissal before reload", async ({

@@ -75,6 +75,7 @@ const NavItem = memo(({
     title={itemName}
     className={cn(
       "flex items-center gap-3 rounded-lg px-3 py-2 transition-all duration-200 hover:bg-accent hover:text-accent-foreground",
+      !isSidebarOpen && "justify-center px-0",
       isActive ? "bg-accent text-accent-foreground" : "text-muted-foreground"
     )}
   >
@@ -110,6 +111,8 @@ export function Sidebar() {
   const { isDesktopRuntime } = useRuntimeCapabilities();
   const { data: session, isLoading: isSessionLoading } = useAppSession();
   const role = resolveSessionRole(session, isSessionLoading, isDesktopRuntime);
+  const brandTitle = isSidebarOpen ? t("重新打开 Codex CLI 引导") : "CodexManager";
+  const toggleTitle = isSidebarOpen ? t("收起侧边栏") : t("展开侧边栏");
   const routeAccess = useMemo(
     () => ({ role, mode: session?.mode ?? null }),
     [role, session?.mode],
@@ -183,14 +186,22 @@ export function Sidebar() {
         isSidebarOpen ? "w-56" : "w-16"
       )}
     >
-      <div className="flex h-16 items-center border-b px-4 shrink-0">
+      <div
+        className={cn(
+          "flex h-16 items-center border-b shrink-0",
+          isSidebarOpen ? "px-4" : "px-2"
+        )}
+      >
         <Button
           type="button"
           variant="ghost"
           onClick={openCodexCliGuide}
-          title={t("重新打开 Codex CLI 引导")}
-          aria-label={t("重新打开 Codex CLI 引导")}
-          className="flex h-auto w-full items-center gap-2 overflow-hidden rounded-xl px-2 py-1.5 text-left transition-colors duration-200 hover:bg-accent/60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/60"
+          title={brandTitle}
+          aria-label={brandTitle}
+          className={cn(
+            "flex h-auto w-full items-center gap-2 overflow-hidden rounded-xl px-2 py-1.5 transition-colors duration-200 hover:bg-accent/60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/60",
+            isSidebarOpen ? "text-left" : "justify-center"
+          )}
         >
           <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-primary text-primary-foreground">
             <span className="text-sm font-bold">CM</span>
@@ -215,6 +226,8 @@ export function Sidebar() {
           variant="ghost"
           size="icon"
           className="w-full justify-start gap-3 px-3 h-10"
+          title={toggleTitle}
+          aria-label={toggleTitle}
           onClick={toggleSidebar}
         >
           {isSidebarOpen ? (

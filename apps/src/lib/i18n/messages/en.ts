@@ -73,6 +73,7 @@ export const EN_MESSAGES: MessageCatalog = {
   我知道了: "Got it",
   "账号池 · 用量管理": "Account Pool · Usage Management",
   收起侧边栏: "Collapse Sidebar",
+  展开侧边栏: "Expand Sidebar",
   基础设置: "Basic settings",
   控制应用启动和窗口行为: "Control startup and window behavior.",
   自动检查更新: "Check updates automatically",
