@@ -676,6 +676,7 @@ fn chat_completions_reader_converts_responses_sse_to_chat_sse() {
     let mut out = String::new();
     reader.read_to_string(&mut out).expect("read chat sse");
     assert!(out.contains("\"object\":\"chat.completion.chunk\""));
+    assert!(out.contains("\"role\":\"assistant\""));
     assert!(out.contains("\"content\":\"你\""));
     assert!(out.contains("\"content\":\"好\""));
     assert!(out.contains("\"finish_reason\":\"stop\""));
@@ -731,6 +732,57 @@ fn chat_completions_reader_dedupes_partial_image_and_done_image() {
 
     assert_eq!(out.matches("data:image/png;base64,aGVsbG8=").count(), 1);
     assert!(out.contains("data: [DONE]"));
+}
+
+#[test]
+fn chat_completions_reader_converts_function_call_to_tool_calls() {
+    let sse = concat!(
+        "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"get_answer\",\"arguments\":\"\"}}\n\n",
+        "data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":0,\"delta\":\"{\\\"question\\\":\\\"2+2\\\"}\"}\n\n",
+        "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"get_answer\",\"arguments\":\"{\\\"question\\\":\\\"2+2\\\"}\"}}\n\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_tool_1\",\"model\":\"gpt-5.4\",\"created\":1775900000,\"usage\":{\"input_tokens\":4,\"output_tokens\":1,\"total_tokens\":5}}}\n\n",
+        "data: [DONE]\n\n"
+    );
+    let response = open_mock_http_response("text/event-stream", sse);
+    let collector = Arc::new(Mutex::new(PassthroughSseCollector::default()));
+    let mut reader = ChatCompletionsFromResponsesSseReader::new(
+        response,
+        Arc::clone(&collector),
+        std::time::Instant::now(),
+    );
+    let mut out = String::new();
+    reader.read_to_string(&mut out).expect("read chat sse");
+
+    assert!(out.contains("\"role\":\"assistant\""));
+    assert!(out.contains("\"tool_calls\""));
+    assert!(out.contains("\"id\":\"call_1\""));
+    assert!(out.contains("\"name\":\"get_answer\""));
+    assert!(out.contains("\"arguments\":\"{\\\"question\\\":\\\"2+2\\\"}\""));
+    assert!(out.contains("\"finish_reason\":\"tool_calls\""));
+    assert!(out.contains("data: [DONE]"));
+}
+
+#[test]
+fn chat_completions_reader_uses_done_arguments_when_delta_is_missing() {
+    let sse = concat!(
+        "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"get_answer\",\"arguments\":\"\"}}\n\n",
+        "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"get_answer\",\"arguments\":\"{\\\"question\\\":\\\"2+2\\\"}\"}}\n\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_tool_1\",\"model\":\"gpt-5.4\",\"created\":1775900000}}\n\n",
+        "data: [DONE]\n\n"
+    );
+    let response = open_mock_http_response("text/event-stream", sse);
+    let collector = Arc::new(Mutex::new(PassthroughSseCollector::default()));
+    let mut reader = ChatCompletionsFromResponsesSseReader::new(
+        response,
+        Arc::clone(&collector),
+        std::time::Instant::now(),
+    );
+    let mut out = String::new();
+    reader.read_to_string(&mut out).expect("read chat sse");
+
+    assert!(out.contains("\"id\":\"call_1\""));
+    assert!(out.contains("\"arguments\":\"{\\\"question\\\":\\\"2+2\\\"}\""));
+    assert!(out.contains("\"finish_reason\":\"tool_calls\""));
 }
 
 #[test]

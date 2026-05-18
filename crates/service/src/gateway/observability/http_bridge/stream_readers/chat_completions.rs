@@ -7,7 +7,7 @@ use super::{
     UpstreamSseFramePumpItem,
 };
 use serde_json::Value;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 pub(crate) struct ChatCompletionsFromResponsesSseReader {
@@ -18,7 +18,11 @@ pub(crate) struct ChatCompletionsFromResponsesSseReader {
     last_upstream_activity: Instant,
     saw_upstream_frame: bool,
     finished: bool,
+    emitted_assistant_role: bool,
     emitted_text: bool,
+    emitted_tool_calls: bool,
+    emitted_tool_call_indices: HashSet<usize>,
+    tool_call_arguments: HashMap<usize, String>,
     emitted_image_urls: HashSet<String>,
     id: Option<String>,
     model: Option<String>,
@@ -39,7 +43,11 @@ impl ChatCompletionsFromResponsesSseReader {
             last_upstream_activity: Instant::now(),
             saw_upstream_frame: false,
             finished: false,
+            emitted_assistant_role: false,
             emitted_text: false,
+            emitted_tool_calls: false,
+            emitted_tool_call_indices: HashSet::new(),
+            tool_call_arguments: HashMap::new(),
             emitted_image_urls: HashSet::new(),
             id: None,
             model: None,
@@ -162,9 +170,152 @@ impl ChatCompletionsFromResponsesSseReader {
                 "total_tokens": collector.usage.total_tokens.unwrap_or(0)
             })
         });
-        let mut out = self.chunk(serde_json::json!({}), Some("stop"), usage);
+        let finish_reason = if self.emitted_tool_calls {
+            "tool_calls"
+        } else {
+            "stop"
+        };
+        let mut out = self.chunk(serde_json::json!({}), Some(finish_reason), usage);
         out.extend_from_slice(b"data: [DONE]\n\n");
         out
+    }
+
+    fn assistant_delta_chunk(&mut self, mut delta: Value) -> Vec<u8> {
+        if !self.emitted_assistant_role {
+            if let Some(object) = delta.as_object_mut() {
+                object.insert("role".to_string(), serde_json::json!("assistant"));
+            }
+            self.emitted_assistant_role = true;
+        }
+        self.chunk(delta, None, None)
+    }
+
+    fn output_index(value: &Value) -> usize {
+        value
+            .get("output_index")
+            .and_then(Value::as_u64)
+            .unwrap_or(0) as usize
+    }
+
+    fn function_call_item(value: &Value) -> Option<&Value> {
+        let item = value.get("item").or_else(|| value.get("output_item"))?;
+        if item.get("type").and_then(Value::as_str) == Some("function_call") {
+            Some(item)
+        } else {
+            None
+        }
+    }
+
+    fn tool_call_added_chunk(&mut self, value: &Value) -> Option<Vec<u8>> {
+        let item = Self::function_call_item(value)?;
+        let index = Self::output_index(value);
+        let call_id = item
+            .get("call_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let name = item.get("name").and_then(Value::as_str).unwrap_or_default();
+        let arguments = item
+            .get("arguments")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        self.emitted_tool_calls = true;
+        self.emitted_tool_call_indices.insert(index);
+        self.tool_call_arguments
+            .entry(index)
+            .or_insert_with(|| arguments.to_string());
+        Some(self.assistant_delta_chunk(serde_json::json!({
+            "tool_calls": [{
+                "index": index,
+                "id": call_id,
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "arguments": arguments
+                }
+            }]
+        })))
+    }
+
+    fn tool_call_arguments_delta_chunk(&mut self, value: &Value) -> Option<Vec<u8>> {
+        let delta = value.get("delta").and_then(Value::as_str)?;
+        let index = Self::output_index(value);
+        self.emitted_tool_calls = true;
+        self.tool_call_arguments
+            .entry(index)
+            .or_default()
+            .push_str(delta);
+        Some(self.assistant_delta_chunk(serde_json::json!({
+            "tool_calls": [{
+                "index": index,
+                "function": {
+                    "arguments": delta
+                }
+            }]
+        })))
+    }
+
+    fn tool_call_arguments_done_chunk(&mut self, value: &Value) -> Option<Vec<u8>> {
+        let arguments = value.get("arguments").and_then(Value::as_str)?;
+        let index = Self::output_index(value);
+        self.remaining_tool_call_arguments_chunk(index, arguments)
+    }
+
+    fn tool_call_done_chunk(&mut self, value: &Value) -> Option<Vec<u8>> {
+        let index = Self::output_index(value);
+        if self.emitted_tool_call_indices.contains(&index) {
+            let item = Self::function_call_item(value)?;
+            let arguments = item.get("arguments").and_then(Value::as_str)?;
+            return self.remaining_tool_call_arguments_chunk(index, arguments);
+        }
+        self.tool_call_added_chunk(value)
+    }
+
+    fn remaining_tool_call_arguments_chunk(
+        &mut self,
+        index: usize,
+        arguments: &str,
+    ) -> Option<Vec<u8>> {
+        let accumulated = self.tool_call_arguments.entry(index).or_default();
+        let remaining = arguments
+            .strip_prefix(accumulated.as_str())
+            .unwrap_or(arguments);
+        if remaining.is_empty() {
+            return None;
+        }
+        accumulated.push_str(remaining);
+        self.emitted_tool_calls = true;
+        Some(self.assistant_delta_chunk(serde_json::json!({
+            "tool_calls": [{
+                "index": index,
+                "function": {
+                    "arguments": remaining
+                }
+            }]
+        })))
+    }
+
+    fn completed_tool_calls_chunk(&mut self, response: &Value) -> Option<Vec<u8>> {
+        let output = response.get("output").and_then(Value::as_array)?;
+        let mut out = Vec::new();
+        for (index, item) in output.iter().enumerate() {
+            if item.get("type").and_then(Value::as_str) != Some("function_call") {
+                continue;
+            }
+            if self.emitted_tool_call_indices.contains(&index) {
+                continue;
+            }
+            if let Some(chunk) = self.tool_call_added_chunk(&serde_json::json!({
+                "output_index": index,
+                "item": item
+            })) {
+                out.extend(chunk);
+            }
+        }
+        if out.is_empty() {
+            None
+        } else {
+            Some(out)
+        }
     }
 
     fn image_delta_chunk(&mut self, value: &Value) -> Option<Vec<u8>> {
@@ -177,14 +328,7 @@ impl ChatCompletionsFromResponsesSseReader {
         if images.is_empty() {
             None
         } else {
-            Some(self.chunk(
-                serde_json::json!({
-                    "role": "assistant",
-                    "images": images
-                }),
-                None,
-                None,
-            ))
+            Some(self.assistant_delta_chunk(serde_json::json!({ "images": images })))
         }
     }
 
@@ -223,11 +367,14 @@ impl ChatCompletionsFromResponsesSseReader {
                     collect_response_output_text(response, &mut text);
                 }
                 if !text.is_empty() {
-                    out.extend(self.chunk(serde_json::json!({ "content": text }), None, None));
+                    out.extend(self.assistant_delta_chunk(serde_json::json!({ "content": text })));
                     self.emitted_text = true;
                 }
             }
             if let Some(response) = value.get("response") {
+                if let Some(tool_calls) = self.completed_tool_calls_chunk(response) {
+                    out.extend(tool_calls);
+                }
                 if let Some(images) = self.image_delta_chunk(response) {
                     out.extend(images);
                 }
@@ -238,8 +385,26 @@ impl ChatCompletionsFromResponsesSseReader {
             return Some(out);
         }
         if event_type.as_deref() == Some("response.output_item.done") {
+            if let Some(tool_call) = self.tool_call_done_chunk(&value) {
+                return Some(tool_call);
+            }
             if let Some(images) = self.image_delta_chunk(&value) {
                 return Some(images);
+            }
+        }
+        if event_type.as_deref() == Some("response.output_item.added") {
+            if let Some(tool_call) = self.tool_call_added_chunk(&value) {
+                return Some(tool_call);
+            }
+        }
+        if event_type.as_deref() == Some("response.function_call_arguments.delta") {
+            if let Some(tool_call) = self.tool_call_arguments_delta_chunk(&value) {
+                return Some(tool_call);
+            }
+        }
+        if event_type.as_deref() == Some("response.function_call_arguments.done") {
+            if let Some(tool_call) = self.tool_call_arguments_done_chunk(&value) {
+                return Some(tool_call);
             }
         }
         if event_type.as_deref() == Some("response.image_generation_call.partial_image") {
@@ -254,7 +419,7 @@ impl ChatCompletionsFromResponsesSseReader {
         }
         if !text.is_empty() {
             self.emitted_text = true;
-            return Some(self.chunk(serde_json::json!({ "content": text }), None, None));
+            return Some(self.assistant_delta_chunk(serde_json::json!({ "content": text })));
         }
         None
     }
