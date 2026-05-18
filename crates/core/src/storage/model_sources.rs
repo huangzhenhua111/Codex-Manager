@@ -286,4 +286,25 @@ impl Storage {
         )?;
         Ok(())
     }
+
+    pub fn delete_model_source_routes_for_source(
+        &self,
+        source_kind: &str,
+        source_id: &str,
+    ) -> Result<()> {
+        let source_kind = normalize_text(source_kind);
+        let source_id = normalize_text(source_id);
+        if source_kind.is_empty() || source_id.is_empty() {
+            return Ok(());
+        }
+        self.conn.execute(
+            "DELETE FROM model_source_mappings WHERE source_kind = ?1 AND source_id = ?2",
+            params![&source_kind, &source_id],
+        )?;
+        self.conn.execute(
+            "DELETE FROM model_source_models WHERE source_kind = ?1 AND source_id = ?2",
+            params![&source_kind, &source_id],
+        )?;
+        Ok(())
+    }
 }
