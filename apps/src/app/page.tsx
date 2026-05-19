@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState, type WheelEvent as ReactWheelEvent } from "react";
 import { useQuery } from "@tanstack/react-query";
 import {
   Activity,
@@ -41,7 +41,16 @@ import {
   EmptyMedia,
   EmptyTitle,
 } from "@/components/ui/empty";
+import { Input } from "@/components/ui/input";
 import { Progress } from "@/components/ui/progress";
+import {
+  Select,
+  SelectContent,
+  SelectGroup,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { Skeleton } from "@/components/ui/skeleton";
 import {
   Table,
@@ -54,6 +63,7 @@ import {
 import { useDashboardStats } from "@/hooks/useDashboardStats";
 import { useDashboardAdminUsageSummary } from "@/hooks/useDashboardAdminUsageSummary";
 import { resolveSessionRole, useAppSession } from "@/hooks/useAppSession";
+import { useLocalDayRange } from "@/hooks/useLocalDayRange";
 import { useMemberDashboardSummary } from "@/hooks/useMemberDashboardSummary";
 import { usePageTransitionReady } from "@/hooks/usePageTransitionReady";
 import { useRuntimeCapabilities } from "@/hooks/useRuntimeCapabilities";
@@ -119,6 +129,71 @@ interface AccountHighlightCardProps {
   progressValue?: number | null | undefined;
 }
 
+type AdminUsageRangePreset = "7d" | "14d" | "30d" | "custom";
+
+interface AdminUsageRangeValue {
+  startTs: number | null;
+  endTs: number | null;
+  startInput: string;
+  endInput: string;
+}
+
+function formatDateInputValue(date: Date): string {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
+function formatDateInputValueFromSeconds(value: number): string {
+  const date = new Date(value * 1000);
+  if (Number.isNaN(date.getTime())) return "";
+  return formatDateInputValue(date);
+}
+
+function parseDateInputStartTs(value: string): number | null {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value.trim());
+  if (!match) return null;
+  const [, year, month, day] = match;
+  const date = new Date(Number(year), Number(month) - 1, Number(day), 0, 0, 0, 0);
+  if (Number.isNaN(date.getTime())) return null;
+  return Math.floor(date.getTime() / 1000);
+}
+
+function parseDateInputEndTs(value: string): number | null {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value.trim());
+  if (!match) return null;
+  const [, year, month, day] = match;
+  const date = new Date(Number(year), Number(month) - 1, Number(day) + 1, 0, 0, 0, 0);
+  if (Number.isNaN(date.getTime())) return null;
+  return Math.floor(date.getTime() / 1000);
+}
+
+function buildAdminUsagePresetRange(
+  preset: Exclude<AdminUsageRangePreset, "custom">,
+  localDayStartTs: number,
+  localDayEndTs: number,
+): AdminUsageRangeValue {
+  const days = preset === "14d" ? 14 : preset === "30d" ? 30 : 7;
+  const todayStart = new Date(localDayStartTs * 1000);
+  const startDate = new Date(
+    todayStart.getFullYear(),
+    todayStart.getMonth(),
+    todayStart.getDate() - (days - 1),
+    0,
+    0,
+    0,
+    0,
+  );
+
+  return {
+    startTs: Math.floor(startDate.getTime() / 1000),
+    endTs: localDayEndTs,
+    startInput: formatDateInputValue(startDate),
+    endInput: formatDateInputValueFromSeconds(Math.max(localDayStartTs, localDayEndTs - 1)),
+  };
+}
+
 function formatUsd(value: number | null | undefined): string {
   const normalized =
     typeof value === "number" && Number.isFinite(value) ? Math.max(0, value) : 0;
@@ -148,6 +223,16 @@ function formatShortDate(value: number | null | undefined): string {
     month: "2-digit",
     day: "2-digit",
   }).format(date);
+}
+
+function formatShortDateRange(
+  startTs: number | null | undefined,
+  endTsExclusive: number | null | undefined,
+): string {
+  if (!startTs || !endTsExclusive || endTsExclusive <= startTs) {
+    return "--";
+  }
+  return `${formatShortDate(startTs)} - ${formatShortDate(endTsExclusive - 1)}`;
 }
 
 function formatDuration(value: number | null | undefined): string {
@@ -338,12 +423,44 @@ function sourceUsageName(item: DashboardSourceUsageSummary): string {
   return item.name || item.sourceId;
 }
 
+function sumDashboardTokenUsages(usages: DashboardTokenUsage[]): DashboardTokenUsage {
+  return usages.reduce<DashboardTokenUsage>(
+    (total, usage) => ({
+      inputTokens: total.inputTokens + usage.inputTokens,
+      cachedInputTokens: total.cachedInputTokens + usage.cachedInputTokens,
+      outputTokens: total.outputTokens + usage.outputTokens,
+      reasoningOutputTokens:
+        total.reasoningOutputTokens + usage.reasoningOutputTokens,
+      totalTokens: total.totalTokens + usage.totalTokens,
+      estimatedCostUsd: total.estimatedCostUsd + usage.estimatedCostUsd,
+      requestCount: total.requestCount + usage.requestCount,
+      successCount: total.successCount + usage.successCount,
+      errorCount: total.errorCount + usage.errorCount,
+    }),
+    {
+      inputTokens: 0,
+      cachedInputTokens: 0,
+      outputTokens: 0,
+      reasoningOutputTokens: 0,
+      totalTokens: 0,
+      estimatedCostUsd: 0,
+      requestCount: 0,
+      successCount: 0,
+      errorCount: 0,
+    },
+  );
+}
+
 function DailyTokenLineChart({
   points,
   className,
+  zoomWindow,
+  onZoomWindowChange,
 }: {
   points: DashboardDailyUsagePoint[];
   className?: string;
+  zoomWindow?: { startIndex: number; endIndex: number } | null;
+  onZoomWindowChange?: (next: { startIndex: number; endIndex: number } | null) => void;
 }) {
   const chartConfig = {
     totalTokens: {
@@ -357,91 +474,157 @@ function DailyTokenLineChart({
     estimatedCostUsd: item.usage.estimatedCostUsd,
     requestCount: item.usage.requestCount,
   }));
+  const normalizedZoomWindow = useMemo(() => {
+    if (chartData.length === 0) return null;
+    const startIndex = Math.max(
+      0,
+      Math.min(zoomWindow?.startIndex ?? 0, chartData.length - 1),
+    );
+    const endIndex = Math.max(
+      startIndex,
+      Math.min(zoomWindow?.endIndex ?? chartData.length - 1, chartData.length - 1),
+    );
+    return { startIndex, endIndex };
+  }, [chartData.length, zoomWindow?.endIndex, zoomWindow?.startIndex]);
+  const visibleStartIndex = normalizedZoomWindow?.startIndex ?? 0;
+  const visibleEndIndex = normalizedZoomWindow?.endIndex ?? Math.max(0, chartData.length - 1);
+  const visibleChartData = useMemo(
+    () => chartData.slice(visibleStartIndex, visibleEndIndex + 1),
+    [chartData, visibleEndIndex, visibleStartIndex],
+  );
+
+  const handleWheelZoom = (event: ReactWheelEvent<HTMLDivElement>) => {
+    if (!onZoomWindowChange || chartData.length <= 2) {
+      return;
+    }
+    event.preventDefault();
+
+    const currentCount = visibleEndIndex - visibleStartIndex + 1;
+    const minCount = Math.min(3, chartData.length);
+    const step = Math.max(1, Math.round(currentCount * 0.2));
+    const nextCount =
+      event.deltaY < 0
+        ? Math.max(minCount, currentCount - step)
+        : Math.min(chartData.length, currentCount + step);
+    if (nextCount === currentCount) {
+      return;
+    }
+
+    const bounds = event.currentTarget.getBoundingClientRect();
+    const ratio =
+      bounds.width > 0
+        ? Math.min(Math.max((event.clientX - bounds.left) / bounds.width, 0), 1)
+        : 0.5;
+    const focalIndex = visibleStartIndex + Math.round((currentCount - 1) * ratio);
+
+    let nextStartIndex = focalIndex - Math.floor((nextCount - 1) * ratio);
+    let nextEndIndex = nextStartIndex + nextCount - 1;
+
+    if (nextStartIndex < 0) {
+      nextStartIndex = 0;
+      nextEndIndex = nextCount - 1;
+    }
+    if (nextEndIndex > chartData.length - 1) {
+      nextEndIndex = chartData.length - 1;
+      nextStartIndex = Math.max(0, nextEndIndex - nextCount + 1);
+    }
+
+    onZoomWindowChange({
+      startIndex: nextStartIndex,
+      endIndex: nextEndIndex,
+    });
+  };
 
   return (
-    <ChartContainer
-      config={chartConfig}
-      className={cn("h-64 w-full rounded-xl bg-background/30 p-3", className)}
-      initialDimension={{ width: 720, height: 256 }}
+    <div
+      className="rounded-xl"
+      onWheel={handleWheelZoom}
+      title="在图表区域使用鼠标滚轮缩放时间区间"
     >
-      <AreaChart
-        accessibilityLayer
-        data={chartData}
-        margin={{ top: 18, right: 14, left: 10, bottom: 4 }}
+      <ChartContainer
+        config={chartConfig}
+        className={cn("h-64 w-full rounded-xl bg-background/30 p-3", className)}
+        initialDimension={{ width: 720, height: 256 }}
       >
-        <defs>
-          <linearGradient id="fillTotalTokens" x1="0" y1="0" x2="0" y2="1">
-            <stop
-              offset="5%"
-              stopColor="var(--color-totalTokens)"
-              stopOpacity={0.32}
-            />
-            <stop
-              offset="95%"
-              stopColor="var(--color-totalTokens)"
-              stopOpacity={0.03}
-            />
-          </linearGradient>
-        </defs>
-        <CartesianGrid vertical={false} strokeDasharray="4 8" />
-        <XAxis
-          dataKey="date"
-          tickLine={false}
-          axisLine={false}
-          tickMargin={10}
-          minTickGap={18}
-        />
-        <YAxis
-          tickLine={false}
-          axisLine={false}
-          tickMargin={10}
-          width={44}
-          tickFormatter={(value) => formatCompactTokenAmount(Number(value))}
-        />
-        <ChartTooltip
-          cursor={false}
-          content={
-            <ChartTooltipContent
-              indicator="line"
-              labelFormatter={(value) => value}
-              formatter={(value, name, item) => {
-                const row = item.payload as {
-                  estimatedCostUsd?: number;
-                  requestCount?: number;
-                };
-                return (
-                  <div className="grid min-w-36 gap-1">
-                    <div className="flex items-center justify-between gap-3">
-                      <span className="text-muted-foreground">{String(name)}</span>
-                      <span className="font-mono font-medium text-foreground">
-                        {formatCompactTokenAmount(Number(value))}
-                      </span>
+        <AreaChart
+          accessibilityLayer
+          data={visibleChartData}
+          margin={{ top: 18, right: 14, left: 10, bottom: 4 }}
+        >
+          <defs>
+            <linearGradient id="fillTotalTokens" x1="0" y1="0" x2="0" y2="1">
+              <stop
+                offset="5%"
+                stopColor="var(--color-totalTokens)"
+                stopOpacity={0.32}
+              />
+              <stop
+                offset="95%"
+                stopColor="var(--color-totalTokens)"
+                stopOpacity={0.03}
+              />
+            </linearGradient>
+          </defs>
+          <CartesianGrid vertical={false} strokeDasharray="4 8" />
+          <XAxis
+            dataKey="date"
+            tickLine={false}
+            axisLine={false}
+            tickMargin={10}
+            minTickGap={18}
+          />
+          <YAxis
+            tickLine={false}
+            axisLine={false}
+            tickMargin={10}
+            width={44}
+            tickFormatter={(value) => formatCompactTokenAmount(Number(value))}
+          />
+          <ChartTooltip
+            cursor={false}
+            content={
+              <ChartTooltipContent
+                indicator="line"
+                labelFormatter={(value) => value}
+                formatter={(value, name, item) => {
+                  const row = item.payload as {
+                    estimatedCostUsd?: number;
+                    requestCount?: number;
+                  };
+                  return (
+                    <div className="grid min-w-36 gap-1">
+                      <div className="flex items-center justify-between gap-3">
+                        <span className="text-muted-foreground">{String(name)}</span>
+                        <span className="font-mono font-medium text-foreground">
+                          {formatCompactTokenAmount(Number(value))}
+                        </span>
+                      </div>
+                      <div className="flex items-center justify-between gap-3 text-muted-foreground">
+                        <span>Cost</span>
+                        <span>{formatUsd(row.estimatedCostUsd)}</span>
+                      </div>
+                      <div className="flex items-center justify-between gap-3 text-muted-foreground">
+                        <span>Requests</span>
+                        <span>{row.requestCount ?? 0}</span>
+                      </div>
                     </div>
-                    <div className="flex items-center justify-between gap-3 text-muted-foreground">
-                      <span>Cost</span>
-                      <span>{formatUsd(row.estimatedCostUsd)}</span>
-                    </div>
-                    <div className="flex items-center justify-between gap-3 text-muted-foreground">
-                      <span>Requests</span>
-                      <span>{row.requestCount ?? 0}</span>
-                    </div>
-                  </div>
-                );
-              }}
-            />
-          }
-        />
-        <Area
-          dataKey="totalTokens"
-          type="monotone"
-          fill="url(#fillTotalTokens)"
-          stroke="var(--color-totalTokens)"
-          strokeWidth={3}
-          dot={{ r: 4, strokeWidth: 2, fill: "var(--background)" }}
-          activeDot={{ r: 6, strokeWidth: 2 }}
-        />
-      </AreaChart>
-    </ChartContainer>
+                  );
+                }}
+              />
+            }
+          />
+          <Area
+            dataKey="totalTokens"
+            type="monotone"
+            fill="url(#fillTotalTokens)"
+            stroke="var(--color-totalTokens)"
+            strokeWidth={3}
+            dot={{ r: 4, strokeWidth: 2, fill: "var(--background)" }}
+            activeDot={{ r: 6, strokeWidth: 2 }}
+          />
+        </AreaChart>
+      </ChartContainer>
+    </div>
   );
 }
 
@@ -450,11 +633,13 @@ function UsageRankList<T extends { todayUsage: DashboardTokenUsage; rangeUsage: 
   items,
   labelForItem,
   emptyText,
+  usageForItem = (item) => item.todayUsage,
 }: {
   title: string;
   items: T[];
   labelForItem: (item: T) => string;
   emptyText: string;
+  usageForItem?: (item: T) => DashboardTokenUsage;
 }) {
   return (
     <div className="min-w-0">
@@ -467,22 +652,25 @@ function UsageRankList<T extends { todayUsage: DashboardTokenUsage; rangeUsage: 
         </Empty>
       ) : (
         <div className="space-y-2">
-          {items.slice(0, 5).map((item, index) => (
-            <div
-              key={`${labelForItem(item)}-${index}`}
-              className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-3 rounded-lg bg-background/30 px-3 py-2 text-xs"
-            >
-              <div className="min-w-0">
-                <div className="truncate font-medium">{labelForItem(item)}</div>
-                <div className="truncate text-muted-foreground">
-                  {item.todayUsage.requestCount} req · {formatUsd(item.todayUsage.estimatedCostUsd)}
+          {items.slice(0, 5).map((item, index) => {
+            const usage = usageForItem(item);
+            return (
+              <div
+                key={`${labelForItem(item)}-${index}`}
+                className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-3 rounded-lg bg-background/30 px-3 py-2 text-xs"
+              >
+                <div className="min-w-0">
+                  <div className="truncate font-medium">{labelForItem(item)}</div>
+                  <div className="truncate text-muted-foreground">
+                    {usage.requestCount} req · {formatUsd(usage.estimatedCostUsd)}
+                  </div>
+                </div>
+                <div className="shrink-0 text-right font-semibold">
+                  {formatCompactTokenAmount(usage.totalTokens)}
                 </div>
               </div>
-              <div className="shrink-0 text-right font-semibold">
-                {formatCompactTokenAmount(item.todayUsage.totalTokens)}
-              </div>
-            </div>
-          ))}
+            );
+          })}
         </div>
       )}
     </div>
@@ -493,12 +681,44 @@ function AdminUsageAnalyticsCard({
   summary,
   isLoading,
   isError,
+  rangePreset,
+  rangeStartInput,
+  rangeEndInput,
+  onRangePresetChange,
+  onRangeStartInputChange,
+  onRangeEndInputChange,
+  onApplyCustomRange,
+  isCustomRangeInvalid,
 }: {
   summary: DashboardAdminUsageSummary | undefined;
   isLoading: boolean;
   isError: boolean;
+  rangePreset: AdminUsageRangePreset;
+  rangeStartInput: string;
+  rangeEndInput: string;
+  onRangePresetChange: (preset: AdminUsageRangePreset) => void;
+  onRangeStartInputChange: (value: string) => void;
+  onRangeEndInputChange: (value: string) => void;
+  onApplyCustomRange: () => void;
+  isCustomRangeInvalid: boolean;
 }) {
   const { t } = useI18n();
+  const [zoomWindow, setZoomWindow] = useState<{
+    startIndex: number;
+    endIndex: number;
+  } | null>(null);
+
+  useEffect(() => {
+    if (!summary?.dailyUsage.length) {
+      setZoomWindow(null);
+      return;
+    }
+    setZoomWindow({
+      startIndex: 0,
+      endIndex: summary.dailyUsage.length - 1,
+    });
+  }, [summary?.dailyUsage.length, summary?.rangeEndTs, summary?.rangeStartTs]);
+
   if (isLoading) {
     return <Skeleton className="h-[420px] w-full rounded-xl" />;
   }
@@ -545,71 +765,167 @@ function AdminUsageAnalyticsCard({
   const activeAggregateApis = summary.aggregateApis.filter(
     (item) => item.todayUsage.totalTokens > 0 || item.rangeUsage.totalTokens > 0,
   );
+  const isTodayOnlyRange =
+    summary.rangeStartTs === summary.todayStartTs &&
+    summary.rangeEndTs === summary.todayEndTs;
+  const rangeUsage = isTodayOnlyRange
+    ? summary.todayUsage
+    : sumDashboardTokenUsages(summary.dailyUsage.map((item) => item.usage));
+  const listUsageForItem = <T extends {
+    todayUsage: DashboardTokenUsage;
+    rangeUsage: DashboardTokenUsage;
+  }>(
+    item: T,
+  ) => (isTodayOnlyRange ? item.todayUsage : item.rangeUsage);
+  const hasZoomWindow =
+    summary.dailyUsage.length > 1 &&
+    zoomWindow != null &&
+    (zoomWindow.startIndex > 0 ||
+      zoomWindow.endIndex < summary.dailyUsage.length - 1);
+  const rangeBadgeLabel = isTodayOnlyRange ? t("今日") : t("所选区间");
 
   return (
     <Card className="glass-card overflow-hidden shadow-sm">
-      <CardHeader className="flex flex-row flex-wrap items-start justify-between gap-3">
-        <div>
-          <CardTitle className="flex items-center gap-2 text-base font-semibold">
-            <LineChart className="h-4 w-4 text-primary" />
-            {t("管理员用量分析")}
-          </CardTitle>
-          <p className="mt-1 text-xs text-muted-foreground">
-            {t("按天、成员、OpenAI 账号和聚合 API 汇总 token 消耗")}
-          </p>
-        </div>
-        <div className="rounded-lg bg-primary/10 px-3 py-2 text-right text-xs">
-          <div className="font-semibold text-primary">
-            {formatCompactTokenAmount(summary.todayUsage.totalTokens)}
+      <CardHeader className="flex flex-col gap-4">
+        <div className="flex flex-col gap-4 xl:flex-row xl:items-start xl:justify-between">
+          <div>
+            <CardTitle className="flex items-center gap-2 text-base font-semibold">
+              <LineChart className="h-4 w-4 text-primary" />
+              {t("管理员用量分析")}
+            </CardTitle>
+            <p className="mt-1 text-xs text-muted-foreground">
+              {t("按天、成员、OpenAI 账号和聚合 API 汇总 token 消耗")}
+            </p>
+            <div className="mt-2 text-[11px] text-muted-foreground">
+              {t("当前区间")} {formatShortDateRange(summary.rangeStartTs, summary.rangeEndTs)}
+              {" · "}
+              {t("图表区域支持鼠标滚轮缩放")}
+            </div>
           </div>
-          <div className="text-muted-foreground">{formatUsd(summary.todayUsage.estimatedCostUsd)}</div>
+          <div className="flex flex-col items-stretch gap-3 xl:items-end">
+            <div className="flex flex-wrap items-center gap-2">
+              <Select
+                value={rangePreset}
+                onValueChange={(value) =>
+                  onRangePresetChange(value as AdminUsageRangePreset)
+                }
+              >
+                <SelectTrigger className="w-[132px] bg-background/40">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectGroup>
+                    <SelectItem value="7d">{t("最近 7 天")}</SelectItem>
+                    <SelectItem value="14d">{t("最近 14 天")}</SelectItem>
+                    <SelectItem value="30d">{t("最近 30 天")}</SelectItem>
+                    <SelectItem value="custom">{t("自定义区间")}</SelectItem>
+                  </SelectGroup>
+                </SelectContent>
+              </Select>
+              <Input
+                type="date"
+                className="w-[144px] bg-background/40 text-xs"
+                value={rangeStartInput}
+                disabled={rangePreset !== "custom"}
+                onChange={(event) => onRangeStartInputChange(event.target.value)}
+              />
+              <Input
+                type="date"
+                className="w-[144px] bg-background/40 text-xs"
+                value={rangeEndInput}
+                disabled={rangePreset !== "custom"}
+                onChange={(event) => onRangeEndInputChange(event.target.value)}
+              />
+              <Button
+                size="sm"
+                variant="outline"
+                disabled={rangePreset !== "custom" || isCustomRangeInvalid}
+                onClick={onApplyCustomRange}
+              >
+                {t("应用")}
+              </Button>
+              {hasZoomWindow ? (
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={() =>
+                    setZoomWindow({
+                      startIndex: 0,
+                      endIndex: summary.dailyUsage.length - 1,
+                    })
+                  }
+                >
+                  {t("重置缩放")}
+                </Button>
+              ) : null}
+            </div>
+            <div className="rounded-lg bg-primary/10 px-3 py-2 text-right text-xs">
+              <div className="text-muted-foreground">{rangeBadgeLabel}</div>
+              <div className="font-semibold text-primary">
+                {formatCompactTokenAmount(rangeUsage.totalTokens)}
+              </div>
+              <div className="text-muted-foreground">{formatUsd(rangeUsage.estimatedCostUsd)}</div>
+            </div>
+          </div>
         </div>
       </CardHeader>
       <CardContent className="grid gap-5 xl:grid-cols-[minmax(0,1.35fr)_minmax(320px,0.9fr)]">
         <div className="space-y-3">
-          <DailyTokenLineChart points={summary.dailyUsage} />
+          <DailyTokenLineChart
+            points={summary.dailyUsage}
+            zoomWindow={zoomWindow}
+            onZoomWindowChange={setZoomWindow}
+          />
           <div className="grid gap-3 text-xs sm:grid-cols-3">
             <div className="rounded-lg bg-background/30 px-3 py-2">
-              <div className="text-muted-foreground">{t("今日请求")}</div>
+              <div className="text-muted-foreground">
+                {isTodayOnlyRange ? t("今日请求") : t("区间请求")}
+              </div>
               <div className="mt-1 font-semibold">
-                {summary.todayUsage.requestCount} · {t("成功")}{" "}
-                {summary.todayUsage.successCount}
+                {rangeUsage.requestCount} · {t("成功")} {rangeUsage.successCount}
               </div>
             </div>
             <div className="rounded-lg bg-background/30 px-3 py-2">
-              <div className="text-muted-foreground">{t("输入 / 输出")}</div>
+              <div className="text-muted-foreground">
+                {isTodayOnlyRange ? t("输入 / 输出") : t("区间输入 / 输出")}
+              </div>
               <div className="mt-1 font-semibold">
-                {formatCompactTokenAmount(summary.todayUsage.inputTokens)} /{" "}
-                {formatCompactTokenAmount(summary.todayUsage.outputTokens)}
+                {formatCompactTokenAmount(rangeUsage.inputTokens)} /{" "}
+                {formatCompactTokenAmount(rangeUsage.outputTokens)}
               </div>
             </div>
             <div className="rounded-lg bg-background/30 px-3 py-2">
-              <div className="text-muted-foreground">{t("缓存 / 推理")}</div>
+              <div className="text-muted-foreground">
+                {isTodayOnlyRange ? t("缓存 / 推理") : t("区间缓存 / 推理")}
+              </div>
               <div className="mt-1 font-semibold">
-                {formatCompactTokenAmount(summary.todayUsage.cachedInputTokens)} /{" "}
-                {formatCompactTokenAmount(summary.todayUsage.reasoningOutputTokens)}
+                {formatCompactTokenAmount(rangeUsage.cachedInputTokens)} /{" "}
+                {formatCompactTokenAmount(rangeUsage.reasoningOutputTokens)}
               </div>
             </div>
           </div>
         </div>
         <div className="grid gap-4">
           <UsageRankList
-            title={t("成员今日消耗")}
+            title={isTodayOnlyRange ? t("成员今日消耗") : t("成员区间消耗")}
             items={memberItems}
             labelForItem={userUsageName}
             emptyText={t("暂无成员消耗")}
+            usageForItem={listUsageForItem}
           />
           <UsageRankList
-            title={t("OpenAI 账号今日消耗")}
+            title={isTodayOnlyRange ? t("OpenAI 账号今日消耗") : t("OpenAI 账号区间消耗")}
             items={activeOpenAiAccounts}
             labelForItem={sourceUsageName}
             emptyText={t("暂无 OpenAI 账号消耗")}
+            usageForItem={listUsageForItem}
           />
           <UsageRankList
-            title={t("聚合 API 今日消耗")}
+            title={isTodayOnlyRange ? t("聚合 API 今日消耗") : t("聚合 API 区间消耗")}
             items={activeAggregateApis}
             labelForItem={sourceUsageName}
             emptyText={t("暂无聚合 API 消耗")}
+            usageForItem={listUsageForItem}
           />
         </div>
       </CardContent>
@@ -621,12 +937,48 @@ function AdminDashboard() {
   const { t } = useI18n();
   const { stats, currentAccount, recommendations, requestLogs, isLoading, isServiceReady } =
     useDashboardStats();
+  const localDayRange = useLocalDayRange();
+  const [adminUsageRangePreset, setAdminUsageRangePreset] =
+    useState<AdminUsageRangePreset>("7d");
+  const [adminUsageRangeStartInput, setAdminUsageRangeStartInput] = useState("");
+  const [adminUsageRangeEndInput, setAdminUsageRangeEndInput] = useState("");
+  const [adminUsageRangeParams, setAdminUsageRangeParams] =
+    useState<AdminUsageRangeValue>({
+      startTs: null,
+      endTs: null,
+      startInput: "",
+      endInput: "",
+    });
+
+  useEffect(() => {
+    if (adminUsageRangePreset === "custom") {
+      return;
+    }
+    const nextRange = buildAdminUsagePresetRange(
+      adminUsageRangePreset,
+      localDayRange.dayStartTs,
+      localDayRange.dayEndTs,
+    );
+    setAdminUsageRangeStartInput(nextRange.startInput);
+    setAdminUsageRangeEndInput(nextRange.endInput);
+    setAdminUsageRangeParams(nextRange);
+  }, [
+    adminUsageRangePreset,
+    localDayRange.dayEndTs,
+    localDayRange.dayStartTs,
+  ]);
+
   const {
     data: adminUsageSummary,
     isLoading: isAdminUsageLoading,
     isError: isAdminUsageError,
-  } =
-    useDashboardAdminUsageSummary(true);
+  } = useDashboardAdminUsageSummary(
+    {
+      startTs: adminUsageRangeParams.startTs,
+      endTs: adminUsageRangeParams.endTs,
+    },
+    true,
+  );
   const { data: quotaModelPools, isLoading: isQuotaModelPoolsLoading } = useQuery({
     queryKey: ["quota", "model-pools"],
     queryFn: () => quotaClient.modelPools(),
@@ -639,6 +991,13 @@ function AdminDashboard() {
   const poolSecondary = stats.poolRemain?.secondary ?? 0;
   const allModelPoolItems = quotaModelPools?.items ?? [];
   const modelPoolItems = allModelPoolItems.slice(0, 8);
+  const isCustomAdminUsageRangeInvalid =
+    adminUsageRangePreset === "custom" &&
+    (() => {
+      const startTs = parseDateInputStartTs(adminUsageRangeStartInput);
+      const endTs = parseDateInputEndTs(adminUsageRangeEndInput);
+      return startTs == null || endTs == null || endTs <= startTs;
+    })();
 
   return (
     <div className="space-y-6 animate-in fade-in duration-700">
@@ -714,6 +1073,39 @@ function AdminDashboard() {
         summary={adminUsageSummary}
         isLoading={isLoading || isAdminUsageLoading}
         isError={isAdminUsageError}
+        rangePreset={adminUsageRangePreset}
+        rangeStartInput={adminUsageRangeStartInput}
+        rangeEndInput={adminUsageRangeEndInput}
+        onRangePresetChange={(preset) => {
+          setAdminUsageRangePreset(preset);
+          if (preset === "custom") {
+            return;
+          }
+          const nextRange = buildAdminUsagePresetRange(
+            preset,
+            localDayRange.dayStartTs,
+            localDayRange.dayEndTs,
+          );
+          setAdminUsageRangeStartInput(nextRange.startInput);
+          setAdminUsageRangeEndInput(nextRange.endInput);
+          setAdminUsageRangeParams(nextRange);
+        }}
+        onRangeStartInputChange={setAdminUsageRangeStartInput}
+        onRangeEndInputChange={setAdminUsageRangeEndInput}
+        onApplyCustomRange={() => {
+          const startTs = parseDateInputStartTs(adminUsageRangeStartInput);
+          const endTs = parseDateInputEndTs(adminUsageRangeEndInput);
+          if (startTs == null || endTs == null || endTs <= startTs) {
+            return;
+          }
+          setAdminUsageRangeParams({
+            startTs,
+            endTs,
+            startInput: adminUsageRangeStartInput,
+            endInput: adminUsageRangeEndInput,
+          });
+        }}
+        isCustomRangeInvalid={isCustomAdminUsageRangeInvalid}
       />
 
       <Card className="glass-card overflow-hidden shadow-sm">
