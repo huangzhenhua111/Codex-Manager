@@ -75,6 +75,7 @@ import { useRuntimeCapabilities } from "@/hooks/useRuntimeCapabilities";
 import { appClient } from "@/lib/api/app-client";
 import { dashboardClient } from "@/lib/api/dashboard-client";
 import { getAppErrorMessage } from "@/lib/api/transport";
+import { estimateChartYAxisWidth } from "@/lib/dashboard/format";
 import { useI18n } from "@/lib/i18n/provider";
 import { cn } from "@/lib/utils";
 import { formatCompactNumber } from "@/lib/utils/usage";
@@ -224,6 +225,10 @@ function UserUsageTrendLine({ summary }: { summary: MemberDashboardSummary }) {
     totalTokens: item.totalTokens,
     estimatedCostUsd: item.estimatedCostUsd,
   }));
+  const yAxisWidth = estimateChartYAxisWidth(
+    [0, ...chartData.map((item) => item.totalTokens)],
+    formatTokenAmount,
+  );
 
   return (
     <ChartContainer
@@ -262,7 +267,7 @@ function UserUsageTrendLine({ summary }: { summary: MemberDashboardSummary }) {
           tickLine={false}
           axisLine={false}
           tickMargin={10}
-          width={44}
+          width={yAxisWidth}
           tickFormatter={(value) => formatTokenAmount(Number(value))}
         />
         <ChartTooltip

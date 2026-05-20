@@ -799,6 +799,103 @@ fn admin_usage_summary_requires_admin_and_returns_range_rollups() {
 }
 
 #[test]
+fn admin_usage_summary_daily_trend_includes_token_stats_without_request_logs() {
+    let _guard = test_env_guard();
+    let db_path = setup_dashboard_test_db("codexmanager-admin-usage-orphan-stats");
+    let day_start = 1_700_000_000;
+    let day_end = day_start + 3 * 86_400;
+    let user = create_test_member("admin-usage-orphan-member", Some(2_000_000));
+    let key_id = create_owned_test_api_key(&user.id, "admin orphan key", "gpt-5-mini");
+    let storage = storage_helpers::open_storage().expect("open storage");
+
+    storage
+        .insert_request_token_stat(&RequestTokenStat {
+            request_log_id: 98_001,
+            key_id: Some(key_id.clone()),
+            account_id: Some("private-account-id".to_string()),
+            model: Some("gpt-5-mini".to_string()),
+            input_tokens: Some(400),
+            cached_input_tokens: Some(0),
+            output_tokens: Some(100),
+            total_tokens: Some(500),
+            estimated_cost_usd: Some(0.5),
+            created_at: day_start + 120,
+            ..RequestTokenStat::default()
+        })
+        .expect("insert orphan day one stat");
+    storage
+        .insert_request_token_stat(&RequestTokenStat {
+            request_log_id: 98_002,
+            key_id: Some(key_id.clone()),
+            account_id: Some("private-account-id".to_string()),
+            model: Some("gpt-5-mini".to_string()),
+            input_tokens: Some(300),
+            cached_input_tokens: Some(0),
+            output_tokens: Some(100),
+            total_tokens: Some(400),
+            estimated_cost_usd: Some(0.4),
+            created_at: day_start + 86_400 + 180,
+            ..RequestTokenStat::default()
+        })
+        .expect("insert orphan day two stat");
+
+    insert_test_request_log(
+        &key_id,
+        "trace-admin-usage-current-day",
+        "gpt-5-mini",
+        200,
+        20,
+        5,
+        10,
+        0.03,
+        day_start + 2 * 86_400 + 240,
+    );
+
+    let admin_resp = response_result(handle_request_with_actor(
+        rpc_request(
+            "dashboard/adminUsageSummary",
+            serde_json::json!({
+                "startTs": day_start,
+                "endTs": day_end
+            }),
+        ),
+        RpcActor::system_admin(),
+    ));
+    assert!(
+        admin_resp.result.get("error").is_none(),
+        "{:?}",
+        admin_resp.result
+    );
+    assert_eq!(admin_resp.result["dailyUsage"].as_array().unwrap().len(), 3);
+    assert_eq!(
+        admin_resp.result["dailyUsage"][0]["usage"]["totalTokens"],
+        500
+    );
+    assert_eq!(
+        admin_resp.result["dailyUsage"][0]["usage"]["requestCount"],
+        0
+    );
+    assert_eq!(
+        admin_resp.result["dailyUsage"][1]["usage"]["totalTokens"],
+        400
+    );
+    assert_eq!(
+        admin_resp.result["dailyUsage"][1]["usage"]["requestCount"],
+        0
+    );
+    assert_eq!(
+        admin_resp.result["dailyUsage"][2]["usage"]["totalTokens"],
+        30
+    );
+    assert_eq!(
+        admin_resp.result["dailyUsage"][2]["usage"]["requestCount"],
+        1
+    );
+
+    let _ = std::fs::remove_file(db_path);
+}
+
+#[test]
 fn member_cannot_read_or_mutate_other_user_api_key() {
     let _guard = test_env_guard();
     let db_path = setup_dashboard_test_db("codexmanager-member-apikey-cross-user-deny");

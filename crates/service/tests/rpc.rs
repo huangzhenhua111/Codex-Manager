@@ -841,7 +841,8 @@ fn rpc_account_list_prefers_free_subscription_result_over_token_plan() {
         Some(false)
     );
     assert_eq!(
-        item.get("subscriptionPlan").and_then(|value| value.as_str()),
+        item.get("subscriptionPlan")
+            .and_then(|value| value.as_str()),
         Some("free")
     );
 }

@@ -12,7 +12,15 @@ export const DASHBOARD_ADMIN_USAGE_QUERY_KEY = [
   "admin-usage-summary",
 ] as const;
 
-export function useDashboardAdminUsageSummary(enabled = true) {
+interface DashboardAdminUsageSummaryQueryParams {
+  startTs?: number | null;
+  endTs?: number | null;
+}
+
+export function useDashboardAdminUsageSummary(
+  params?: DashboardAdminUsageSummaryQueryParams,
+  enabled = true,
+) {
   const serviceStatus = useAppStore((state) => state.serviceStatus);
   const isPageActive = useDesktopPageActive("/");
   const isServiceReady = serviceStatus.connected;
@@ -21,8 +29,17 @@ export function useDashboardAdminUsageSummary(enabled = true) {
   );
 
   const query = useQuery<DashboardAdminUsageSummary>({
-    queryKey: [...DASHBOARD_ADMIN_USAGE_QUERY_KEY, serviceStatus.addr],
-    queryFn: () => dashboardClient.getAdminUsageSummary(),
+    queryKey: [
+      ...DASHBOARD_ADMIN_USAGE_QUERY_KEY,
+      serviceStatus.addr,
+      params?.startTs ?? null,
+      params?.endTs ?? null,
+    ],
+    queryFn: () =>
+      dashboardClient.getAdminUsageSummary({
+        startTs: params?.startTs ?? null,
+        endTs: params?.endTs ?? null,
+      }),
     enabled: isQueryEnabled,
     retry: 1,
     staleTime: 30_000,

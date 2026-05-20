@@ -495,7 +495,11 @@ fn is_warmup_error_event(value: &str) -> bool {
 fn summarize_warmup_stream_error(value: &serde_json::Value) -> String {
     value
         .get("error")
-        .or_else(|| value.get("response").and_then(|response| response.get("error")))
+        .or_else(|| {
+            value
+                .get("response")
+                .and_then(|response| response.get("error"))
+        })
         .and_then(|error| {
             error
                 .get("message")
