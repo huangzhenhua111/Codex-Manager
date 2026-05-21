@@ -415,6 +415,33 @@ fn chat_text_config_with_response_format(
     }
 }
 
+const DEFAULT_CHAT_RESPONSES_REASONING_EFFORT: &str = "medium";
+const DEFAULT_CHAT_RESPONSES_REASONING_SUMMARY: &str = "auto";
+
+fn chat_reasoning_config_for_responses(
+    obj: &serde_json::Map<String, serde_json::Value>,
+) -> serde_json::Value {
+    if let Some(reasoning) = obj.get("reasoning") {
+        let mut reasoning = reasoning.clone();
+        if let Some(reasoning_obj) = reasoning.as_object_mut() {
+            reasoning_obj
+                .entry("summary".to_string())
+                .or_insert_with(|| {
+                    serde_json::Value::String(DEFAULT_CHAT_RESPONSES_REASONING_SUMMARY.to_string())
+                });
+        }
+        return reasoning;
+    }
+
+    let effort = obj.get("reasoning_effort").cloned().unwrap_or_else(|| {
+        serde_json::Value::String(DEFAULT_CHAT_RESPONSES_REASONING_EFFORT.to_string())
+    });
+    serde_json::json!({
+        "effort": effort,
+        "summary": DEFAULT_CHAT_RESPONSES_REASONING_SUMMARY
+    })
+}
+
 fn adapt_openai_chat_completions_body_to_responses(body: Vec<u8>) -> Result<Vec<u8>, String> {
     let payload = serde_json::from_slice::<serde_json::Value>(&body)
         .map_err(|err| format!("invalid chat completions request json: {err}"))?;
@@ -503,14 +530,10 @@ fn adapt_openai_chat_completions_body_to_responses(body: Vec<u8>) -> Result<Vec<
     if let Some(stream) = obj.get("stream") {
         rewritten.insert("stream".to_string(), stream.clone());
     }
-    if let Some(reasoning) = obj.get("reasoning") {
-        rewritten.insert("reasoning".to_string(), reasoning.clone());
-    } else if let Some(reasoning_effort) = obj.get("reasoning_effort") {
-        rewritten.insert(
-            "reasoning".to_string(),
-            serde_json::json!({ "effort": reasoning_effort }),
-        );
-    }
+    rewritten.insert(
+        "reasoning".to_string(),
+        chat_reasoning_config_for_responses(obj),
+    );
     if let Some(tools) = obj.get("tools").and_then(serde_json::Value::as_array) {
         rewritten.insert(
             "tools".to_string(),

@@ -6,6 +6,7 @@ use serde_json::{json, Value};
 mod aggregate;
 #[cfg(test)]
 mod openai;
+use aggregate::collect_response_reasoning_summary_text;
 use aggregate::openai_responses_event::{OpenAIResponsesEvent, OpenAIResponsesOutputTextState};
 pub(crate) use aggregate::PassthroughSseProtocol;
 #[allow(unused_imports)]

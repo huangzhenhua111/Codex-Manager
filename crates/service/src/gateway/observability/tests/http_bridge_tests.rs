@@ -161,6 +161,19 @@ fn chat_sse_content_fragments(out: &str) -> Vec<String> {
         .collect()
 }
 
+fn chat_sse_reasoning_fragments(out: &str) -> Vec<String> {
+    out.lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .filter(|data| data.trim() != "[DONE]")
+        .filter_map(|data| serde_json::from_str::<serde_json::Value>(data).ok())
+        .filter_map(|value| {
+            value["choices"][0]["delta"]["reasoning_content"]
+                .as_str()
+                .map(str::to_string)
+        })
+        .collect()
+}
+
 /// 函数 `parse_usage_from_json_reads_cached_and_reasoning_details`
 ///
 /// 作者: gaohongshun
@@ -723,6 +736,53 @@ fn chat_completions_reader_converts_responses_sse_to_chat_sse() {
     assert_eq!(collector.usage.input_tokens, Some(2));
     assert_eq!(collector.usage.output_tokens, Some(2));
     assert_eq!(collector.usage.total_tokens, Some(4));
+}
+
+#[test]
+fn chat_completions_reader_converts_reasoning_output_item_to_reasoning_delta() {
+    let sse = concat!(
+        "data: {\"type\":\"response.output_item.done\",\"response_id\":\"resp_reason_1\",\"output_index\":0,\"item\":{\"type\":\"reasoning\",\"id\":\"rs_1\",\"summary\":[{\"type\":\"summary_text\",\"text\":\"先读配置\"}],\"encrypted_content\":\"sig_reason_1\"}}\n\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_reason_1\",\"model\":\"gpt-5.4\",\"created\":1775900000,\"usage\":{\"input_tokens\":4,\"output_tokens\":2,\"total_tokens\":6}}}\n\n",
+        "data: [DONE]\n\n"
+    );
+    let response = open_mock_http_response("text/event-stream", sse);
+    let collector = Arc::new(Mutex::new(PassthroughSseCollector::default()));
+    let mut reader = ChatCompletionsFromResponsesSseReader::new(
+        response,
+        Arc::clone(&collector),
+        std::time::Instant::now(),
+    );
+    let mut out = String::new();
+    reader.read_to_string(&mut out).expect("read chat sse");
+
+    assert_eq!(chat_sse_reasoning_fragments(&out), vec!["先读配置"]);
+    assert!(out.contains("\"reasoning\":\"先读配置\""));
+    assert!(!out.contains("\"content\":\"先读配置\""));
+    assert!(out.contains("\"finish_reason\":\"stop\""));
+    assert!(out.contains("data: [DONE]"));
+}
+
+#[test]
+fn chat_completions_reader_converts_reasoning_summary_delta_to_reasoning_delta() {
+    let sse = concat!(
+        "data: {\"type\":\"response.reasoning_summary_text.delta\",\"response_id\":\"resp_reason_delta_1\",\"delta\":\"先读配置\"}\n\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_reason_delta_1\",\"model\":\"gpt-5.4\",\"created\":1775900000,\"usage\":{\"input_tokens\":4,\"output_tokens\":2,\"total_tokens\":6}}}\n\n",
+        "data: [DONE]\n\n"
+    );
+    let response = open_mock_http_response("text/event-stream", sse);
+    let collector = Arc::new(Mutex::new(PassthroughSseCollector::default()));
+    let mut reader = ChatCompletionsFromResponsesSseReader::new(
+        response,
+        Arc::clone(&collector),
+        std::time::Instant::now(),
+    );
+    let mut out = String::new();
+    reader.read_to_string(&mut out).expect("read chat sse");
+
+    assert_eq!(chat_sse_reasoning_fragments(&out), vec!["先读配置"]);
+    assert!(out.contains("\"reasoning\":\"先读配置\""));
+    assert!(out.contains("\"finish_reason\":\"stop\""));
+    assert!(out.contains("data: [DONE]"));
 }
 
 #[test]

@@ -1,7 +1,8 @@
 use super::{
     chat_image_payload, classify_upstream_stream_read_error, collect_image_generation_data_urls,
-    collect_output_text_from_event_fields, collect_response_output_text, mark_first_response_ms,
-    merge_usage, should_emit_keepalive, stream_idle_timed_out, stream_idle_timeout_message,
+    collect_output_text_from_event_fields, collect_response_output_text,
+    collect_response_reasoning_summary_text, mark_first_response_ms, merge_usage,
+    should_emit_keepalive, stream_idle_timed_out, stream_idle_timeout_message,
     stream_reader_disconnected_message, stream_wait_timeout,
     upstream_hint_or_stream_incomplete_message, Arc, Cursor, Mutex, PassthroughSseCollector, Read,
     SseKeepAliveFrame, UpstreamSseFramePump, UpstreamSseFramePumpItem,
@@ -20,6 +21,7 @@ pub(crate) struct ChatCompletionsFromResponsesSseReader {
     finished: bool,
     emitted_assistant_role: bool,
     emitted_text: bool,
+    emitted_reasoning: bool,
     emitted_tool_calls: bool,
     emitted_tool_call_indices: HashSet<usize>,
     tool_call_arguments: HashMap<usize, String>,
@@ -45,6 +47,7 @@ impl ChatCompletionsFromResponsesSseReader {
             finished: false,
             emitted_assistant_role: false,
             emitted_text: false,
+            emitted_reasoning: false,
             emitted_tool_calls: false,
             emitted_tool_call_indices: HashSet::new(),
             tool_call_arguments: HashMap::new(),
@@ -332,6 +335,48 @@ impl ChatCompletionsFromResponsesSseReader {
         }
     }
 
+    fn reasoning_delta_chunk(&mut self, text: String) -> Option<Vec<u8>> {
+        if text.trim().is_empty() {
+            return None;
+        }
+        self.emitted_reasoning = true;
+        let reasoning_content = text.clone();
+        Some(self.assistant_delta_chunk(serde_json::json!({
+            "reasoning": text,
+            "reasoning_content": reasoning_content
+        })))
+    }
+
+    fn reasoning_text_from_event(event_type: Option<&str>, value: &Value) -> Option<String> {
+        let mut reasoning = String::new();
+        match event_type {
+            Some("response.reasoning_summary_text.delta")
+            | Some("response.reasoning_text.delta") => {
+                if let Some(delta) = value.get("delta") {
+                    collect_response_output_text(delta, &mut reasoning);
+                }
+            }
+            Some("response.reasoning_summary_text.done") | Some("response.reasoning_text.done") => {
+                if let Some(text) = value.get("text").or_else(|| value.get("delta")) {
+                    collect_response_output_text(text, &mut reasoning);
+                }
+            }
+            _ => collect_response_reasoning_summary_text(value, &mut reasoning),
+        }
+        if reasoning.trim().is_empty() {
+            None
+        } else {
+            Some(reasoning)
+        }
+    }
+
+    fn is_reasoning_delta_event(event_type: Option<&str>) -> bool {
+        matches!(
+            event_type,
+            Some("response.reasoning_summary_text.delta") | Some("response.reasoning_text.delta")
+        )
+    }
+
     fn update_terminal_success(&self, event_type: Option<&str>) {
         if let Ok(mut collector) = self.usage_collector.lock() {
             if let Some(event_type) = event_type {
@@ -345,6 +390,20 @@ impl ChatCompletionsFromResponsesSseReader {
         let value = Self::data_json(lines)?;
         self.remember_meta(&value);
         let event_type = Self::event_type(lines, &value);
+        let is_terminal_event = matches!(
+            event_type.as_deref(),
+            Some("response.completed") | Some("response.done")
+        );
+        if !is_terminal_event
+            && (Self::is_reasoning_delta_event(event_type.as_deref()) || !self.emitted_reasoning)
+        {
+            if let Some(reasoning) = Self::reasoning_text_from_event(event_type.as_deref(), &value)
+            {
+                if let Some(chunk) = self.reasoning_delta_chunk(reasoning) {
+                    return Some(chunk);
+                }
+            }
+        }
         let mut text = String::new();
         match event_type.as_deref() {
             Some("response.output_text.delta") | Some("response.content_part.delta") => {
@@ -388,6 +447,15 @@ impl ChatCompletionsFromResponsesSseReader {
                 }
             }
             if let Some(response) = value.get("response") {
+                if !self.emitted_reasoning {
+                    if let Some(reasoning) =
+                        Self::reasoning_text_from_event(event_type.as_deref(), response)
+                    {
+                        if let Some(chunk) = self.reasoning_delta_chunk(reasoning) {
+                            out.extend(chunk);
+                        }
+                    }
+                }
                 if let Some(tool_calls) = self.completed_tool_calls_chunk(response) {
                     out.extend(tool_calls);
                 }

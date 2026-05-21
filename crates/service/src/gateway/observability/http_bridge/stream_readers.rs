@@ -4,7 +4,8 @@ use std::sync::{Arc, Mutex};
 
 use super::{
     append_output_text, collect_output_text_from_event_fields, collect_response_output_text,
-    extract_error_hint_from_body, extract_error_message_from_json, merge_usage,
+    collect_response_reasoning_summary_text, extract_error_hint_from_body,
+    extract_error_message_from_json, merge_usage,
 };
 use super::{
     build_images_api_response, chat_image_payload, collect_image_generation_data_urls,

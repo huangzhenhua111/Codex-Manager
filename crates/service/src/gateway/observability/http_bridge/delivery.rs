@@ -9,9 +9,9 @@ use crate::gateway::upstream::GatewayStreamResponse;
 use super::super::{GeminiStreamOutputMode, ResponseAdapter, ToolNameRestoreMap};
 use super::{
     build_images_api_response, collect_image_generation_chat_images,
-    collect_non_stream_json_from_sse_bytes, extract_error_hint_from_body,
-    extract_error_message_from_json, looks_like_sse_payload, merge_usage, parse_usage_from_json,
-    push_trace_id_header, usage_has_signal, AnthropicSseReader,
+    collect_non_stream_json_from_sse_bytes, collect_response_reasoning_summary_text,
+    extract_error_hint_from_body, extract_error_message_from_json, looks_like_sse_payload,
+    merge_usage, parse_usage_from_json, push_trace_id_header, usage_has_signal, AnthropicSseReader,
     ChatCompletionsFromResponsesSseReader, GeminiSseReader, ImagesFromResponsesSseReader,
     ImagesResponseFormat, OpenAIResponsesPassthroughSseReader, PassthroughSseCollector,
     PassthroughSseProtocol, PassthroughSseUsageReader, SseKeepAliveFrame,
@@ -753,6 +753,8 @@ fn convert_responses_body_to_chat_completions(body: &[u8]) -> Option<Vec<u8>> {
             collect_chat_output_text(output, &mut text);
         }
     }
+    let mut reasoning_text = String::new();
+    collect_response_reasoning_summary_text(response, &mut reasoning_text);
     let id = response
         .get("id")
         .or_else(|| value.get("id"))
@@ -790,6 +792,10 @@ fn convert_responses_body_to_chat_completions(body: &[u8]) -> Option<Vec<u8>> {
     });
     if let Some(usage) = usage {
         completion["usage"] = usage;
+    }
+    if !reasoning_text.trim().is_empty() {
+        completion["choices"][0]["message"]["reasoning"] = Value::String(reasoning_text.clone());
+        completion["choices"][0]["message"]["reasoning_content"] = Value::String(reasoning_text);
     }
     let images = collect_image_generation_chat_images(response);
     if !images.is_empty() {
@@ -4065,6 +4071,69 @@ mod tests {
         assert_eq!(
             value["usage"]["prompt_tokens"],
             serde_json::Value::Number(2.into())
+        );
+    }
+
+    #[test]
+    fn non_stream_chat_completion_response_preserves_reasoning_content() {
+        let body = json!({
+            "id": "resp_non_stream_reasoning",
+            "model": "gpt-5.4",
+            "output": [{
+                "type": "reasoning",
+                "id": "rs_non_stream_1",
+                "summary": [{
+                    "type": "summary_text",
+                    "text": "先读配置"
+                }]
+            }],
+            "usage": { "input_tokens": 4, "output_tokens": 2, "total_tokens": 6 }
+        });
+
+        let mapped = convert_responses_body_to_chat_completions(
+            serde_json::to_vec(&body).expect("body").as_slice(),
+        )
+        .expect("convert chat completion body");
+        let value: serde_json::Value = serde_json::from_slice(&mapped).expect("parse mapped body");
+
+        assert_eq!(value["choices"][0]["message"]["content"], "");
+        assert_eq!(
+            value["choices"][0]["message"]["reasoning_content"],
+            "先读配置"
+        );
+        assert_eq!(value["choices"][0]["message"]["reasoning"], "先读配置");
+        assert_eq!(
+            value["usage"]["prompt_tokens"],
+            serde_json::Value::Number(4.into())
+        );
+    }
+
+    #[test]
+    fn non_stream_chat_completion_response_preserves_answer_and_reasoning_content() {
+        let body = json!({
+            "id": "resp_non_stream_text_and_reasoning",
+            "model": "gpt-5.4",
+            "output_text": "OK",
+            "output": [{
+                "type": "reasoning",
+                "id": "rs_non_stream_1",
+                "summary": [{
+                    "type": "summary_text",
+                    "text": "先想一下"
+                }]
+            }]
+        });
+
+        let mapped = convert_responses_body_to_chat_completions(
+            serde_json::to_vec(&body).expect("body").as_slice(),
+        )
+        .expect("convert chat completion body");
+        let value: serde_json::Value = serde_json::from_slice(&mapped).expect("parse mapped body");
+
+        assert_eq!(value["choices"][0]["message"]["content"], "OK");
+        assert_eq!(
+            value["choices"][0]["message"]["reasoning_content"],
+            "先想一下"
         );
     }
 

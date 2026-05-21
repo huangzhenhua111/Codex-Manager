@@ -611,6 +611,112 @@ fn openai_chat_completions_api_body_is_adapted_to_responses_for_codex_backend() 
             .and_then(Value::as_str),
         Some("ping")
     );
+    assert_eq!(
+        payload
+            .get("reasoning")
+            .and_then(|reasoning| reasoning.get("effort"))
+            .and_then(Value::as_str),
+        Some("medium")
+    );
+    assert_eq!(
+        payload
+            .get("reasoning")
+            .and_then(|reasoning| reasoning.get("summary"))
+            .and_then(Value::as_str),
+        Some("auto")
+    );
+}
+
+#[test]
+fn openai_chat_completions_reasoning_effort_adds_summary_for_responses() {
+    let body = serde_json::json!({
+        "model": "gpt-5.5",
+        "messages": [{ "role": "user", "content": "你好" }],
+        "reasoning_effort": "high"
+    });
+    let adapted = adapt_openai_chat_completions_body_to_responses(
+        serde_json::to_vec(&body).expect("serialize chat body"),
+    )
+    .expect("adapt chat body");
+    let payload: Value = serde_json::from_slice(&adapted).expect("json body");
+
+    assert_eq!(
+        payload
+            .get("reasoning")
+            .and_then(|reasoning| reasoning.get("effort"))
+            .and_then(Value::as_str),
+        Some("high")
+    );
+    assert_eq!(
+        payload
+            .get("reasoning")
+            .and_then(|reasoning| reasoning.get("summary"))
+            .and_then(Value::as_str),
+        Some("auto")
+    );
+}
+
+#[test]
+fn openai_chat_completions_reasoning_object_preserves_fields_and_adds_missing_summary() {
+    let body = serde_json::json!({
+        "model": "gpt-5.5",
+        "messages": [{ "role": "user", "content": "你好" }],
+        "reasoning": {
+            "effort": "low"
+        }
+    });
+    let adapted = adapt_openai_chat_completions_body_to_responses(
+        serde_json::to_vec(&body).expect("serialize chat body"),
+    )
+    .expect("adapt chat body");
+    let payload: Value = serde_json::from_slice(&adapted).expect("json body");
+
+    assert_eq!(
+        payload
+            .get("reasoning")
+            .and_then(|reasoning| reasoning.get("effort"))
+            .and_then(Value::as_str),
+        Some("low")
+    );
+    assert_eq!(
+        payload
+            .get("reasoning")
+            .and_then(|reasoning| reasoning.get("summary"))
+            .and_then(Value::as_str),
+        Some("auto")
+    );
+}
+
+#[test]
+fn openai_chat_completions_reasoning_object_keeps_existing_summary() {
+    let body = serde_json::json!({
+        "model": "gpt-5.5",
+        "messages": [{ "role": "user", "content": "你好" }],
+        "reasoning": {
+            "effort": "low",
+            "summary": "detailed"
+        }
+    });
+    let adapted = adapt_openai_chat_completions_body_to_responses(
+        serde_json::to_vec(&body).expect("serialize chat body"),
+    )
+    .expect("adapt chat body");
+    let payload: Value = serde_json::from_slice(&adapted).expect("json body");
+
+    assert_eq!(
+        payload
+            .get("reasoning")
+            .and_then(|reasoning| reasoning.get("effort"))
+            .and_then(Value::as_str),
+        Some("low")
+    );
+    assert_eq!(
+        payload
+            .get("reasoning")
+            .and_then(|reasoning| reasoning.get("summary"))
+            .and_then(Value::as_str),
+        Some("detailed")
+    );
 }
 
 #[test]

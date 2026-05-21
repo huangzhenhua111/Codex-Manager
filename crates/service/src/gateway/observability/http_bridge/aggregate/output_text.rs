@@ -340,6 +340,99 @@ pub(in super::super) fn collect_response_output_text(value: &Value, output: &mut
     }
 }
 
+fn collect_reasoning_text_fragment(value: &Value, output: &mut String) {
+    match value {
+        Value::String(text) => output.push_str(text),
+        Value::Array(items) => {
+            for item in items {
+                collect_reasoning_text_fragment(item, output);
+            }
+        }
+        Value::Object(map) => {
+            if let Some(text) = map.get("text").and_then(Value::as_str) {
+                output.push_str(text);
+            }
+            if let Some(summary) = map.get("summary") {
+                collect_reasoning_text_fragment(summary, output);
+            }
+            if let Some(content) = map.get("content") {
+                collect_reasoning_text_fragment(content, output);
+            }
+            if let Some(delta) = map.get("delta") {
+                collect_reasoning_text_fragment(delta, output);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// 函数 `collect_response_reasoning_summary_text`
+///
+/// 作者: gaohongshun
+///
+/// 时间: 2026-05-21
+///
+/// # 参数
+/// - in super: 参数 in super
+///
+/// # 返回
+/// 无
+pub(in super::super) fn collect_response_reasoning_summary_text(
+    value: &Value,
+    output: &mut String,
+) {
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                collect_response_reasoning_summary_text(item, output);
+            }
+        }
+        Value::Object(map) => {
+            let event_type = map.get("type").and_then(Value::as_str);
+            match event_type {
+                Some("reasoning") => {
+                    if let Some(summary) = map.get("summary") {
+                        collect_reasoning_text_fragment(summary, output);
+                    }
+                    if let Some(content) = map.get("content") {
+                        collect_reasoning_text_fragment(content, output);
+                    }
+                    if let Some(text) = map.get("text") {
+                        collect_reasoning_text_fragment(text, output);
+                    }
+                }
+                Some("response.reasoning_summary_text.delta")
+                | Some("response.reasoning_text.delta") => {
+                    if let Some(delta) = map.get("delta") {
+                        collect_reasoning_text_fragment(delta, output);
+                    }
+                }
+                Some("response.reasoning_summary_text.done")
+                | Some("response.reasoning_text.done") => {
+                    if let Some(text) = map.get("text").or_else(|| map.get("delta")) {
+                        collect_reasoning_text_fragment(text, output);
+                    }
+                }
+                _ => {}
+            }
+
+            if let Some(response) = map.get("response") {
+                collect_response_reasoning_summary_text(response, output);
+            }
+            if let Some(output_field) = map.get("output") {
+                collect_response_reasoning_summary_text(output_field, output);
+            }
+            if let Some(item) = map.get("item") {
+                collect_response_reasoning_summary_text(item, output);
+            }
+            if let Some(output_item) = map.get("output_item") {
+                collect_response_reasoning_summary_text(output_item, output);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// 函数 `output_text_limit_bytes`
 ///
 /// 作者: gaohongshun
