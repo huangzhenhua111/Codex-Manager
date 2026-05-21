@@ -4,7 +4,7 @@ version = 3
 
 [[package]]
 name = "CodexManager"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "codexmanager-core",
  "codexmanager-service",
@@ -813,7 +813,7 @@ dependencies = [
 
 [[package]]
 name = "codexmanager-core"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "base64 0.22.1",
  "rand 0.8.5",
@@ -826,7 +826,7 @@ dependencies = [
 
 [[package]]
 name = "codexmanager-service"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "axum",
  "base64 0.22.1",
