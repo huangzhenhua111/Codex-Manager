@@ -417,9 +417,8 @@ pub(crate) fn current_upstream_total_timeout_ms() -> u64 {
 /// # 参数
 /// - crate: 参数 crate
 ///
-/// # 返回
-/// 返回函数执行结果
 pub(crate) fn use_websocket_upstream() -> bool {
+    ensure_runtime_config_loaded();
     USE_WEBSOCKET_UPSTREAM.load(Ordering::Relaxed)
 }
 
