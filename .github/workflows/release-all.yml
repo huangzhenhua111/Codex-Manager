@@ -317,7 +317,19 @@ jobs:
 
   build_linux:
     needs: build_frontend_dist
-    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            rust_target: x86_64-unknown-linux-gnu
+            runner: ubuntu-22.04
+            build_docker: true
+          - arch: arm64
+            rust_target: aarch64-unknown-linux-gnu
+            runner: ubuntu-22.04-arm
+            build_docker: false
+    runs-on: ${{ matrix.runner }}
 
     steps:
       - name: Checkout
@@ -328,6 +340,7 @@ jobs:
       - name: Setup release environment
         uses: ./.github/actions/setup-release-env
         with:
+          rust-target: ${{ matrix.rust_target }}
           enable-pnpm-cache: "false"
           enable-rust-cache: "false"
 
@@ -345,13 +358,15 @@ jobs:
           working-directory: apps
           tauri-cli-version: ${{ env.TAURI_CLI_VERSION }}
           bundles: appimage,deb
+          target: ${{ matrix.rust_target }}
           shell-type: bash
 
       - name: Stage portable package
         shell: bash
         run: |
-          release_dir="${{ env.CARGO_TARGET_DIR }}/release"
+          release_dir="${{ env.CARGO_TARGET_DIR }}/${{ matrix.rust_target }}/release"
           portable_dir="$release_dir/portable"
+          portable_zip_name="CodexManager-linux-${{ matrix.arch }}-portable.zip"
           mkdir -p "$portable_dir"
 
           source_bin="$release_dir/CodexManager"
@@ -364,26 +379,27 @@ jobs:
           cp -f "$source_bin" "$portable_bin"
           chmod +x "$portable_bin"
 
-          zip_path="$portable_dir/CodexManager-linux-portable.zip"
+          zip_path="$portable_dir/$portable_zip_name"
           rm -f "$zip_path"
           (
             cd "$portable_dir"
-            zip -q "CodexManager-linux-portable.zip" "CodexManager-portable"
+            zip -q "$portable_zip_name" "CodexManager-portable"
           )
           echo "portable package: $zip_path"
 
       - name: Build service binaries
         run: |
-          cargo build -p codexmanager-service --release
-          cargo build -p codexmanager-web --release --features embedded-ui
-          cargo build -p codexmanager-start --release
+          cargo build -p codexmanager-service --release --target ${{ matrix.rust_target }}
+          cargo build -p codexmanager-web --release --features embedded-ui --target ${{ matrix.rust_target }}
+          cargo build -p codexmanager-start --release --target ${{ matrix.rust_target }}
 
       - name: Stage docker release package
+        if: ${{ matrix.build_docker }}
         shell: bash
         run: |
           set -euo pipefail
 
-          release_dir="${{ env.CARGO_TARGET_DIR }}/release"
+          release_dir="${{ env.CARGO_TARGET_DIR }}/${{ matrix.rust_target }}/release"
           docker_stage="${release_dir}/docker-release"
           release_assets_dir="${release_dir}/release-assets"
 
@@ -405,12 +421,13 @@ jobs:
           cp "$docker_stage/docker-compose.yml" "$release_assets_dir/docker-compose.release.yml"
 
       - name: Upload docker artifacts
+        if: ${{ matrix.build_docker }}
         uses: actions/upload-artifact@v6
         with:
           name: codexmanager-docker
           path: |
-            ${{ env.CARGO_TARGET_DIR }}/release/release-assets/codexmanager-docker-images.tar.gz
-            ${{ env.CARGO_TARGET_DIR }}/release/release-assets/docker-compose.release.yml
+            ${{ env.CARGO_TARGET_DIR }}/${{ matrix.rust_target }}/release/release-assets/codexmanager-docker-images.tar.gz
+            ${{ env.CARGO_TARGET_DIR }}/${{ matrix.rust_target }}/release/release-assets/docker-compose.release.yml
           if-no-files-found: error
           compression-level: 0
 
@@ -418,9 +435,9 @@ jobs:
         uses: ./.github/actions/stage-service-package
         with:
           platform: linux
-          arch: x86_64
+          arch: ${{ matrix.arch }}
           stage-root: stage
-          release-dir: ${{ env.CARGO_TARGET_DIR }}/release
+          release-dir: ${{ env.CARGO_TARGET_DIR }}/${{ matrix.rust_target }}/release
           shell-type: bash
 
       - name: Stage web package
@@ -428,10 +445,10 @@ jobs:
         run: |
           set -euo pipefail
 
-          release_dir="${{ env.CARGO_TARGET_DIR }}/release"
+          release_dir="${{ env.CARGO_TARGET_DIR }}/${{ matrix.rust_target }}/release"
           release_assets_dir="${release_dir}/release-assets"
-          service_zip="stage/CodexManager-service-linux-x86_64.zip"
-          web_zip="${release_assets_dir}/CodexManager-web-linux-x86_64.zip"
+          service_zip="stage/CodexManager-service-linux-${{ matrix.arch }}.zip"
+          web_zip="${release_assets_dir}/CodexManager-web-linux-${{ matrix.arch }}.zip"
 
           mkdir -p "$release_assets_dir"
           test -f "$service_zip" || { echo "service package not found: $service_zip"; exit 1; }
@@ -441,18 +458,18 @@ jobs:
       - name: Upload artifacts
         uses: actions/upload-artifact@v6
         with:
-          name: codexmanager-linux
+          name: codexmanager-linux-${{ matrix.arch }}
           path: |
-            ${{ env.CARGO_TARGET_DIR }}/release/bundle/**/*.AppImage
-            ${{ env.CARGO_TARGET_DIR }}/release/bundle/**/*.deb
-            ${{ env.CARGO_TARGET_DIR }}/release/portable/*.zip
+            ${{ env.CARGO_TARGET_DIR }}/${{ matrix.rust_target }}/release/bundle/**/*.AppImage
+            ${{ env.CARGO_TARGET_DIR }}/${{ matrix.rust_target }}/release/bundle/**/*.deb
+            ${{ env.CARGO_TARGET_DIR }}/${{ matrix.rust_target }}/release/portable/*.zip
           if-no-files-found: error
           compression-level: 0
 
       - name: Upload service artifacts
         uses: actions/upload-artifact@v6
         with:
-          name: codexmanager-service-linux
+          name: codexmanager-service-linux-${{ matrix.arch }}
           path: stage/*.zip
           if-no-files-found: error
           compression-level: 0
@@ -460,8 +477,8 @@ jobs:
       - name: Upload web artifacts
         uses: actions/upload-artifact@v6
         with:
-          name: codexmanager-web-linux
-          path: ${{ env.CARGO_TARGET_DIR }}/release/release-assets/CodexManager-web-linux-x86_64.zip
+          name: codexmanager-web-linux-${{ matrix.arch }}
+          path: ${{ env.CARGO_TARGET_DIR }}/${{ matrix.rust_target }}/release/release-assets/CodexManager-web-linux-${{ matrix.arch }}.zip
           if-no-files-found: error
           compression-level: 0
 
