@@ -23,7 +23,7 @@ impl Storage {
     /// 返回函数执行结果
     pub fn insert_account(&self, account: &Account) -> Result<()> {
         self.conn.execute(
-            "INSERT OR REPLACE INTO accounts (
+            "INSERT INTO accounts (
                 id,
                 label,
                 issuer,
@@ -44,8 +44,16 @@ impl Storage {
                 ?7,
                 ?8,
                 ?9,
-                COALESCE((SELECT preferred FROM accounts WHERE id = ?1), 0)
-            )",
+                0
+            )
+             ON CONFLICT(id) DO UPDATE SET
+                label = excluded.label,
+                issuer = excluded.issuer,
+                chatgpt_account_id = excluded.chatgpt_account_id,
+                workspace_id = excluded.workspace_id,
+                sort = excluded.sort,
+                status = excluded.status,
+                updated_at = excluded.updated_at",
             (
                 &account.id,
                 &account.label,
@@ -1103,6 +1111,54 @@ mod tests {
             api_key_access_token: None,
             last_refresh: now,
         }
+    }
+
+    #[test]
+    fn insert_account_update_preserves_existing_token() {
+        let mut storage = Storage::open_in_memory().expect("open");
+        storage.init().expect("init");
+        let now = now_ts();
+
+        let mut account = sample_account("acc-upsert", "active", now);
+        account.chatgpt_account_id = Some("cgpt-old".to_string());
+        storage.insert_account(&account).expect("insert account");
+        storage
+            .insert_token(&sample_token(account.id.as_str(), now))
+            .expect("insert token");
+        storage
+            .set_preferred_account(Some(account.id.as_str()))
+            .expect("set preferred");
+
+        let mut updated = account.clone();
+        updated.label = "updated label".to_string();
+        updated.chatgpt_account_id = Some("cgpt-new".to_string());
+        updated.workspace_id = Some("ws-new".to_string());
+        updated.created_at = now.saturating_add(100);
+        updated.updated_at = now.saturating_add(1);
+        storage
+            .insert_account(&updated)
+            .expect("update account without replacing row");
+
+        let found = storage
+            .find_account_by_id(account.id.as_str())
+            .expect("find updated account")
+            .expect("updated account exists");
+        assert_eq!(found.label, "updated label");
+        assert_eq!(found.chatgpt_account_id.as_deref(), Some("cgpt-new"));
+        assert_eq!(found.workspace_id.as_deref(), Some("ws-new"));
+        assert_eq!(found.created_at, now);
+        assert_eq!(found.updated_at, now.saturating_add(1));
+        assert_eq!(
+            storage.preferred_account_id().expect("preferred account"),
+            Some(account.id.clone())
+        );
+
+        let token = storage
+            .find_token_by_account_id(account.id.as_str())
+            .expect("find token")
+            .expect("token still exists");
+        assert_eq!(token.access_token, "access");
+        assert_eq!(token.refresh_token, "refresh");
     }
 
     #[test]
