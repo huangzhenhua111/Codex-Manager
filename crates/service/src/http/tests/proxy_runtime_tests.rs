@@ -839,7 +839,10 @@ async fn official_responses_websocket_proxies_frames_and_headers() {
             .map(String::as_str),
         Some("chatgpt_proxy_runtime_ws")
     );
-    assert_eq!(capture.headers.get("openai-beta").map(String::as_str), None);
+    assert_eq!(
+        capture.headers.get("openai-beta").map(String::as_str),
+        Some("responses_websockets=2026-02-06")
+    );
     assert_eq!(capture.headers.get("version").map(String::as_str), None);
     assert_eq!(
         capture

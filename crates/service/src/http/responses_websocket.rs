@@ -27,6 +27,7 @@ use crate::http::proxy_response::{text_error_response, text_response};
 use crate::storage_helpers::{hash_platform_key, open_storage};
 
 const RESPONSES_WS_ERROR_CODE: &str = "responses_websocket_error";
+const RESPONSES_WEBSOCKETS_BETA_HEADER_VALUE: &str = "responses_websockets=2026-02-06";
 
 #[derive(Clone)]
 struct WsRequestContext {
@@ -1138,6 +1139,11 @@ fn build_upstream_websocket_request(
         "originator",
         &crate::gateway::current_wire_originator(),
     )?;
+    insert_header(
+        headers,
+        "OpenAI-Beta",
+        RESPONSES_WEBSOCKETS_BETA_HEADER_VALUE,
+    )?;
     if let Some(residency_requirement) = crate::gateway::current_residency_requirement() {
         insert_header(
             headers,
@@ -1876,6 +1882,13 @@ mod tests {
                 .get("x-oai-attestation")
                 .and_then(|value| value.to_str().ok()),
             Some("attest-ws")
+        );
+        assert_eq!(
+            request
+                .headers()
+                .get("openai-beta")
+                .and_then(|value| value.to_str().ok()),
+            Some(super::RESPONSES_WEBSOCKETS_BETA_HEADER_VALUE)
         );
     }
 
