@@ -1136,7 +1136,7 @@ pub(crate) fn gateway_rewrite_ws_responses_body(
         normalized_service_tier,
         api_key.upstream_base_url.as_deref(),
         prompt_cache_key,
-        false,
+        true,
     )
 }
 

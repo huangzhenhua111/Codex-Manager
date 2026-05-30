@@ -22,7 +22,6 @@ import {
 import { usePageTransitionReady } from "@/hooks/usePageTransitionReady";
 import { useRuntimeCapabilities } from "@/hooks/useRuntimeCapabilities";
 import {
-  APPEARANCE_PRESETS,
   applyAppearancePreset,
   normalizeAppearancePreset,
 } from "@/lib/appearance";
@@ -66,24 +65,23 @@ import {
   ExternalLink,
   FolderOpen,
   Globe,
-  Info,
-  Plus,
   Palette,
   RefreshCw,
   RotateCcw,
   Save,
-  Search,
   Settings as SettingsIcon,
   ShieldCheck,
-  Trash2,
-  Variable,
   UserRound,
+  Variable,
   LockKeyhole,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { ConfirmDialog } from "@/components/modals/confirm-dialog";
 import { WebPasswordModal } from "@/components/modals/web-password-modal";
 import { useI18n } from "@/lib/i18n/provider";
+import { AppearanceTabContent } from "@/app/settings/components/appearance-tab-content";
+import { EnvTabContent } from "@/app/settings/components/env-tab-content";
+import { ModelForwardRulesEditor } from "@/app/settings/components/model-forward-rules-editor";
 import {
   CUSTOM_WORKER_MODE_VALUE,
   DEFAULT_FREE_ACCOUNT_MAX_MODEL_OPTIONS,
@@ -100,9 +98,7 @@ import {
   THEMES,
   WORKER_PRESET_KEYS,
   WORKER_PRESETS,
-  asRecord,
   buildReleaseUrl,
-  createEmptyModelForwardRule,
   type CheckUpdateRequest,
   compareEnvOverrideItems,
   ensureModelForwardRuleRows,
@@ -314,10 +310,9 @@ function AdminSettingsPage() {
   const [gatewayOriginatorDraft, setGatewayOriginatorDraft] = useState<
     string | null
   >(null);
-  const [modelForwardRulesDraft, setModelForwardRulesDraft] =
-    useState<string | null>(null);
-  const [compactModelForwardRulesDraft, setCompactModelForwardRulesDraft] =
-    useState<string | null>(null);
+  const [modelForwardRuleRowsDraft, setModelForwardRuleRowsDraft] = useState<
+    ReturnType<typeof parseModelForwardRules> | null
+  >(null);
   const [lastUpdateCheck, setLastUpdateCheck] =
     useState<UpdateCheckResult | null>(null);
   const [updateDialogCheck, setUpdateDialogCheck] =
@@ -405,15 +400,9 @@ function AdminSettingsPage() {
     enabled: isSnapshotQueryEnabled && isPageActive,
   });
   const snapshot = fetchedSnapshot ?? storedSettings;
-  const modelForwardRulesInput =
-    modelForwardRulesDraft ?? (snapshot?.modelForwardRules || "");
   const modelForwardRuleRows = ensureModelForwardRuleRows(
-    parseModelForwardRules(modelForwardRulesInput),
-  );
-  const compactModelForwardRulesInput =
-    compactModelForwardRulesDraft ?? (snapshot?.compactModelForwardRules || "");
-  const compactModelForwardRuleRows = ensureModelForwardRuleRows(
-    parseModelForwardRules(compactModelForwardRulesInput),
+    modelForwardRuleRowsDraft ??
+      parseModelForwardRules(snapshot?.modelForwardRules || ""),
   );
   usePageTransitionReady(
     "/settings/",
@@ -752,44 +741,23 @@ function AdminSettingsPage() {
       typeof parseModelForwardRules
     >,
   ) => {
-    const nextRows = updater(parseModelForwardRules(modelForwardRulesInput));
-    setModelForwardRulesDraft(serializeModelForwardRules(nextRows));
+    const sourceRows =
+      modelForwardRuleRowsDraft ??
+      parseModelForwardRules(snapshot?.modelForwardRules || "");
+    setModelForwardRuleRowsDraft(updater(ensureModelForwardRuleRows(sourceRows)));
   };
   const commitModelForwardRulesDraft = () => {
-    if (modelForwardRulesDraft == null) return;
-    if (modelForwardRulesInput.trim() === (snapshot?.modelForwardRules || "").trim()) {
-      setModelForwardRulesDraft(null);
+    if (modelForwardRuleRowsDraft == null) return;
+    const nextSerialized = serializeModelForwardRules(modelForwardRuleRowsDraft);
+    if (nextSerialized.trim() === (snapshot?.modelForwardRules || "").trim()) {
+      setModelForwardRuleRowsDraft(null);
       return;
     }
     void updateSettings
       .mutateAsync({
-        modelForwardRules: modelForwardRulesInput,
+        modelForwardRules: nextSerialized,
       })
-      .then(() => setModelForwardRulesDraft(null))
-      .catch(() => undefined);
-  };
-  const updateCompactModelForwardRuleRows = (
-    updater: (rows: ReturnType<typeof parseModelForwardRules>) => ReturnType<
-      typeof parseModelForwardRules
-    >,
-  ) => {
-    const nextRows = updater(parseModelForwardRules(compactModelForwardRulesInput));
-    setCompactModelForwardRulesDraft(serializeModelForwardRules(nextRows));
-  };
-  const commitCompactModelForwardRulesDraft = () => {
-    if (compactModelForwardRulesDraft == null) return;
-    if (
-      compactModelForwardRulesInput.trim() ===
-      (snapshot?.compactModelForwardRules || "").trim()
-    ) {
-      setCompactModelForwardRulesDraft(null);
-      return;
-    }
-    void updateSettings
-      .mutateAsync({
-        compactModelForwardRules: compactModelForwardRulesInput,
-      })
-      .then(() => setCompactModelForwardRulesDraft(null))
+      .then(() => setModelForwardRuleRowsDraft(null))
       .catch(() => undefined);
   };
   const transportInputValues = {
@@ -1623,133 +1591,13 @@ function AdminSettingsPage() {
         </TabsContent>
 
         <TabsContent value="appearance" className="space-y-6">
-          <Card className="glass-card shadow-sm">
-            <CardHeader>
-              <div className="flex items-center gap-2">
-                <Palette className="h-4 w-4 text-primary" />
-                <CardTitle className="text-base">{t("样式版本")}</CardTitle>
-              </div>
-              <CardDescription>{t("在渐变版本和默认版本之间切换")}</CardDescription>
-            </CardHeader>
-            <CardContent>
-              <div className="grid gap-3 md:grid-cols-2">
-                {APPEARANCE_PRESETS.map((item) => {
-                  const currentPreset = normalizeAppearancePreset(
-                    snapshot.appearancePreset,
-                  );
-                  const isActive = currentPreset === item.id;
-                  return (
-                    <Button
-                      key={item.id}
-                      type="button"
-                      variant="outline"
-                      onClick={() => handleAppearancePresetChange(item.id)}
-                      className={cn(
-                        "group relative h-auto justify-start rounded-xl p-4 text-left transition-all duration-300",
-                        isActive
-                          ? "border-primary bg-primary/10 shadow-sm ring-1 ring-primary"
-                          : "border-border/60 bg-background/50 hover:bg-accent/30",
-                      )}
-                    >
-                      <div className="flex items-start justify-between gap-3">
-                        <div className="space-y-1.5">
-                          <div className="text-sm font-semibold">
-                            {t(item.name)}
-                          </div>
-                          <p className="text-xs leading-5 text-muted-foreground">
-                            {t(item.description)}
-                          </p>
-                        </div>
-                        {isActive ? (
-                          <div className="rounded-full bg-primary p-1 text-primary-foreground shadow-sm">
-                            <Check className="h-3 w-3" />
-                          </div>
-                        ) : null}
-                      </div>
-                      <div className="mt-3 flex items-end gap-2.5">
-                        <div
-                          className={cn(
-                            "h-14 flex-1 rounded-xl border",
-                            item.id === "modern"
-                              ? "border-primary/20 bg-accent/50"
-                              : "border-border/70 bg-muted/70",
-                          )}
-                        />
-                        <div className="flex w-16 flex-col gap-1.5">
-                          <div
-                            className={cn(
-                              "h-4 rounded-lg border",
-                              item.id === "modern"
-                                ? "border-primary/15 bg-card shadow-sm"
-                                : "border-border/70 bg-card",
-                            )}
-                          />
-                          <div
-                            className={cn(
-                              "h-4 rounded-lg border",
-                              item.id === "modern"
-                                ? "border-primary/15 bg-card/80 shadow-sm"
-                                : "border-border/70 bg-card/80",
-                            )}
-                          />
-                        </div>
-                      </div>
-                    </Button>
-                  );
-                })}
-              </div>
-            </CardContent>
-          </Card>
-
-          <Card className="glass-card shadow-sm">
-            <CardHeader>
-              <div className="flex items-center gap-2">
-                <Palette className="h-4 w-4 text-primary" />
-                <CardTitle className="text-base">{t("界面主题")}</CardTitle>
-              </div>
-              <CardDescription>
-                {t("选择您喜爱的配色方案，适配不同工作心情")}
-              </CardDescription>
-            </CardHeader>
-            <CardContent>
-              <div className="grid grid-cols-2 gap-4 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6 xl:grid-cols-12">
-                {THEMES.map((item) => (
-                  <Button
-                    key={item.id}
-                    type="button"
-                    variant="ghost"
-                    onClick={() => handleThemeChange(item.id)}
-                    className={cn(
-                      "group relative h-auto flex-col items-center gap-2.5 rounded-xl border p-4 transition-all duration-300 hover:bg-accent/40",
-                      theme === item.id
-                        ? "border-primary bg-primary/10 shadow-sm ring-1 ring-primary"
-                        : "border-transparent bg-muted/20 hover:bg-accent/40",
-                    )}
-                  >
-                    <div
-                      className="h-10 w-10 rounded-full border-2 border-white/20 shadow-sm"
-                      style={{ backgroundColor: item.color }}
-                    />
-                    <span
-                      className={cn(
-                        "whitespace-nowrap text-[10px] font-semibold transition-colors",
-                        theme === item.id
-                          ? "text-primary"
-                          : "text-muted-foreground group-hover:text-foreground",
-                      )}
-                    >
-                      {t(item.name)}
-                    </span>
-                    {theme === item.id ? (
-                      <div className="absolute right-2 top-2 rounded-full bg-primary p-0.5 text-primary-foreground shadow-sm">
-                        <Check className="h-2.5 w-2.5" />
-                      </div>
-                    ) : null}
-                  </Button>
-                ))}
-              </div>
-            </CardContent>
-          </Card>
+          <AppearanceTabContent
+            t={t}
+            theme={theme}
+            appearancePreset={normalizeAppearancePreset(snapshot.appearancePreset)}
+            onThemeChange={handleThemeChange}
+            onAppearancePresetChange={handleAppearancePresetChange}
+          />
         </TabsContent>
 
         <TabsContent value="gateway" className="space-y-4">
@@ -1917,206 +1765,24 @@ function AdminSettingsPage() {
 
               <div className="grid gap-2">
                 <Label>{t("模型转发规则")}</Label>
-                <div
-                  className="grid max-w-3xl gap-3 rounded-lg border border-border/60 bg-background/40 p-3"
-                  onBlur={(event) => {
-                    const nextTarget = event.relatedTarget;
-                    if (nextTarget instanceof Node && event.currentTarget.contains(nextTarget)) {
-                      return;
-                    }
-                    commitModelForwardRulesDraft();
-                  }}
-                >
-                  <div className="hidden grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto] gap-2 px-1 text-[10px] font-medium text-muted-foreground md:grid">
-                    <span>{t("源模型")}</span>
-                    <span>{t("目标模型")}</span>
-                    <span />
-                  </div>
-                  <div className="grid gap-2">
-                    {modelForwardRuleRows.map((rule, index) => (
-                      <div
-                        key={index}
-                        className="grid gap-2 md:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto]"
-                      >
-                        <Input
-                          className="h-10 font-mono text-xs"
-                          aria-label={t("源模型")}
-                          placeholder={t("例如：spark*")}
-                          value={rule.pattern}
-                          onChange={(event) =>
-                            updateModelForwardRuleRows((rows) => {
-                              const nextRows = ensureModelForwardRuleRows(rows);
-                              nextRows[index] = {
-                                ...nextRows[index],
-                                pattern: event.target.value,
-                              };
-                              return nextRows;
-                            })
-                          }
-                        />
-                        <Input
-                          className="h-10 font-mono text-xs"
-                          aria-label={t("目标模型")}
-                          placeholder={t("例如：gpt-5.4-openai-compact")}
-                          value={rule.target}
-                          onChange={(event) =>
-                            updateModelForwardRuleRows((rows) => {
-                              const nextRows = ensureModelForwardRuleRows(rows);
-                              nextRows[index] = {
-                                ...nextRows[index],
-                                target: event.target.value,
-                              };
-                              return nextRows;
-                            })
-                          }
-                        />
-                        <Button
-                          type="button"
-                          variant="ghost"
-                          size="icon"
-                          className="h-10 w-10 shrink-0"
-                          aria-label={t("删除条目")}
-                          onClick={() =>
-                            updateModelForwardRuleRows((rows) => {
-                              const nextRows = ensureModelForwardRuleRows(rows).filter(
-                                (_, rowIndex) => rowIndex !== index,
-                              );
-                              return nextRows.length > 0
-                                ? nextRows
-                                : [createEmptyModelForwardRule()];
-                            })
-                          }
-                        >
-                          <Trash2 className="h-4 w-4" />
-                        </Button>
-                      </div>
-                    ))}
-                  </div>
-                  <div>
-                    <Button
-                      type="button"
-                      variant="outline"
-                      size="sm"
-                      className="gap-2"
-                      onClick={() =>
-                        updateModelForwardRuleRows((rows) => [
-                          ...ensureModelForwardRuleRows(rows).filter(
-                            (item) => item.pattern.length > 0 || item.target.length > 0,
-                          ),
-                          createEmptyModelForwardRule(),
-                        ])
-                      }
-                    >
-                      <Plus className="h-4 w-4" />
-                      {t("新增规则")}
-                    </Button>
-                  </div>
-                </div>
+                <ModelForwardRulesEditor
+                  rows={modelForwardRuleRows}
+                  sourcePlaceholder={t("例如：spark*")}
+                  targetPlaceholder={t("例如：gpt-5.4-openai-compact")}
+                  sourceLabel={t("源模型")}
+                  targetLabel={t("目标模型")}
+                  addButtonLabel={t("新增规则")}
+                  deleteButtonLabel={t("删除条目")}
+                  onRowsChange={(updater) =>
+                    updateModelForwardRuleRows((rows) =>
+                      ensureModelForwardRuleRows(updater(rows)),
+                    )
+                  }
+                  onCommit={commitModelForwardRulesDraft}
+                />
                 <p className="text-[10px] text-muted-foreground">
                   {t("左边匹配请求模型，右边填写转发目标；支持")} <code>*</code>{" "}
                   {t("通配。平台 Key 没有强绑模型时，会先按这里把请求模型改写，再进入账号路由。")}
-                </p>
-              </div>
-
-              <div className="grid gap-2">
-                <Label>{t("压缩模型转发规则")}</Label>
-                <div
-                  className="grid max-w-3xl gap-3 rounded-lg border border-border/60 bg-background/40 p-3"
-                  onBlur={(event) => {
-                    const nextTarget = event.relatedTarget;
-                    if (nextTarget instanceof Node && event.currentTarget.contains(nextTarget)) {
-                      return;
-                    }
-                    commitCompactModelForwardRulesDraft();
-                  }}
-                >
-                  <div className="hidden grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto] gap-2 px-1 text-[10px] font-medium text-muted-foreground md:grid">
-                    <span>{t("源模型")}</span>
-                    <span>{t("目标模型")}</span>
-                    <span />
-                  </div>
-                  <div className="grid gap-2">
-                    {compactModelForwardRuleRows.map((rule, index) => (
-                      <div
-                        key={index}
-                        className="grid gap-2 md:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto]"
-                      >
-                        <Input
-                          className="h-10 font-mono text-xs"
-                          aria-label={t("源模型")}
-                          placeholder={t("例如：gpt-5.4")}
-                          value={rule.pattern}
-                          onChange={(event) =>
-                            updateCompactModelForwardRuleRows((rows) => {
-                              const nextRows = ensureModelForwardRuleRows(rows);
-                              nextRows[index] = {
-                                ...nextRows[index],
-                                pattern: event.target.value,
-                              };
-                              return nextRows;
-                            })
-                          }
-                        />
-                        <Input
-                          className="h-10 font-mono text-xs"
-                          aria-label={t("目标模型")}
-                          placeholder={t("例如：gpt-5.4-openai-compact")}
-                          value={rule.target}
-                          onChange={(event) =>
-                            updateCompactModelForwardRuleRows((rows) => {
-                              const nextRows = ensureModelForwardRuleRows(rows);
-                              nextRows[index] = {
-                                ...nextRows[index],
-                                target: event.target.value,
-                              };
-                              return nextRows;
-                            })
-                          }
-                        />
-                        <Button
-                          type="button"
-                          variant="ghost"
-                          size="icon"
-                          className="h-10 w-10 shrink-0"
-                          aria-label={t("删除条目")}
-                          onClick={() =>
-                            updateCompactModelForwardRuleRows((rows) => {
-                              const nextRows = ensureModelForwardRuleRows(rows).filter(
-                                (_, rowIndex) => rowIndex !== index,
-                              );
-                              return nextRows.length > 0
-                                ? nextRows
-                                : [createEmptyModelForwardRule()];
-                            })
-                          }
-                        >
-                          <Trash2 className="h-4 w-4" />
-                        </Button>
-                      </div>
-                    ))}
-                  </div>
-                  <div>
-                    <Button
-                      type="button"
-                      variant="outline"
-                      size="sm"
-                      className="gap-2"
-                      onClick={() =>
-                        updateCompactModelForwardRuleRows((rows) => [
-                          ...ensureModelForwardRuleRows(rows).filter(
-                            (item) => item.pattern.length > 0 || item.target.length > 0,
-                          ),
-                          createEmptyModelForwardRule(),
-                        ])
-                      }
-                    >
-                      <Plus className="h-4 w-4" />
-                      {t("新增规则")}
-                    </Button>
-                  </div>
-                </div>
-                <p className="text-[10px] text-muted-foreground">
-                  {t("仅对 /v1/responses/compact 生效；命中后会在 compact 请求里优先改写模型。")}
                 </p>
               </div>
 
@@ -2615,193 +2281,35 @@ function AdminSettingsPage() {
         </TabsContent>
 
         <TabsContent value="env" className="space-y-4">
-          <div className="flex flex-col gap-3 rounded-xl border border-border/50 bg-muted/20 p-4 sm:flex-row sm:items-center sm:justify-between">
-            <div className="space-y-1">
-              <h3 className="text-sm font-semibold">{t("环境变量配置")}</h3>
-              <p className="text-sm leading-6 text-muted-foreground">
-                {t(
-                  "这里保留旧版和外部部署环境变量覆盖；普通用户优先使用前面结构化设置，高风险项只建议排障时临时修改。",
-                )}
-              </p>
-            </div>
-            <Button
-              type="button"
-              variant="outline"
-              className="gap-2 self-start sm:self-auto"
-              disabled={!hasCustomizedEnvOverrides || updateSettings.isPending}
-              onClick={() => setResetAllEnvDialogOpen(true)}
-            >
-              <RotateCcw className="h-4 w-4" />
-              {t("全部恢复默认")}
-            </Button>
-          </div>
-
-          <div className="grid gap-6 md:grid-cols-[300px_1fr]">
-            <Card className="glass-card flex h-[500px] flex-col shadow-sm">
-              <CardHeader className="pb-3">
-                <div className="relative">
-                  <Search className="absolute left-2.5 top-2.5 h-4 w-4 text-muted-foreground" />
-                  <Input
-                    placeholder={t("搜索变量...")}
-                    className="h-9 pl-9"
-                    value={envSearch}
-                    onChange={(event) => setEnvSearch(event.target.value)}
-                  />
-                </div>
-              </CardHeader>
-              <CardContent className="flex-1 overflow-y-auto p-2">
-                <div className="space-y-1">
-                  {filteredEnvCatalog.map((item) => (
-                    <Button
-                      key={item.key}
-                      type="button"
-                      variant="ghost"
-                      onClick={() => setSelectedEnvKey(item.key)}
-                      className={cn(
-                        "h-auto w-full justify-start rounded-md px-3 py-2 text-left text-sm transition-colors",
-                        selectedEnvKey === item.key
-                          ? "bg-primary text-primary-foreground"
-                          : "hover:bg-accent",
-                      )}
-                    >
-                      <div className="flex items-center gap-2">
-                        <span className="min-w-0 flex-1 truncate font-medium">
-                          {t(item.label)}
-                        </span>
-                        <Badge
-                          variant="outline"
-                          className={cn(
-                            "shrink-0 px-1.5 py-0 text-[10px]",
-                            selectedEnvKey === item.key
-                              ? "border-primary-foreground/30 bg-primary-foreground/10 text-primary-foreground"
-                              : ENV_RISK_BADGE_CLASSES[
-                                  normalizeEnvRiskLevel(item.riskLevel)
-                                ],
-                          )}
-                        >
-                          {t(
-                            ENV_RISK_LABELS[
-                              normalizeEnvRiskLevel(item.riskLevel)
-                            ],
-                          )}
-                        </Badge>
-                      </div>
-                      <code className="block truncate text-[10px] opacity-70">
-                        {item.key}
-                      </code>
-                    </Button>
-                  ))}
-                </div>
-              </CardContent>
-            </Card>
-
-            <Card className="glass-card min-h-[500px] shadow-sm">
-              {selectedEnvKey ? (
-                <>
-                  <CardHeader>
-                    <div className="flex flex-col gap-2">
-                      <CardTitle className="text-lg">
-                        {selectedEnvItem ? t(selectedEnvItem.label) : null}
-                      </CardTitle>
-                      <div className="flex flex-wrap items-center gap-2">
-                        <code className="w-fit rounded bg-primary/10 px-2 py-0.5 text-xs text-primary">
-                          {selectedEnvKey}
-                        </code>
-                        <Badge
-                          variant="outline"
-                          className={cn(
-                            "px-2 py-0.5",
-                            ENV_RISK_BADGE_CLASSES[selectedEnvRiskLevel],
-                          )}
-                        >
-                          {t(ENV_RISK_LABELS[selectedEnvRiskLevel])}
-                        </Badge>
-                        <Badge variant="secondary" className="px-2 py-0.5">
-                          {t(
-                            ENV_EFFECT_SCOPE_LABELS[selectedEnvEffectScope] ||
-                              selectedEnvEffectScope,
-                          )}
-                        </Badge>
-                      </div>
-                    </div>
-                  </CardHeader>
-                  <CardContent className="space-y-6">
-                    <Alert>
-                      <Info />
-                      <AlertDescription>
-                        {t(
-                          ENV_DESCRIPTION_MAP[selectedEnvKey] ||
-                            `${selectedEnvItem?.label} 对应环境变量，修改后会应用到相关模块。`,
-                        )}
-                      </AlertDescription>
-                    </Alert>
-                    {selectedEnvRiskLevel === "high" ? (
-                      <Alert variant="destructive">
-                        <AlertDescription>{t(selectedEnvSafetyNote)}</AlertDescription>
-                      </Alert>
-                    ) : (
-                      <Alert>
-                        <AlertDescription>{t(selectedEnvSafetyNote)}</AlertDescription>
-                      </Alert>
-                    )}
-
-                    <div className="space-y-2">
-                      <Label>{t("当前值")}</Label>
-                      <Input
-                        value={selectedEnvValue}
-                        onChange={(event) => {
-                          if (!selectedEnvKey) return;
-                          setEnvDrafts((current) => ({
-                            ...current,
-                            [selectedEnvKey]: event.target.value,
-                          }));
-                        }}
-                        className="h-11 font-mono"
-                        placeholder={t("输入变量值")}
-                      />
-                      <p className="text-[10px] text-muted-foreground">
-                        {t("默认值:")}{" "}
-                        <span className="font-mono italic">
-                          {selectedEnvItem?.defaultValue || t("空")}
-                        </span>
-                      </p>
-                    </div>
-
-                    <Separator />
-                    <div className="flex gap-3">
-                      <Button onClick={handleSaveEnv} className="gap-2">
-                        <Save className="h-4 w-4" /> {t("保存修改")}
-                      </Button>
-                      <Button
-                        variant="outline"
-                        onClick={handleResetEnv}
-                        className="gap-2"
-                      >
-                        <RotateCcw className="h-4 w-4" /> {t("恢复默认")}
-                      </Button>
-                    </div>
-                  </CardContent>
-                </>
-              ) : (
-                <CardContent className="flex h-full flex-col items-center justify-center gap-4 text-muted-foreground">
-                  <div className="rounded-full bg-accent/30 p-4">
-                    <Variable className="h-12 w-12 opacity-20" />
-                  </div>
-                  <p>{t("请从左侧列表选择一个环境变量进行配置")}</p>
-                  <Button
-                    type="button"
-                    variant="outline"
-                    className="gap-2"
-                    disabled={!hasCustomizedEnvOverrides || updateSettings.isPending}
-                    onClick={() => setResetAllEnvDialogOpen(true)}
-                  >
-                    <RotateCcw className="h-4 w-4" />
-                    {t("全部恢复默认")}
-                  </Button>
-                </CardContent>
-              )}
-            </Card>
-          </div>
+          <EnvTabContent
+            t={t}
+            envSearch={envSearch}
+            selectedEnvKey={selectedEnvKey}
+            selectedEnvItem={selectedEnvItem}
+            selectedEnvValue={selectedEnvValue}
+            selectedEnvRiskLevel={selectedEnvRiskLevel}
+            selectedEnvEffectScope={selectedEnvEffectScope}
+            selectedEnvSafetyNote={selectedEnvSafetyNote}
+            hasCustomizedEnvOverrides={hasCustomizedEnvOverrides}
+            isSaving={updateSettings.isPending}
+            filteredEnvCatalog={filteredEnvCatalog}
+            descriptionMap={ENV_DESCRIPTION_MAP}
+            riskBadgeClasses={ENV_RISK_BADGE_CLASSES}
+            riskLabels={ENV_RISK_LABELS}
+            effectScopeLabels={ENV_EFFECT_SCOPE_LABELS}
+            onSearchChange={setEnvSearch}
+            onSelectEnvKey={setSelectedEnvKey}
+            onSelectedEnvValueChange={(value) => {
+              if (!selectedEnvKey) return;
+              setEnvDrafts((current) => ({
+                ...current,
+                [selectedEnvKey]: value,
+              }));
+            }}
+            onSaveEnv={handleSaveEnv}
+            onResetEnv={handleResetEnv}
+            onResetAllEnv={() => setResetAllEnvDialogOpen(true)}
+          />
         </TabsContent>
       </Tabs>
 

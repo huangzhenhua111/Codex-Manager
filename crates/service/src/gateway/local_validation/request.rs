@@ -1568,7 +1568,7 @@ fn apply_passthrough_request_overrides(
             effective_service_tier.as_deref(),
             api_key.upstream_base_url.as_deref(),
             None,
-            false,
+            true,
         );
     let rewritten_body = super::super::normalize_official_responses_http_body(
         transport_request_path(path).as_str(),

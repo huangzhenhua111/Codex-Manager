@@ -149,7 +149,7 @@ impl CandidateExecutionState {
                         None,
                         Some(setup.upstream_base.as_str()),
                         effective_prompt_cache_key,
-                        false,
+                        true,
                     )
                 } else {
                     super::super::super::apply_request_overrides_with_service_tier_and_prompt_cache_key_scope(
@@ -160,7 +160,7 @@ impl CandidateExecutionState {
                         None,
                         Some(setup.upstream_base.as_str()),
                         effective_prompt_cache_key,
-                        false,
+                        true,
                     )
                 };
                 Bytes::from(rewritten)

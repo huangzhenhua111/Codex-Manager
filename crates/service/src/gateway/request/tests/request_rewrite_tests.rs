@@ -2242,18 +2242,18 @@ fn responses_apply_global_model_forward_rules_when_platform_key_not_bound() {
         "model": "spark",
         "input": "hello"
     });
-    let out = apply_request_overrides(
+    let out = apply_codex_compat_request_overrides(
         "/v1/responses",
         serde_json::to_vec(&body).expect("serialize request body"),
         None,
         None,
-        Some("https://api.openai.com/v1"),
+        Some("https://chatgpt.com/backend-api/codex"),
     );
     let value: serde_json::Value = serde_json::from_slice(&out).expect("parse output body");
 
     assert_eq!(
         value.get("model").and_then(serde_json::Value::as_str),
-        Some("spark")
+        Some("gpt-5.4-mini")
     );
 
     let _ = crate::gateway::set_model_forward_rules(original_rules.as_str());

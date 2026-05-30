@@ -7,6 +7,24 @@ pub(in super::super) enum CandidateSkipReason {
     Inflight,
 }
 
+fn account_source_ids_for_model(storage: &Storage, model: &str) -> Result<HashSet<String>, String> {
+    let mut account_source_ids = storage
+        .list_enabled_model_source_mappings_for_platform(model)
+        .map_err(|err| format!("list model source mappings failed: {err}"))?
+        .into_iter()
+        .filter(|mapping| mapping.source_kind == "openai_account")
+        .map(|mapping| mapping.source_id)
+        .collect::<HashSet<_>>();
+    if account_source_ids.is_empty() {
+        account_source_ids.extend(
+            storage
+                .list_available_source_model_ids_by_upstream_model("openai_account", model)
+                .map_err(|err| format!("list source models by upstream model failed: {err}"))?,
+        );
+    }
+    Ok(account_source_ids)
+}
+
 /// 函数 `prepare_gateway_candidates`
 ///
 /// 作者: gaohongshun
@@ -47,13 +65,7 @@ pub(crate) fn prepare_gateway_candidates(
         .filter(|value| !value.is_empty());
     if let Some(model) = normalized_model {
         let _ = crate::apikey_models::bootstrap_account_pool_model_routes(storage, false);
-        let account_source_ids = storage
-            .list_enabled_model_source_mappings_for_platform(model)
-            .map_err(|err| format!("list model source mappings failed: {err}"))?
-            .into_iter()
-            .filter(|mapping| mapping.source_kind == "openai_account")
-            .map(|mapping| mapping.source_id)
-            .collect::<HashSet<_>>();
+        let account_source_ids = account_source_ids_for_model(storage, model)?;
         candidates.retain(|(account, _)| account_source_ids.contains(&account.id));
     }
     Ok(candidates)
@@ -177,7 +189,9 @@ mod tests {
         allow_openai_fallback_for_account, candidate_skip_reason_for_proxy,
         free_account_model_override, CandidateSkipReason,
     };
-    use codexmanager_core::storage::{now_ts, Account, Storage, Token, UsageSnapshotRecord};
+    use codexmanager_core::storage::{
+        now_ts, Account, ModelSourceModel, Storage, Token, UsageSnapshotRecord,
+    };
 
     /// 函数 `free_account_model_override_uses_configured_model_for_free_account`
     ///
@@ -253,6 +267,63 @@ mod tests {
         let _ = crate::gateway::set_free_account_max_model(&original);
 
         assert_eq!(actual.as_deref(), Some("gpt-5.2"));
+    }
+
+    #[test]
+    fn prepare_gateway_candidates_accepts_direct_upstream_model_without_platform_mapping() {
+        let _guard = crate::test_env_guard();
+        let storage = Storage::open_in_memory().expect("open");
+        storage.init().expect("init");
+        let now = now_ts();
+        storage
+            .insert_account(&Account {
+                id: "acc-direct-upstream".to_string(),
+                label: "acc-direct-upstream".to_string(),
+                issuer: "issuer".to_string(),
+                chatgpt_account_id: None,
+                workspace_id: None,
+                group_name: None,
+                sort: 0,
+                status: "active".to_string(),
+                created_at: now,
+                updated_at: now,
+            })
+            .expect("insert account");
+        storage
+            .insert_token(&Token {
+                account_id: "acc-direct-upstream".to_string(),
+                id_token: "header.payload.sig".to_string(),
+                access_token: "header.payload.sig".to_string(),
+                refresh_token: "refresh".to_string(),
+                api_key_access_token: None,
+                last_refresh: now,
+            })
+            .expect("insert token");
+        storage
+            .upsert_model_source_model(&ModelSourceModel {
+                source_kind: "openai_account".to_string(),
+                source_id: "acc-direct-upstream".to_string(),
+                upstream_model: "gpt-5.4-mini".to_string(),
+                display_name: Some("gpt-5.4-mini".to_string()),
+                status: "available".to_string(),
+                discovery_kind: "manual".to_string(),
+                last_synced_at: Some(now),
+                extra_json: "{}".to_string(),
+                created_at: now,
+                updated_at: now,
+            })
+            .expect("upsert source model");
+
+        let candidates = super::prepare_gateway_candidates(
+            &storage,
+            Some("gpt-5.4-mini"),
+            None,
+            crate::gateway::LowQuotaCandidateMode::NormalOnly,
+        )
+        .expect("prepare candidates");
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].0.id, "acc-direct-upstream");
     }
 
     /// 函数 `free_account_model_override_accepts_single_window_weekly_account`

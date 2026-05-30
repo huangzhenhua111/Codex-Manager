@@ -107,6 +107,30 @@ impl Storage {
         rows.collect()
     }
 
+    pub fn list_available_source_model_ids_by_upstream_model(
+        &self,
+        source_kind: &str,
+        upstream_model: &str,
+    ) -> Result<Vec<String>> {
+        let source_kind = normalize_text(source_kind);
+        let upstream_model = normalize_text(upstream_model);
+        if source_kind.is_empty() || upstream_model.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT source_id
+             FROM model_source_models
+             WHERE source_kind = ?1
+               AND upstream_model = ?2
+               AND status = 'available'
+             ORDER BY source_id ASC",
+        )?;
+        let rows = stmt.query_map(params![source_kind, upstream_model], |row| {
+            row.get::<_, String>(0)
+        })?;
+        rows.collect()
+    }
+
     pub fn upsert_model_source_model(&self, model: &ModelSourceModel) -> Result<()> {
         self.conn.execute(
             "INSERT INTO model_source_models (
