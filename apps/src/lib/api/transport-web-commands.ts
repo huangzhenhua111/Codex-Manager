@@ -543,6 +543,7 @@ export function createWebCommandMap(
     },
     service_model_source_mapping_delete: {
       rpcMethod: "apikey/modelSourceMappingDelete",
+      mapParams: (params) => asRecord(asRecord(params)?.payload) ?? {},
     },
     service_model_price_rules_list: {
       rpcMethod: "quota/modelPriceRules/list",

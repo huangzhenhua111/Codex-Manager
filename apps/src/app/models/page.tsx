@@ -1112,7 +1112,14 @@ export default function ModelsPage() {
                                     size="icon"
                                     aria-label={t("删除映射")}
                                     disabled={isRoutingSaving}
-                                    onClick={() => void deleteSourceMapping(mapping.id)}
+                                    onClick={() =>
+                                      void deleteSourceMapping(
+                                        mapping.id,
+                                        mapping.sourceKind,
+                                        mapping.sourceId,
+                                        mapping.upstreamModel,
+                                      )
+                                    }
                                   >
                                     <Unlink className="h-4 w-4" />
                                   </Button>

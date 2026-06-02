@@ -405,13 +405,42 @@ pub(crate) fn save_managed_model_source_mapping(
     storage
         .upsert_model_source_mapping(&mapping)
         .map_err(|err| format!("save model mapping failed: {err}"))?;
+    if mapping.enabled {
+        storage
+            .delete_model_source_mapping_preference(
+                &mapping.source_kind,
+                &mapping.source_id,
+                &mapping.upstream_model,
+            )
+            .map_err(|err| format!("clear preference failed: {err}"))?;
+    } else {
+        storage
+            .upsert_model_source_mapping_preference(
+                &mapping.source_kind,
+                &mapping.source_id,
+                &mapping.upstream_model,
+                "disabled",
+            )
+            .map_err(|err| format!("save disable preference failed: {err}"))?;
+    }
     Ok(source_mapping_entry(mapping))
 }
 
-pub(crate) fn delete_managed_model_source_mapping(id: &str) -> Result<(), String> {
+pub(crate) fn delete_managed_model_source_mapping(
+    id: &str,
+    source_kind: &str,
+    source_id: &str,
+    upstream_model: &str,
+) -> Result<(), String> {
     let storage =
         storage_helpers::open_storage().ok_or_else(|| "storage unavailable".to_string())?;
     let id = normalize_required("id", id)?;
+    let source_kind = normalize_routing_source_kind(source_kind)?;
+    let source_id = normalize_required("sourceId", source_id)?;
+    let upstream_model = normalize_required("upstreamModel", upstream_model)?;
+    storage
+        .upsert_model_source_mapping_preference(&source_kind, &source_id, &upstream_model, "unlinked")
+        .map_err(|err| format!("save unlink preference failed: {err}"))?;
     storage
         .delete_model_source_mapping(id.as_str())
         .map_err(|err| format!("delete model mapping failed: {err}"))
@@ -502,6 +531,12 @@ fn sync_openai_account_source_models_with_options(
         .collect::<HashSet<_>>();
     if let Some(source_id) = requested_source_id.as_deref() {
         if !active_source_ids.contains(source_id) {
+            storage
+                .delete_model_source_mapping_preferences_for_source(
+                    ROUTING_SOURCE_KIND_OPENAI_ACCOUNT,
+                    source_id,
+                )
+                .map_err(|err| format!("delete account preferences failed: {err}"))?;
             storage
                 .delete_model_source_routes_for_source(
                     ROUTING_SOURCE_KIND_OPENAI_ACCOUNT,
@@ -608,6 +643,12 @@ where
                 ROUTING_SOURCE_KIND_AGGREGATE_API,
                 source_id,
             )?;
+            storage
+                .delete_model_source_mapping_preferences_for_source(
+                    ROUTING_SOURCE_KIND_AGGREGATE_API,
+                    source_id,
+                )
+                .map_err(|err| format!("delete api preferences failed: {err}"))?;
             storage
                 .delete_model_source_routes_for_source(ROUTING_SOURCE_KIND_AGGREGATE_API, source_id)
                 .map_err(|err| format!("delete stale aggregate api source routes failed: {err}"))?;
@@ -832,6 +873,13 @@ fn auto_associate_source_models(
         .map(|mapping| mapping.platform_model_slug)
         .collect::<HashSet<_>>();
 
+    let prefs: std::collections::HashMap<String, String> = storage
+        .list_model_source_mapping_preferences(source_kind, source_id)
+        .map_err(|err| format!("list preferences failed: {err}"))?
+        .into_iter()
+        .map(|p| (p.upstream_model, p.preference))
+        .collect();
+
     let source_models = storage
         .list_model_source_models(Some(source_kind), Some(source_id))
         .map_err(|err| format!("list source models failed: {err}"))?
@@ -901,13 +949,22 @@ fn auto_associate_source_models(
         if existing_source_platform_mappings.contains(source_model.upstream_model.as_str()) {
             continue;
         }
+        if prefs
+            .get(source_model.upstream_model.as_str())
+            .map_or(false, |v| v == "unlinked")
+        {
+            continue;
+        }
+        let enabled = prefs
+            .get(source_model.upstream_model.as_str())
+            .map_or(true, |v| v != "disabled");
         let mapping = ModelSourceMapping {
             id: generate_mapping_id(),
             platform_model_slug: source_model.upstream_model.clone(),
             source_kind: source_kind.to_string(),
             source_id: source_id.to_string(),
             upstream_model: source_model.upstream_model.clone(),
-            enabled: true,
+            enabled,
             priority: 0,
             weight: 1,
             billing_model_slug: None,

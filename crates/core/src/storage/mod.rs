@@ -97,6 +97,15 @@ pub struct ModelSourceMapping {
 }
 
 #[derive(Debug, Clone)]
+pub struct ModelSourceMappingPreference {
+    pub source_kind: String,
+    pub source_id: String,
+    pub upstream_model: String,
+    pub preference: String,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone)]
 pub struct AccountQuotaCapacityTemplate {
     pub plan_type: String,
     pub primary_window_tokens: Option<i64>,
@@ -1007,6 +1016,11 @@ impl Storage {
         self.apply_sql_migration(
             "064_drop_gateway_error_logs",
             include_str!("../../migrations/064_drop_gateway_error_logs.sql"),
+        )?;
+        self.apply_sql_or_compat_migration(
+            "065_model_source_mapping_preferences",
+            include_str!("../../migrations/065_model_source_mapping_preferences.sql"),
+            |s| s.ensure_model_source_tables(),
         )?;
         self.ensure_api_key_rotation_columns()?;
         self.ensure_aggregate_apis_table()?;

@@ -865,8 +865,13 @@ export const accountClient = {
     if (!item) throw new Error("模型映射保存结果为空");
     return item;
   },
-  deleteManagedModelSourceMapping: (id: string) =>
-    invoke("service_model_source_mapping_delete", withAddr({ id })),
+  deleteManagedModelSourceMapping: (params: {
+    id: string;
+    sourceKind: string;
+    sourceId: string;
+    upstreamModel: string;
+  }) =>
+    invoke("service_model_source_mapping_delete", withAddr({ payload: params })),
   async saveManagedModel(params: ManagedModelPayload): Promise<ManagedModelInfo> {
     const payload = {
       previousSlug: params.previousSlug || null,

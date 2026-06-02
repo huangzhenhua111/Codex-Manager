@@ -488,6 +488,11 @@ impl Storage {
              WHERE source_kind = 'openai_account' AND source_id = ?1",
             [account_id],
         )?;
+        tx.execute(
+            "DELETE FROM model_source_mapping_preferences
+             WHERE source_kind = 'openai_account' AND source_id = ?1",
+            [account_id],
+        )?;
         tx.execute("DELETE FROM accounts WHERE id = ?1", [account_id])?;
         tx.commit()?;
         Ok(())

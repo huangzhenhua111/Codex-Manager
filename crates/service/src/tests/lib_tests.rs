@@ -176,7 +176,12 @@ fn password_mode_can_call_admin_and_model_source_rpcs() {
         ),
         (
             "apikey/modelSourceMappingDelete",
-            serde_json::json!({ "id": "map_test" }),
+            serde_json::json!({
+                "id": "map_test",
+                "sourceKind": "openai_account",
+                "sourceId": "acc_test",
+                "upstreamModel": "gpt-test",
+            }),
         ),
     ] {
         let resp = response_result(handle_request_with_actor(

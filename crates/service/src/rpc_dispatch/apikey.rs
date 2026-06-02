@@ -233,7 +233,12 @@ pub(super) fn try_handle(req: &JsonRpcRequest, actor: &RpcActor) -> Option<JsonR
         }
         "apikey/modelSourceMappingDelete" => {
             let id = super::str_param(req, "id").unwrap_or("");
-            super::ok_or_error(apikey_models::delete_managed_model_source_mapping(id))
+            let source_kind = super::str_param(req, "sourceKind").unwrap_or("");
+            let source_id = super::str_param(req, "sourceId").unwrap_or("");
+            let upstream_model = super::str_param(req, "upstreamModel").unwrap_or("");
+            super::ok_or_error(apikey_models::delete_managed_model_source_mapping(
+                id, source_kind, source_id, upstream_model,
+            ))
         }
         "apikey/usageStats" => super::value_or_error(
             apikey_usage_stats::read_api_key_usage_stats_for_actor(actor)

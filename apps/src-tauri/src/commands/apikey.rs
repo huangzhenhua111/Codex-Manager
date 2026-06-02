@@ -210,10 +210,9 @@ pub async fn service_model_source_mapping_save(
 #[tauri::command]
 pub async fn service_model_source_mapping_delete(
     addr: Option<String>,
-    id: String,
+    payload: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
-    let params = serde_json::json!({ "id": id });
-    rpc_call_in_background("apikey/modelSourceMappingDelete", addr, Some(params)).await
+    rpc_call_in_background("apikey/modelSourceMappingDelete", addr, Some(payload)).await
 }
 
 /// 函数 `service_apikey_usage_stats`
