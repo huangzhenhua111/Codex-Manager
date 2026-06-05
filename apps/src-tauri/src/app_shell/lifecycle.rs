@@ -18,7 +18,7 @@ use super::state::{
     TRAY_AVAILABLE,
 };
 #[cfg(target_os = "macos")]
-use super::window::show_main_window;
+use super::window::request_show_main_window;
 use super::window::{hide_tray_preview_window, MAIN_WINDOW_LABEL, TRAY_PREVIEW_WINDOW_LABEL};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,7 +49,7 @@ fn resolve_main_window_close_mode(
     if !close_to_tray_on_close || !tray_available {
         return MainWindowCloseMode::AllowWindowClose;
     }
-    if lightweight_tray_close {
+    if cfg!(target_os = "windows") || lightweight_tray_close {
         return MainWindowCloseMode::CloseForLightweightTray;
     }
     MainWindowCloseMode::HideToTray
@@ -225,7 +225,9 @@ pub(crate) fn handle_run_event(app: &tauri::AppHandle, event: &tauri::RunEvent) 
         }
         #[cfg(target_os = "macos")]
         tauri::RunEvent::Reopen { .. } => {
-            show_main_window(app);
+            if let Err(err) = request_show_main_window(app) {
+                log::warn!("request show main window from reopen failed: {}", err);
+            }
         }
         _ => {}
     }
@@ -259,9 +261,15 @@ mod tests {
             resolve_main_window_close_mode(true, false, false),
             MainWindowCloseMode::AllowWindowClose
         );
+        #[cfg(not(target_os = "windows"))]
         assert_eq!(
             resolve_main_window_close_mode(true, true, false),
             MainWindowCloseMode::HideToTray
+        );
+        #[cfg(target_os = "windows")]
+        assert_eq!(
+            resolve_main_window_close_mode(true, true, false),
+            MainWindowCloseMode::CloseForLightweightTray
         );
         assert_eq!(
             resolve_main_window_close_mode(true, true, true),

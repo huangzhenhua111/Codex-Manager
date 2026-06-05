@@ -13,5 +13,5 @@ pub(crate) use state::{
     prepare_for_forced_app_exit, set_unsaved_settings_draft_sections, CLOSE_TO_TRAY_ON_CLOSE,
     KEEP_ALIVE_FOR_LIGHTWEIGHT_CLOSE, LIGHTWEIGHT_MODE_ON_CLOSE_TO_TRAY, TRAY_AVAILABLE,
 };
-pub(crate) use tray::{notify_existing_instance_focused, setup_tray};
-pub(crate) use window::show_main_window;
+pub(crate) use tray::setup_tray;
+pub(crate) use window::request_show_main_window;

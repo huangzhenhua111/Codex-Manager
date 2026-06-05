@@ -1,5 +1,5 @@
 use crate::{
-    app_shell::{set_unsaved_settings_draft_sections, show_main_window},
+    app_shell::{request_show_main_window, set_unsaved_settings_draft_sections},
     commands::shared::{
         open_external_url_blocking, open_in_browser_blocking, open_in_file_manager_blocking,
     },
@@ -67,6 +67,5 @@ pub fn app_window_unsaved_draft_sections_set(sections: Vec<String>) -> Result<()
 
 #[tauri::command]
 pub fn app_show_main_window(app: tauri::AppHandle) -> Result<(), String> {
-    show_main_window(&app);
-    Ok(())
+    request_show_main_window(&app)
 }

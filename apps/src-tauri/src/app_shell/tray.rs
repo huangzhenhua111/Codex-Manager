@@ -1,4 +1,3 @@
-use rfd::{MessageButtons, MessageDialog, MessageLevel};
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 
@@ -9,30 +8,10 @@ use super::state::{
     has_unsaved_settings_draft_sections, mark_skip_next_unsaved_settings_exit_confirm,
     APP_EXIT_REQUESTED, KEEP_ALIVE_FOR_LIGHTWEIGHT_CLOSE, TRAY_AVAILABLE,
 };
-use super::window::{show_main_window, toggle_tray_preview_window};
+use super::window::{request_show_main_window, toggle_tray_preview_window};
 
 const TRAY_MENU_SHOW_MAIN: &str = "tray_show_main";
 const TRAY_MENU_QUIT_APP: &str = "tray_quit_app";
-
-/// 函数 `notify_existing_instance_focused`
-///
-/// 作者: gaohongshun
-///
-/// 时间: 2026-04-02
-///
-/// # 参数
-/// - crate: 参数 crate
-///
-/// # 返回
-/// 无
-pub(crate) fn notify_existing_instance_focused() {
-    let _ = MessageDialog::new()
-        .set_title("CodexManager")
-        .set_description("CodexManager 已在运行，已切换到现有窗口。")
-        .set_level(MessageLevel::Info)
-        .set_buttons(MessageButtons::Ok)
-        .show();
-}
 
 /// 函数 `setup_tray`
 ///
@@ -55,7 +34,9 @@ pub(crate) fn setup_tray(app: &tauri::AppHandle) -> Result<(), tauri::Error> {
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| match event.id().as_ref() {
             TRAY_MENU_SHOW_MAIN => {
-                show_main_window(app);
+                if let Err(err) = request_show_main_window(app) {
+                    log::warn!("request show main window from tray failed: {}", err);
+                }
             }
             TRAY_MENU_QUIT_APP => {
                 if has_unsaved_settings_draft_sections() {

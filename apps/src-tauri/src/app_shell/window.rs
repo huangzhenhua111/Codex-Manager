@@ -1,15 +1,18 @@
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use tauri::webview::Color;
 use tauri::window::{Effect, EffectState, EffectsBuilder};
 use tauri::Manager;
 use tauri::{PhysicalPosition, PhysicalRect, Rect, WebviewUrl, WebviewWindowBuilder};
 
-use super::state::KEEP_ALIVE_FOR_LIGHTWEIGHT_CLOSE;
+use super::state::{APP_EXIT_REQUESTED, KEEP_ALIVE_FOR_LIGHTWEIGHT_CLOSE};
 
 pub(crate) const MAIN_WINDOW_LABEL: &str = "main";
 pub(crate) const TRAY_PREVIEW_WINDOW_LABEL: &str = "tray-preview";
 const TRAY_PREVIEW_WIDTH: f64 = 360.0;
 const TRAY_PREVIEW_HEIGHT: f64 = 390.0;
 const TRAY_PREVIEW_MARGIN: f64 = 8.0;
+static SHOW_MAIN_WINDOW_PENDING: AtomicBool = AtomicBool::new(false);
 
 /// 函数 `show_main_window`
 ///
@@ -22,18 +25,68 @@ const TRAY_PREVIEW_MARGIN: f64 = 8.0;
 ///
 /// # 返回
 /// 无
-pub(crate) fn show_main_window(app: &tauri::AppHandle) {
+fn show_main_window(app: &tauri::AppHandle) -> bool {
+    if APP_EXIT_REQUESTED.load(Ordering::Relaxed) {
+        log::info!("show main window skipped because app exit is already requested");
+        return false;
+    }
+    log::info!("show main window requested");
     hide_tray_preview_window(app);
-    KEEP_ALIVE_FOR_LIGHTWEIGHT_CLOSE.store(false, std::sync::atomic::Ordering::Relaxed);
+    KEEP_ALIVE_FOR_LIGHTWEIGHT_CLOSE.store(false, Ordering::Relaxed);
     let Some(window) = ensure_main_window(app) else {
-        return;
+        return false;
     };
+    if let Err(err) = window.unminimize() {
+        log::debug!("unminimize main window before show skipped: {}", err);
+    }
     if let Err(err) = window.show() {
         log::warn!("show main window failed: {}", err);
-        return;
+        return false;
     }
-    let _ = window.unminimize();
-    let _ = window.set_focus();
+    if let Err(err) = window.unminimize() {
+        log::warn!("unminimize main window after show failed: {}", err);
+    }
+    if let Err(err) = window.set_focus() {
+        log::warn!("focus main window failed: {}", err);
+    }
+    log::info!("show main window completed");
+    true
+}
+
+pub(crate) fn request_show_main_window(app: &tauri::AppHandle) -> Result<(), String> {
+    if APP_EXIT_REQUESTED.load(Ordering::Relaxed) {
+        return Err("app is exiting; show main window request skipped".to_string());
+    }
+    if SHOW_MAIN_WINDOW_PENDING.swap(true, Ordering::AcqRel) {
+        log::debug!("show main window request coalesced because one is already pending");
+        return Ok(());
+    }
+
+    let app = app.clone();
+    std::thread::spawn(move || {
+        if APP_EXIT_REQUESTED.load(Ordering::Relaxed) {
+            SHOW_MAIN_WINDOW_PENDING.store(false, Ordering::Release);
+            return;
+        }
+        let app_for_show = app.clone();
+        if let Err(err) = app.run_on_main_thread(move || {
+            if APP_EXIT_REQUESTED.load(Ordering::Relaxed) {
+                log::info!("show main window skipped on main thread because app is exiting");
+                SHOW_MAIN_WINDOW_PENDING.store(false, Ordering::Release);
+                return;
+            }
+            let shown = show_main_window(&app_for_show);
+            if !shown {
+                log::warn!("show main window request completed without showing a window");
+            }
+            SHOW_MAIN_WINDOW_PENDING.store(false, Ordering::Release);
+        }) {
+            log::warn!("schedule show main window on main thread failed: {}", err);
+            KEEP_ALIVE_FOR_LIGHTWEIGHT_CLOSE.store(false, Ordering::Relaxed);
+            SHOW_MAIN_WINDOW_PENDING.store(false, Ordering::Release);
+        }
+    });
+    Ok(())
 }
 
 pub(crate) fn hide_tray_preview_window(app: &tauri::AppHandle) {
