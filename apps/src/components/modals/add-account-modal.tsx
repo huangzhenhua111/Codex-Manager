@@ -21,6 +21,7 @@ import { Textarea } from "@/components/ui/textarea";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { accountClient } from "@/lib/api/account-client";
+import { CODEX_PROFILE_CANDIDATES_QUERY_KEY } from "@/lib/api/codex-profile-client";
 import { useRuntimeCapabilities } from "@/hooks/useRuntimeCapabilities";
 import { useI18n } from "@/lib/i18n/provider";
 import { useAppStore } from "@/lib/store/useAppStore";
@@ -267,6 +268,7 @@ export function AddAccountModal({ open, onOpenChange }: AddAccountModalProps) {
       queryClient.invalidateQueries({ queryKey: ["accounts"] }),
       queryClient.invalidateQueries({ queryKey: ["usage"] }),
       queryClient.invalidateQueries({ queryKey: ["startup-snapshot"] }),
+      queryClient.invalidateQueries({ queryKey: CODEX_PROFILE_CANDIDATES_QUERY_KEY }),
     ]);
   };
 
@@ -508,6 +510,7 @@ export function AddAccountModal({ open, onOpenChange }: AddAccountModalProps) {
         queryClient.invalidateQueries({ queryKey: ["accounts"] }),
         queryClient.invalidateQueries({ queryKey: ["usage"] }),
         queryClient.invalidateQueries({ queryKey: ["startup-snapshot"] }),
+        queryClient.invalidateQueries({ queryKey: CODEX_PROFILE_CANDIDATES_QUERY_KEY }),
       ]);
       resetModalState();
       onOpenChange(false);

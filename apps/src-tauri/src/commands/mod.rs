@@ -2,6 +2,7 @@ pub mod account;
 pub mod account_manager;
 pub mod aggregate_api;
 pub mod apikey;
+pub mod codex_profile;
 pub mod dashboard;
 pub mod login;
 pub mod plugin;

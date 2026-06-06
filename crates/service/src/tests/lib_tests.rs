@@ -112,23 +112,29 @@ fn unknown_method_returns_jsonrpc_error() {
 
 #[test]
 fn member_actor_cannot_call_admin_only_rpc() {
-    let req = JsonRpcRequest {
-        id: 21.into(),
-        method: "accountManager/users/list".to_string(),
-        params: None,
-        trace: None,
-    };
+    for method in [
+        "accountManager/users/list",
+        "codexProfile/repairHistory",
+        "codexProfile/pruneHistoryBackups",
+    ] {
+        let req = JsonRpcRequest {
+            id: 21.into(),
+            method: method.to_string(),
+            params: None,
+            trace: None,
+        };
 
-    let resp = response_result(handle_request_with_actor(
-        req,
-        RpcActor::from_parts(Some(ROLE_MEMBER), Some("user-1")),
-    ));
-    let err = resp
-        .result
-        .get("error")
-        .and_then(|value| value.as_str())
-        .unwrap_or("");
-    assert!(err.contains("permission_denied"));
+        let resp = response_result(handle_request_with_actor(
+            req,
+            RpcActor::from_parts(Some(ROLE_MEMBER), Some("user-1")),
+        ));
+        let err = resp
+            .result
+            .get("error")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+        assert!(err.contains("permission_denied"), "{method}: {err}");
+    }
 }
 
 #[test]
