@@ -103,6 +103,7 @@ import {
   compareEnvOverrideItems,
   ensureModelForwardRuleRows,
   formatFreeAccountModelLabel,
+  formatRuntimeTimeZoneLabel,
   inferServiceBindPreview,
   matchesRecommendedWorkerSettings,
   normalizeEnvRiskLevel,
@@ -2132,9 +2133,15 @@ function AdminSettingsPage() {
                 </div>
                 <div className="text-xs text-muted-foreground lg:col-span-2">
                   <span>
-                    {snapshot.backgroundTasks.warmupCronEnabled
-                      ? t("定时账号预热已启用")
-                      : t("定时账号预热未启用。多个计划用 | 分隔。")}
+                    {t(
+                      "计划按服务端时区 {timeZone} 执行。多个计划用 | 分隔。",
+                      {
+                        timeZone: formatRuntimeTimeZoneLabel(
+                          snapshot.runtimeTimeZone,
+                          t("服务端本地时区"),
+                        ),
+                      },
+                    )}
                   </span>
                 </div>
               </div>

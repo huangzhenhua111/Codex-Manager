@@ -558,6 +558,9 @@ export const EN_MESSAGES: MessageCatalog = {
   网关保活线程: "Gateway keepalive worker",
   令牌刷新轮询: "Token refresh polling",
   "Worker 并发参数": "Worker concurrency",
+  "计划按服务端时区 {timeZone} 执行。多个计划用 | 分隔。":
+    "Schedule runs in server time zone {timeZone}. Separate multiple schedules with |.",
+  服务端本地时区: "Server local time zone",
   当前档位: "Current preset",
   自定义: "Custom",
   "搜索变量...": "Search variables...",

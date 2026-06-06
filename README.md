@@ -150,6 +150,7 @@
 - macOS：`~/Library/Application Support/com.codexmanager.desktop/codexmanager.db`
 - Linux：`~/.local/share/com.codexmanager.desktop/codexmanager.db`
 - 如需调整数据库、代理、监听地址等运行配置，可继续查看 [环境变量与运行配置](docs/zh-CN/report/环境变量与运行配置说明.md)。
+- Docker 镜像默认使用 `TZ=Asia/Shanghai`；compose 示例会优先沿用部署环境里的 `TZ`，没有设置时回退到 `Asia/Shanghai`，其他地区部署时请改成对应 IANA 时区。
 
 ## 页面展示
 ### 桌面端
