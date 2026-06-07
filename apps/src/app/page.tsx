@@ -509,6 +509,7 @@ function DailyTokenLineChart({
   zoomWindow?: { startIndex: number; endIndex: number } | null;
   onZoomWindowChange?: (next: { startIndex: number; endIndex: number } | null) => void;
 }) {
+  const { t } = useI18n();
   const chartConfig = {
     totalTokens: {
       label: "Token",
@@ -590,7 +591,7 @@ function DailyTokenLineChart({
     <div
       className="rounded-xl"
       onWheel={handleWheelZoom}
-      title="在图表区域使用鼠标滚轮缩放时间区间"
+      title={t("在图表区域使用鼠标滚轮缩放时间区间")}
     >
       <ChartContainer
         config={chartConfig}

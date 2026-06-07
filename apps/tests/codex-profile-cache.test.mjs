@@ -46,6 +46,9 @@ test("平台模式页面可见时会主动刷新候选列表", async () => {
 test("平台模式页面采用当前模式优先的切换结构", async () => {
   const source = `${await readSource("src/app/platform-mode/page.tsx")}\n${await readSource("src/app/platform-mode/page-sections.tsx")}`;
   assert.match(source, /平台模式选择/);
+  assert.match(source, /state\.mode === "web-gateway"/);
+  assert.match(source, /Web \/ Docker 模式/);
+  assert.match(source, /\/api\/rpc 写入 codexmanager-service/);
   assert.match(source, /当前模式/);
   assert.match(source, /账号直连/);
   assert.match(source, /本地网关/);

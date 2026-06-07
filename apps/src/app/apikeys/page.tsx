@@ -792,7 +792,7 @@ export default function ApiKeysPage() {
                         {key.model ? (
                           key.model
                         ) : (
-                          <span title="跟随请求表示使用请求体里的实际 model；请求日志展示的是最终生效模型。">
+                          <span title={t("跟随请求表示使用请求体里的实际 model；请求日志展示的是最终生效模型。")}>
                             {t("跟随请求")}
                           </span>
                         )}

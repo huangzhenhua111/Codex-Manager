@@ -1,14 +1,36 @@
 "use client";
 
 import type { MessageCatalog } from "./types";
+import { EN_ACCESS_CONTROL_MESSAGES } from "./sections/en-access-control";
+import { EN_ACCOUNT_MANAGER_MESSAGES } from "./sections/en-account-manager";
+import { EN_ACCOUNTS_MESSAGES } from "./sections/en-accounts";
+import { EN_API_KEYS_MESSAGES } from "./sections/en-api-keys";
+import { EN_AGGREGATE_API_MESSAGES } from "./sections/en-aggregate-api";
+import { EN_DASHBOARD_MESSAGES } from "./sections/en-dashboard";
+import { EN_DYNAMIC_UI_MESSAGES } from "./sections/en-dynamic-ui";
+import { EN_MODEL_CATALOG_MESSAGES } from "./sections/en-model-catalog";
+import { EN_MODEL_GROUPS_MESSAGES } from "./sections/en-model-groups";
+import { EN_MODELS_MESSAGES } from "./sections/en-models";
 import { EN_PLATFORM_MODE_MESSAGES } from "./sections/en-platform-mode";
+import { EN_RUNTIME_UI_MESSAGES } from "./sections/en-runtime-ui";
 
 export const EN_MESSAGES: MessageCatalog = {
   仪表盘: "Dashboard",
   概览: "Overview",
   平台接入: "Platform Access",
   平台配置: "Platform Configuration",
+  ...EN_ACCESS_CONTROL_MESSAGES,
+  ...EN_ACCOUNT_MANAGER_MESSAGES,
+  ...EN_ACCOUNTS_MESSAGES,
+  ...EN_API_KEYS_MESSAGES,
+  ...EN_AGGREGATE_API_MESSAGES,
+  ...EN_DASHBOARD_MESSAGES,
+  ...EN_DYNAMIC_UI_MESSAGES,
+  ...EN_MODEL_CATALOG_MESSAGES,
+  ...EN_MODEL_GROUPS_MESSAGES,
+  ...EN_MODELS_MESSAGES,
   ...EN_PLATFORM_MODE_MESSAGES,
+  ...EN_RUNTIME_UI_MESSAGES,
   模型与路由: "Models & Routing",
   成员管理: "Member Management",
   运行观测: "Observability",

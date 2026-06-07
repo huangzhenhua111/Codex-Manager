@@ -32,11 +32,48 @@ import type {
 } from "@/types";
 
 function ModeFact({ label, value }: { label: string; value: string }) {
+  const displayValue = value || "-";
+  const valueSizeClass =
+    Array.from(displayValue).length > 64
+      ? "text-[0.68rem] leading-snug"
+      : Array.from(displayValue).length > 32
+        ? "text-[0.75rem] leading-snug"
+        : "text-sm";
   return (
-    <div className="rounded-xl border border-border/60 bg-background/35 p-3">
-      <p className="text-[11px] text-muted-foreground">{label}</p>
-      <p className="mt-1 truncate text-sm font-semibold">{value || "-"}</p>
+    <div className="min-w-0 rounded-xl border border-border/60 bg-background/35 p-3">
+      <p className="min-w-0 text-[11px] text-muted-foreground">{label}</p>
+      <p
+        className={cn(
+          "mt-1 block min-w-0 max-w-full break-all font-semibold [overflow-wrap:anywhere]",
+          valueSizeClass,
+        )}
+        title={displayValue}
+      >
+        {displayValue}
+      </p>
     </div>
+  );
+}
+
+function platformSelectLabelClassName(value: string): string {
+  const length = Array.from(String(value || "")).length;
+  if (length > 96) return "text-[10px] leading-tight";
+  if (length > 60) return "text-[11px] leading-snug";
+  if (length > 36) return "text-xs leading-snug";
+  return "text-sm";
+}
+
+function PlatformSelectText({ value }: { value: string }) {
+  return (
+    <span
+      className={cn(
+        "block min-w-0 max-w-full whitespace-normal break-words text-left [overflow-wrap:anywhere]",
+        platformSelectLabelClassName(value),
+      )}
+      title={value}
+    >
+      {value}
+    </span>
   );
 }
 
@@ -200,20 +237,31 @@ export function DirectAccountCard({
               onValueChange={onSelectAccount}
               disabled={!isServiceReady || isMutating || candidates.length === 0}
             >
-              <SelectTrigger className="w-full">
+              <SelectTrigger className="h-auto min-h-8 w-full whitespace-normal py-1.5 *:data-[slot=select-value]:line-clamp-none *:data-[slot=select-value]:min-w-0">
                 <SelectValue placeholder={t("选择账号")}>
-                  {(value) =>
-                    candidates.find((item) => item.id === value)?.label || t("选择账号")
-                  }
+                  {(value) => {
+                    const account = candidates.find((item) => item.id === value);
+                    return (
+                      <PlatformSelectText
+                        value={account ? accountLabel(account) : t("选择账号")}
+                      />
+                    );
+                  }}
                 </SelectValue>
               </SelectTrigger>
-              <SelectContent align="start">
+              <SelectContent
+                align="start"
+                className="w-[min(28rem,calc(100vw-2rem))] min-w-[min(28rem,calc(100vw-2rem))]"
+              >
                 <SelectGroup>
-                  {candidates.map((account) => (
-                    <SelectItem key={account.id} value={account.id}>
-                      {accountLabel(account)}
-                    </SelectItem>
-                  ))}
+                  {candidates.map((account) => {
+                    const label = accountLabel(account);
+                    return (
+                      <SelectItem key={account.id} value={account.id} className="items-start py-2">
+                        <PlatformSelectText value={label} />
+                      </SelectItem>
+                    );
+                  })}
                 </SelectGroup>
               </SelectContent>
             </Select>
@@ -296,21 +344,31 @@ export function GatewayModeCard({
               onValueChange={onSelectApiKey}
               disabled={!isServiceReady || isMutating || candidates.length === 0}
             >
-              <SelectTrigger className="w-full">
+              <SelectTrigger className="h-auto min-h-8 w-full whitespace-normal py-1.5 *:data-[slot=select-value]:line-clamp-none *:data-[slot=select-value]:min-w-0">
                 <SelectValue placeholder={t("选择平台密钥")}>
                   {(value) => {
                     const key = candidates.find((item) => item.id === value);
-                    return key ? keyLabel(key) : t("选择平台密钥");
+                    return (
+                      <PlatformSelectText
+                        value={key ? keyLabel(key) : t("选择平台密钥")}
+                      />
+                    );
                   }}
                 </SelectValue>
               </SelectTrigger>
-              <SelectContent align="start">
+              <SelectContent
+                align="start"
+                className="w-[min(28rem,calc(100vw-2rem))] min-w-[min(28rem,calc(100vw-2rem))]"
+              >
                 <SelectGroup>
-                  {candidates.map((key) => (
-                    <SelectItem key={key.id} value={key.id}>
-                      {keyLabel(key)}
-                    </SelectItem>
-                  ))}
+                  {candidates.map((key) => {
+                    const label = keyLabel(key);
+                    return (
+                      <SelectItem key={key.id} value={key.id} className="items-start py-2">
+                        <PlatformSelectText value={label} />
+                      </SelectItem>
+                    );
+                  })}
                 </SelectGroup>
               </SelectContent>
             </Select>

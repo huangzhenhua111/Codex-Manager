@@ -177,9 +177,14 @@ pub async fn service_model_catalog_delete(
 }
 
 #[tauri::command]
-pub async fn service_model_routing(
+pub async fn service_model_catalog_prune_stale_remote(
     addr: Option<String>,
 ) -> Result<serde_json::Value, String> {
+    rpc_call_in_background("apikey/modelCatalogPruneStaleRemote", addr, None).await
+}
+
+#[tauri::command]
+pub async fn service_model_routing(addr: Option<String>) -> Result<serde_json::Value, String> {
     rpc_call_in_background("apikey/modelRouting", addr, None).await
 }
 

@@ -1,14 +1,36 @@
 "use client";
 
 import type { MessageCatalog } from "./types";
+import { KO_ACCESS_CONTROL_MESSAGES } from "./sections/ko-access-control";
+import { KO_ACCOUNT_MANAGER_MESSAGES } from "./sections/ko-account-manager";
+import { KO_ACCOUNTS_MESSAGES } from "./sections/ko-accounts";
+import { KO_API_KEYS_MESSAGES } from "./sections/ko-api-keys";
+import { KO_AGGREGATE_API_MESSAGES } from "./sections/ko-aggregate-api";
+import { KO_DASHBOARD_MESSAGES } from "./sections/ko-dashboard";
+import { KO_DYNAMIC_UI_MESSAGES } from "./sections/ko-dynamic-ui";
+import { KO_MODEL_CATALOG_MESSAGES } from "./sections/ko-model-catalog";
+import { KO_MODEL_GROUPS_MESSAGES } from "./sections/ko-model-groups";
+import { KO_MODELS_MESSAGES } from "./sections/ko-models";
 import { KO_PLATFORM_MODE_MESSAGES } from "./sections/ko-platform-mode";
+import { KO_RUNTIME_UI_MESSAGES } from "./sections/ko-runtime-ui";
 
 export const KO_MESSAGES: MessageCatalog = {
   仪表盘: "대시보드",
   概览: "개요",
   平台接入: "플랫폼 연결",
   平台配置: "플랫폼 설정",
+  ...KO_ACCESS_CONTROL_MESSAGES,
+  ...KO_ACCOUNT_MANAGER_MESSAGES,
+  ...KO_ACCOUNTS_MESSAGES,
+  ...KO_API_KEYS_MESSAGES,
+  ...KO_AGGREGATE_API_MESSAGES,
+  ...KO_DASHBOARD_MESSAGES,
+  ...KO_DYNAMIC_UI_MESSAGES,
+  ...KO_MODEL_CATALOG_MESSAGES,
+  ...KO_MODEL_GROUPS_MESSAGES,
+  ...KO_MODELS_MESSAGES,
   ...KO_PLATFORM_MODE_MESSAGES,
+  ...KO_RUNTIME_UI_MESSAGES,
   模型与路由: "모델 및 라우팅",
   成员管理: "멤버 관리",
   运行观测: "운영 관측",

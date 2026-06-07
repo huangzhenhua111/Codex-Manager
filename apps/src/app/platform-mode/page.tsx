@@ -76,6 +76,16 @@ export default function PlatformModePage() {
         </AlertDescription>
       </Alert>
 
+      {state.mode === "web-gateway" ? (
+        <Alert className="border-sky-500/30 bg-sky-500/10">
+          <AlertTriangle className="size-4" />
+          <AlertTitle>{t("Web / Docker 模式")}</AlertTitle>
+          <AlertDescription>
+            {t("当前页面会通过 /api/rpc 写入 codexmanager-service 进程可访问的 Codex profile；Docker 部署时请确认 CODEX_HOME 或挂载卷指向你希望 Codex CLI 使用的配置目录。")}
+          </AlertDescription>
+        </Alert>
+      ) : null}
+
       {!state.isServiceReady ? (
         <Alert variant="destructive">
           <AlertTriangle className="size-4" />

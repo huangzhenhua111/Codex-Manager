@@ -95,7 +95,7 @@ export function useManagedModels() {
     options?: { force?: boolean },
   ): Promise<string | null> => {
     if (!catalog) {
-      return "模型目录为空";
+      return t("模型目录为空");
     }
 
     if (!isDesktopRuntime) {
@@ -103,12 +103,12 @@ export function useManagedModels() {
     }
 
     if (!isServiceReady) {
-      return "服务未连接";
+      return t("服务未连接");
     }
 
     const models = serializeManagedModelCatalogForCodexCache(catalog.items || []);
     if (models.length === 0) {
-      return "模型目录为空";
+      return t("模型目录为空");
     }
 
     const fingerprint = JSON.stringify(models);
@@ -433,7 +433,7 @@ export function useManagedModels() {
     },
     saveModelPriceRule: async (params: ModelPriceRuleUpsertPayload) => {
       if (!ensureServiceReady("保存模型价格")) {
-        throw new Error("服务未就绪，无法保存模型价格");
+        throw new Error(t("服务未就绪，无法保存模型价格"));
       }
       await accountClient.upsertModelPriceRule(params);
     },

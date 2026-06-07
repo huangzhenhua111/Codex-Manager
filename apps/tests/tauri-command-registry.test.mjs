@@ -10,18 +10,43 @@ async function readSource(relativePath) {
   return fs.readFile(path.join(appsRoot, relativePath), "utf8");
 }
 
-function extractInvokedCommands(source) {
-  return Array.from(source.matchAll(/invoke(?:<[^>]+>)?\(\s*["']([^"']+)["']/g))
-    .map((match) => match[1])
-    .filter((command) => command.startsWith("service_account_") || command.startsWith("service_usage_"));
+async function listSourceFiles(dir) {
+  const entries = await fs.readdir(dir, { withFileTypes: true });
+  const files = await Promise.all(
+    entries.map(async (entry) => {
+      const entryPath = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        if ([".next", "node_modules", "out"].includes(entry.name)) {
+          return [];
+        }
+        return listSourceFiles(entryPath);
+      }
+      return /\.(ts|tsx)$/.test(entry.name) ? [entryPath] : [];
+    }),
+  );
+  return files.flat();
 }
 
-test("账号池前端使用的 Tauri account/usage commands 都已注册", async () => {
-  const accountClientSource = await readSource("src/lib/api/account-client.ts");
-  const registrySource = await readSource("src-tauri/src/commands/registry.rs");
-  const commands = [...new Set(extractInvokedCommands(accountClientSource))].sort();
+function extractStaticInvokedCommands(source) {
+  return Array.from(
+    source.matchAll(/invoke(?:First)?(?:<[^>]+>)?\(\s*(?:\[\s*)?["']([^"']+)["']/g),
+  ).map((match) => match[1]);
+}
 
-  assert.ok(commands.length > 0, "未从 account-client.ts 读取到 account/usage command");
+test("前端静态调用的 Tauri commands 都已注册", async () => {
+  const sourceFiles = await listSourceFiles(path.join(appsRoot, "src"));
+  const registrySource = await readSource("src-tauri/src/commands/registry.rs");
+  const commands = [
+    ...new Set(
+      (
+        await Promise.all(
+          sourceFiles.map(async (file) => extractStaticInvokedCommands(await fs.readFile(file, "utf8"))),
+        )
+      ).flat(),
+    ),
+  ].sort();
+
+  assert.ok(commands.length > 0, "未从 apps/src 读取到静态 invoke command");
   for (const command of commands) {
     assert.match(
       registrySource,
