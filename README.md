@@ -22,7 +22,7 @@
 <p align="left">
   <a href="https://linux.do/t/topic/1688401" title="LINUX DO">
     <img
-      src="https://cdn3.linux.do/original/4X/d/1/4/d146c68151340881c884d95e0da4acdf369258c6.png"
+      src="https://cdn3.ldstatic.com/original/4X/c/c/d/ccd8c210609d498cbeb3d5201d4c259348447562.png"
       alt="LINUX DO"
       width="100"
       hight="100"
