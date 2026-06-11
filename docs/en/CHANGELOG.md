@@ -5,6 +5,22 @@ It follows Keep a Changelog with a lightweight adaptation for this repository.
 
 ## [Unreleased]
 
+## [0.3.9] - 2026-06-11
+
+### Added
+- Added an Unknown status cleanup option to account cleanup by status.
+- Disabled Aggregate APIs now retain discovered model pools and model mappings so they can be reused when re-enabled.
+
+### Fixed
+- Covered the newly imported account path in usage-refresh unavailable status handling.
+- Stabilized same-session `prompt_cache_key` behavior so the same session does not receive a new cache key.
+- Covered refresh-token invalidation cleanup after a session ends.
+- Changed `CODEXMANAGER_CODEX_IMAGE_GENERATION_AUTO_INJECT_TOOL` default to `0`, so normal Responses requests no longer auto-inject the `image_generation` tool by default.
+
+### Changed
+- Improved upstream relay compatibility observability.
+- Bumped the release version to `0.3.9` and synchronized workspace, frontend package, Tauri desktop metadata, and lockfiles.
+
 ## [0.3.8] - 2026-05-30
 
 ### Fixed
@@ -309,7 +325,8 @@ It follows Keep a Changelog with a lightweight adaptation for this repository.
 ### Changed
 - The operation area of ​​the account management page is integrated into a single "Account Operation" drop-down menu, replacing the stack of multiple buttons on the right, making the interface more concise.
 
-[Unreleased]: https://github.com/qxcnm/Codex-Manager/compare/v0.3.8...HEAD
+[Unreleased]: https://github.com/qxcnm/Codex-Manager/compare/v0.3.9...HEAD
+[0.3.9]: https://github.com/qxcnm/Codex-Manager/compare/v0.3.8...v0.3.9
 [0.3.8]: https://github.com/qxcnm/Codex-Manager/compare/v0.3.7...v0.3.8
 [0.3.7]: https://github.com/qxcnm/Codex-Manager/compare/v0.3.6...v0.3.7
 [0.3.6]: https://github.com/qxcnm/Codex-Manager/compare/v0.3.5...v0.3.6

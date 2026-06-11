@@ -5,6 +5,22 @@
 
 ## [Unreleased]
 
+## [0.3.9] - 2026-06-11
+
+### Added
+- 按状态清理账号新增“未知状态”删除选项。
+- 聚合 API 禁用后保留已发现模型池与模型映射，重新启用时可继续复用。
+
+### Fixed
+- 修复新导入账号在刷新用量状态处理中未覆盖不可用状态的场景。
+- 固定同一会话的 `prompt_cache_key`，避免同一会话被重新分配缓存 key。
+- 覆盖会话结束后刷新令牌失效的清理场景。
+- `CODEXMANAGER_CODEX_IMAGE_GENERATION_AUTO_INJECT_TOOL` 默认改为 `0`，普通 Responses 请求默认不再自动注入 `image_generation` tool。
+
+### Changed
+- 增强上游中转兼容观测信息。
+- 发布版本提升到 `0.3.9`，同步更新 workspace、前端包、Tauri 桌面端与锁文件。
+
 ## [0.3.8] - 2026-05-30
 
 ### Fixed
@@ -309,7 +325,8 @@
 ### Changed
 - 账号管理页操作区整合为单一“账号操作”下拉菜单，替代右侧多按钮堆叠，界面更简洁。
 
-[Unreleased]: https://github.com/qxcnm/Codex-Manager/compare/v0.3.8...HEAD
+[Unreleased]: https://github.com/qxcnm/Codex-Manager/compare/v0.3.9...HEAD
+[0.3.9]: https://github.com/qxcnm/Codex-Manager/compare/v0.3.8...v0.3.9
 [0.3.8]: https://github.com/qxcnm/Codex-Manager/compare/v0.3.7...v0.3.8
 [0.3.7]: https://github.com/qxcnm/Codex-Manager/compare/v0.3.6...v0.3.7
 [0.3.6]: https://github.com/qxcnm/Codex-Manager/compare/v0.3.5...v0.3.6
