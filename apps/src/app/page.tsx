@@ -86,9 +86,7 @@ import {
 import type {
   DashboardAdminUsageSummary,
   DashboardDailyUsagePoint,
-  DashboardSourceUsageSummary,
   DashboardTokenUsage,
-  DashboardUserUsageSummary,
   MemberDashboardAlert,
   MemberDashboardKeyUsage,
   MemberDashboardSummary,
@@ -331,14 +329,6 @@ function DirectModeUnavailable({
   );
 }
 
-function userUsageName(item: DashboardUserUsageSummary): string {
-  return item.displayName || item.username || item.userId;
-}
-
-function sourceUsageName(item: DashboardSourceUsageSummary): string {
-  return item.name || item.sourceId;
-}
-
 function sumDashboardTokenUsages(usages: DashboardTokenUsage[]): DashboardTokenUsage {
   return usages.reduce<DashboardTokenUsage>(
     (total, usage) => ({
@@ -549,55 +539,6 @@ function DailyTokenLineChart({
   );
 }
 
-function UsageRankList<T extends { todayUsage: DashboardTokenUsage; rangeUsage: DashboardTokenUsage }>({
-  title,
-  items,
-  labelForItem,
-  emptyText,
-  usageForItem = (item) => item.todayUsage,
-}: {
-  title: string;
-  items: T[];
-  labelForItem: (item: T) => string;
-  emptyText: string;
-  usageForItem?: (item: T) => DashboardTokenUsage;
-}) {
-  return (
-    <div className="min-w-0">
-      <div className="mb-2 text-xs font-semibold text-muted-foreground">{title}</div>
-      {items.length === 0 ? (
-        <Empty className="min-h-20 border bg-muted/20 p-3">
-          <EmptyHeader>
-            <EmptyTitle>{emptyText}</EmptyTitle>
-          </EmptyHeader>
-        </Empty>
-      ) : (
-        <div className="space-y-2">
-          {items.slice(0, 5).map((item, index) => {
-            const usage = usageForItem(item);
-            return (
-              <div
-                key={`${labelForItem(item)}-${index}`}
-                className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-3 rounded-lg bg-background/30 px-3 py-2 text-xs"
-              >
-                <div className="min-w-0">
-                  <div className="truncate font-medium">{labelForItem(item)}</div>
-                  <div className="truncate text-muted-foreground">
-                    {usage.requestCount} req · {formatUsd(usage.estimatedCostUsd)}
-                  </div>
-                </div>
-                <div className="shrink-0 text-right font-semibold">
-                  {formatCompactTokenAmount(usage.totalTokens)}
-                </div>
-              </div>
-            );
-          })}
-        </div>
-      )}
-    </div>
-  );
-}
-
 function AdminUsageAnalyticsCard({
   summary,
   isLoading,
@@ -685,30 +626,12 @@ function AdminUsageAnalyticsCard({
     );
   }
 
-  const memberItems = summary.users.filter(
-    (item) =>
-      item.role !== "admin" ||
-      item.todayUsage.totalTokens > 0 ||
-      item.rangeUsage.totalTokens > 0,
-  );
-  const activeOpenAiAccounts = summary.openaiAccounts.filter(
-    (item) => item.todayUsage.totalTokens > 0 || item.rangeUsage.totalTokens > 0,
-  );
-  const activeAggregateApis = summary.aggregateApis.filter(
-    (item) => item.todayUsage.totalTokens > 0 || item.rangeUsage.totalTokens > 0,
-  );
   const isTodayOnlyRange =
     summary.rangeStartTs === summary.todayStartTs &&
     summary.rangeEndTs === summary.todayEndTs;
   const rangeUsage = isTodayOnlyRange
     ? summary.todayUsage
     : sumDashboardTokenUsages(summary.dailyUsage.map((item) => item.usage));
-  const listUsageForItem = <T extends {
-    todayUsage: DashboardTokenUsage;
-    rangeUsage: DashboardTokenUsage;
-  }>(
-    item: T,
-  ) => (isTodayOnlyRange ? item.todayUsage : item.rangeUsage);
   const hasZoomWindow =
     summary.dailyUsage.length > 1 &&
     zoomWindow != null &&
@@ -726,7 +649,7 @@ function AdminUsageAnalyticsCard({
               {t("管理员用量分析")}
             </CardTitle>
             <p className="mt-1 text-xs text-muted-foreground">
-              {t("按天、成员、OpenAI 账号和聚合 API 汇总 token 消耗")}
+              {t("按天汇总 token、费用和请求量")}
             </p>
             <div className="mt-2 text-[11px] text-muted-foreground">
               {t("当前区间")} {formatShortDateRange(summary.rangeStartTs, summary.rangeEndTs, locale)}
@@ -801,64 +724,39 @@ function AdminUsageAnalyticsCard({
           </div>
         </div>
       </CardHeader>
-      <CardContent className="grid gap-5 xl:grid-cols-[minmax(0,1.35fr)_minmax(320px,0.9fr)]">
-        <div className="space-y-3">
-          <DailyTokenLineChart
-            points={summary.dailyUsage}
-            zoomWindow={zoomWindow}
-            onZoomWindowChange={setZoomWindow}
-          />
-          <div className="grid gap-3 text-xs sm:grid-cols-3">
-            <div className="rounded-lg bg-background/30 px-3 py-2">
-              <div className="text-muted-foreground">
-                {isTodayOnlyRange ? t("今日请求") : t("区间请求")}
-              </div>
-              <div className="mt-1 font-semibold">
-                {rangeUsage.requestCount} · {t("成功")} {rangeUsage.successCount}
-              </div>
+      <CardContent className="space-y-3">
+        <DailyTokenLineChart
+          points={summary.dailyUsage}
+          zoomWindow={zoomWindow}
+          onZoomWindowChange={setZoomWindow}
+        />
+        <div className="grid gap-3 text-xs sm:grid-cols-3">
+          <div className="rounded-lg bg-background/30 px-3 py-2">
+            <div className="text-muted-foreground">
+              {isTodayOnlyRange ? t("今日请求") : t("区间请求")}
             </div>
-            <div className="rounded-lg bg-background/30 px-3 py-2">
-              <div className="text-muted-foreground">
-                {isTodayOnlyRange ? t("输入 / 输出") : t("区间输入 / 输出")}
-              </div>
-              <div className="mt-1 font-semibold">
-                {formatCompactTokenAmount(rangeUsage.inputTokens - rangeUsage.cachedInputTokens)} /{" "}
-                {formatCompactTokenAmount(rangeUsage.outputTokens)}
-              </div>
-            </div>
-            <div className="rounded-lg bg-background/30 px-3 py-2">
-              <div className="text-muted-foreground">
-                {isTodayOnlyRange ? t("缓存 / 推理") : t("区间缓存 / 推理")}
-              </div>
-              <div className="mt-1 font-semibold">
-                {formatCompactTokenAmount(rangeUsage.cachedInputTokens)} /{" "}
-                {formatCompactTokenAmount(rangeUsage.reasoningOutputTokens)}
-              </div>
+            <div className="mt-1 font-semibold">
+              {rangeUsage.requestCount} · {t("成功")} {rangeUsage.successCount}
             </div>
           </div>
-        </div>
-        <div className="grid gap-4">
-          <UsageRankList
-            title={isTodayOnlyRange ? t("成员今日消耗") : t("成员区间消耗")}
-            items={memberItems}
-            labelForItem={userUsageName}
-            emptyText={t("暂无成员消耗")}
-            usageForItem={listUsageForItem}
-          />
-          <UsageRankList
-            title={isTodayOnlyRange ? t("OpenAI 账号今日消耗") : t("OpenAI 账号区间消耗")}
-            items={activeOpenAiAccounts}
-            labelForItem={sourceUsageName}
-            emptyText={t("暂无 OpenAI 账号消耗")}
-            usageForItem={listUsageForItem}
-          />
-          <UsageRankList
-            title={isTodayOnlyRange ? t("聚合 API 今日消耗") : t("聚合 API 区间消耗")}
-            items={activeAggregateApis}
-            labelForItem={sourceUsageName}
-            emptyText={t("暂无聚合 API 消耗")}
-            usageForItem={listUsageForItem}
-          />
+          <div className="rounded-lg bg-background/30 px-3 py-2">
+            <div className="text-muted-foreground">
+              {isTodayOnlyRange ? t("输入 / 输出") : t("区间输入 / 输出")}
+            </div>
+            <div className="mt-1 font-semibold">
+              {formatCompactTokenAmount(rangeUsage.inputTokens - rangeUsage.cachedInputTokens)} /{" "}
+              {formatCompactTokenAmount(rangeUsage.outputTokens)}
+            </div>
+          </div>
+          <div className="rounded-lg bg-background/30 px-3 py-2">
+            <div className="text-muted-foreground">
+              {isTodayOnlyRange ? t("缓存 / 推理") : t("区间缓存 / 推理")}
+            </div>
+            <div className="mt-1 font-semibold">
+              {formatCompactTokenAmount(rangeUsage.cachedInputTokens)} /{" "}
+              {formatCompactTokenAmount(rangeUsage.reasoningOutputTokens)}
+            </div>
+          </div>
         </div>
       </CardContent>
     </Card>
@@ -925,6 +823,7 @@ function AdminDashboard() {
     {
       startTs: adminUsageRangeParams.startTs,
       endTs: adminUsageRangeParams.endTs,
+      includeBreakdowns: false,
     },
     true,
   );

@@ -7,7 +7,13 @@ pub(super) fn try_handle(req: &JsonRpcRequest, actor: &RpcActor) -> Option<JsonR
         "dashboard/adminUsageSummary" => {
             let start_ts = super::i64_param(req, "startTs");
             let end_ts = super::i64_param(req, "endTs");
-            super::value_or_error(dashboard::read_admin_usage_summary(actor, start_ts, end_ts))
+            let include_breakdowns = super::bool_param(req, "includeBreakdowns").unwrap_or(true);
+            super::value_or_error(dashboard::read_admin_usage_summary(
+                actor,
+                start_ts,
+                end_ts,
+                include_breakdowns,
+            ))
         }
         "dashboard/memberSummary" => {
             let user_id = super::string_param(req, "userId");

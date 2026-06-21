@@ -1517,6 +1517,64 @@ fn admin_usage_summary_requires_admin_and_returns_range_rollups() {
 }
 
 #[test]
+fn admin_usage_summary_can_skip_breakdowns_for_light_dashboard() {
+    let _guard = test_env_guard();
+    let db_path = setup_dashboard_test_db("codexmanager-admin-usage-light");
+    let day_start = 1_700_000_000;
+    let day_end = day_start + 86_400;
+    let user = create_test_member("admin-usage-light-member", Some(2_000_000));
+    let key_id = create_owned_test_api_key(&user.id, "admin usage light key", "gpt-5-mini");
+
+    insert_test_request_log(
+        &key_id,
+        "trace-admin-usage-light",
+        "gpt-5-mini",
+        200,
+        20,
+        5,
+        10,
+        0.03,
+        day_start + 10,
+    );
+
+    let admin_resp = response_result(handle_request_with_actor(
+        rpc_request(
+            "dashboard/adminUsageSummary",
+            serde_json::json!({
+                "startTs": day_start,
+                "endTs": day_end,
+                "includeBreakdowns": false
+            }),
+        ),
+        RpcActor::system_admin(),
+    ));
+    assert!(
+        admin_resp.result.get("error").is_none(),
+        "{:?}",
+        admin_resp.result
+    );
+    assert_eq!(admin_resp.result["dailyUsage"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        admin_resp.result["dailyUsage"][0]["usage"]["totalTokens"],
+        30
+    );
+    assert_eq!(admin_resp.result["users"].as_array().unwrap().len(), 0);
+    assert_eq!(
+        admin_resp.result["openaiAccounts"]
+            .as_array()
+            .unwrap()
+            .len(),
+        0
+    );
+    assert_eq!(
+        admin_resp.result["aggregateApis"].as_array().unwrap().len(),
+        0
+    );
+
+    let _ = std::fs::remove_file(db_path);
+}
+
+#[test]
 fn admin_usage_summary_daily_trend_includes_token_stats_without_request_logs() {
     let _guard = test_env_guard();
     let db_path = setup_dashboard_test_db("codexmanager-admin-usage-orphan-stats");

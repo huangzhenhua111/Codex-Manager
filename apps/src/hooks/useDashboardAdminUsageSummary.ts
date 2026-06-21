@@ -15,6 +15,7 @@ export const DASHBOARD_ADMIN_USAGE_QUERY_KEY = [
 interface DashboardAdminUsageSummaryQueryParams {
   startTs?: number | null;
   endTs?: number | null;
+  includeBreakdowns?: boolean;
 }
 
 export function useDashboardAdminUsageSummary(
@@ -34,11 +35,13 @@ export function useDashboardAdminUsageSummary(
       serviceStatus.addr,
       params?.startTs ?? null,
       params?.endTs ?? null,
+      params?.includeBreakdowns ?? true,
     ],
     queryFn: () =>
       dashboardClient.getAdminUsageSummary({
         startTs: params?.startTs ?? null,
         endTs: params?.endTs ?? null,
+        includeBreakdowns: params?.includeBreakdowns ?? true,
       }),
     enabled: isQueryEnabled,
     retry: 1,
