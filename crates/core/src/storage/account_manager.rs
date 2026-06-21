@@ -1081,6 +1081,9 @@ impl Storage {
     pub(super) fn ensure_account_manager_tables(&self) -> Result<()> {
         self.conn
             .execute_batch(include_str!("../../migrations/057_account_manager.sql"))?;
+        self.conn.execute_batch(include_str!(
+            "../../migrations/102_app_users_list_order_index.sql"
+        ))?;
         Ok(())
     }
 }
@@ -1389,6 +1392,30 @@ mod tests {
         assert!(
             plan.contains("idx_api_key_owners_user_key_lookup"),
             "expected user key owner lookup index in plan, got {plan}"
+        );
+    }
+
+    #[test]
+    fn app_user_lists_use_list_order_index() {
+        let storage = Storage::open_in_memory().expect("open storage");
+        storage.init().expect("init storage");
+
+        let plan = collect_query_plan(
+            &storage,
+            "EXPLAIN QUERY PLAN
+             SELECT id, username, display_name, password_hash, role, status,
+                    created_at, updated_at, last_login_at
+             FROM app_users
+             ORDER BY created_at ASC, username ASC",
+        );
+
+        assert!(
+            plan.contains("idx_app_users_list_order"),
+            "expected app user list query to use idx_app_users_list_order, got {plan}"
+        );
+        assert!(
+            !plan.contains("USE TEMP B-TREE FOR ORDER BY"),
+            "app user list query should avoid temp sorting, got {plan}"
         );
     }
 

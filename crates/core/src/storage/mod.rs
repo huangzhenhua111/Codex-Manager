@@ -1752,6 +1752,11 @@ impl Storage {
             include_str!("../../migrations/101_events_account_cleanup_index.sql"),
             |s| s.ensure_events_account_cleanup_index(),
         )?;
+        self.apply_sql_or_compat_migration(
+            "102_app_users_list_order_index",
+            include_str!("../../migrations/102_app_users_list_order_index.sql"),
+            |s| s.ensure_account_manager_tables(),
+        )?;
         self.ensure_api_key_rotation_columns()?;
         self.ensure_aggregate_apis_table()?;
         self.ensure_aggregate_api_supplier_model_tables()?;
