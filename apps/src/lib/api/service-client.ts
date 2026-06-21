@@ -47,6 +47,8 @@ export const serviceClient = {
       dayEndTs?: number;
       includeApiModels?: boolean;
       includeApiKeys?: boolean;
+      includeAccounts?: boolean;
+      includeUsageSnapshots?: boolean;
       includeAccountRuntime?: boolean;
       includeAccountDetails?: boolean;
     }

@@ -232,6 +232,8 @@ export function AppBootstrap({ children }: { children: React.ReactNode }) {
           false,
           false,
           false,
+          false,
+          false,
         ),
         queryFn: () =>
           serviceClient.getStartupSnapshot({
@@ -240,6 +242,8 @@ export function AppBootstrap({ children }: { children: React.ReactNode }) {
             dayEndTs: localDayRange.dayEndTs,
             includeApiModels: false,
             includeApiKeys: false,
+            includeAccounts: false,
+            includeUsageSnapshots: false,
             includeAccountRuntime: false,
             includeAccountDetails: false,
           }),

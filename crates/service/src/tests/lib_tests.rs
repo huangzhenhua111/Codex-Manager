@@ -795,6 +795,81 @@ fn startup_snapshot_can_skip_account_runtime_for_light_dashboard_reads() {
 }
 
 #[test]
+fn startup_snapshot_can_skip_account_payload_for_dashboard_summary_reads() {
+    let _guard = test_env_guard();
+    let db_path = setup_dashboard_test_db("codexmanager-startup-snapshot-summary-only");
+    let now = codexmanager_core::storage::now_ts();
+    let account_id = "acc-startup-summary-only";
+    let storage = storage_helpers::open_storage().expect("open storage");
+    storage
+        .insert_account(&Account {
+            id: account_id.to_string(),
+            label: "Startup Summary Only".to_string(),
+            issuer: "issuer".to_string(),
+            chatgpt_account_id: None,
+            workspace_id: None,
+            group_name: None,
+            sort: 0,
+            status: "active".to_string(),
+            created_at: now,
+            updated_at: now,
+        })
+        .expect("insert account");
+    storage
+        .insert_usage_snapshot(&UsageSnapshotRecord {
+            account_id: account_id.to_string(),
+            used_percent: Some(20.0),
+            window_minutes: Some(180),
+            resets_at: Some(now + 300),
+            secondary_used_percent: Some(30.0),
+            secondary_window_minutes: Some(10_080),
+            secondary_resets_at: Some(now + 600),
+            credits_json: None,
+            captured_at: now,
+        })
+        .expect("insert usage snapshot");
+
+    let light_resp = response_result(handle_request_with_actor(
+        rpc_request(
+            "startup/snapshot",
+            serde_json::json!({
+                "requestLogLimit": 0,
+                "includeApiModels": false,
+                "includeApiKeys": false,
+                "includeAccounts": false,
+                "includeUsageSnapshots": false,
+                "includeAccountRuntime": false,
+                "includeAccountDetails": false
+            }),
+        ),
+        RpcActor::system_admin(),
+    ));
+
+    assert_eq!(
+        light_resp.result["accounts"].as_array().map(Vec::len),
+        Some(0)
+    );
+    assert_eq!(
+        light_resp.result["usageSnapshots"].as_array().map(Vec::len),
+        Some(0)
+    );
+    assert_eq!(
+        light_resp.result["accountSummary"]["accountCount"].as_i64(),
+        Some(1)
+    );
+    assert_eq!(
+        light_resp.result["usageAggregateSummary"]["primaryKnownCount"].as_i64(),
+        Some(1)
+    );
+    assert_eq!(
+        light_resp.result["usageAggregateSummary"]["primaryRemainPercent"].as_i64(),
+        Some(80)
+    );
+
+    let _ = std::fs::remove_file(db_path);
+}
+
+#[test]
 fn request_log_summary_reuses_filtered_count_for_all_status() {
     let _guard = test_env_guard();
     let db_path = setup_dashboard_test_db("codexmanager-requestlog-summary-count");

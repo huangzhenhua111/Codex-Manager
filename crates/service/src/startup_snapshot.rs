@@ -38,51 +38,83 @@ pub(crate) fn read_startup_snapshot(
     day_end_ts: Option<i64>,
     include_api_models: bool,
     include_api_keys: bool,
+    include_accounts: bool,
+    include_usage_snapshots: bool,
     include_account_runtime: bool,
     include_account_details: bool,
 ) -> Result<StartupSnapshotResult, String> {
     let request_log_limit = normalize_startup_request_log_limit(request_log_limit);
     let storage =
         storage_helpers::open_storage().ok_or_else(|| "open storage failed".to_string())?;
-    let accounts = storage
-        .list_account_summary_rows()
-        .map_err(|err| format!("list accounts failed: {err}"))?;
     let db_path = std::env::var("CODEXMANAGER_DB_PATH").unwrap_or_else(|_| "<unset>".to_string());
-    log::info!(
-        "startup/snapshot read: db_path={} account_count={}",
-        db_path,
-        accounts.len()
-    );
     let account_summary = storage
         .account_quota_overview_stats()
         .map(startup_account_summary)
         .map_err(|err| format!("read startup account summary failed: {err}"))?;
-    let account_ids = accounts
-        .iter()
-        .map(|account| account.id.clone())
-        .collect::<Vec<_>>();
-    let account_context = account_list::build_account_summary_context_from_rows_with_options(
-        &storage,
-        accounts,
-        if include_account_runtime {
-            AccountSummaryStorageSnapshotOptions {
-                include_details: include_account_details,
-                ..AccountSummaryStorageSnapshotOptions::default()
-            }
+    let should_read_account_context = include_accounts || include_usage_snapshots;
+    let (accounts, usage_snapshots, usage_aggregate_summary, account_count_for_log) =
+        if should_read_account_context {
+            let accounts = storage
+                .list_account_summary_rows()
+                .map_err(|err| format!("list accounts failed: {err}"))?;
+            let account_ids = accounts
+                .iter()
+                .map(|account| account.id.clone())
+                .collect::<Vec<_>>();
+            let account_count_for_log = accounts.len();
+            let account_context =
+                account_list::build_account_summary_context_from_rows_with_options(
+                    &storage,
+                    accounts,
+                    if include_account_runtime {
+                        AccountSummaryStorageSnapshotOptions {
+                            include_details: include_account_details,
+                            ..AccountSummaryStorageSnapshotOptions::default()
+                        }
+                    } else {
+                        AccountSummaryStorageSnapshotOptions::dashboard_light()
+                    },
+                )?;
+            let usage_aggregate_summary =
+                usage_aggregate::compute_usage_aggregate_summary_for_account_ids_list(
+                    &account_ids,
+                    &account_context.usage_snapshots,
+                );
+            let accounts = if include_accounts {
+                account_context.items
+            } else {
+                Vec::new()
+            };
+            let usage_snapshots = if include_usage_snapshots {
+                account_context
+                    .usage_snapshots
+                    .into_iter()
+                    .map(crate::usage_read::usage_snapshot_result_from_record)
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            (
+                accounts,
+                usage_snapshots,
+                usage_aggregate_summary,
+                account_count_for_log,
+            )
         } else {
-            AccountSummaryStorageSnapshotOptions::dashboard_light()
-        },
-    )?;
-    let usage_aggregate_summary =
-        usage_aggregate::compute_usage_aggregate_summary_for_account_ids_list(
-            &account_ids,
-            &account_context.usage_snapshots,
-        );
-    let usage_snapshots = account_context
-        .usage_snapshots
-        .into_iter()
-        .map(crate::usage_read::usage_snapshot_result_from_record)
-        .collect();
+            (
+                Vec::new(),
+                Vec::new(),
+                usage_aggregate::read_usage_aggregate_summary_with_storage(&storage)?,
+                account_summary.account_count.max(0) as usize,
+            )
+        };
+    log::info!(
+        "startup/snapshot read: db_path={} account_count={} include_accounts={} include_usage_snapshots={}",
+        db_path,
+        account_count_for_log,
+        include_accounts,
+        include_usage_snapshots
+    );
     let api_keys = if include_api_keys {
         apikey_list::read_api_keys_with_storage(&storage)?
     } else {
@@ -104,7 +136,7 @@ pub(crate) fn read_startup_snapshot(
         requestlog_list::read_request_logs_with_storage(&storage, None, Some(request_log_limit))?;
 
     Ok(StartupSnapshotResult {
-        accounts: account_context.items,
+        accounts,
         account_summary,
         usage_snapshots,
         usage_aggregate_summary,
@@ -123,6 +155,8 @@ pub(crate) fn read_startup_snapshot_for_actor(
     day_end_ts: Option<i64>,
     include_api_models: bool,
     include_api_keys: bool,
+    include_accounts: bool,
+    include_usage_snapshots: bool,
     include_account_runtime: bool,
     include_account_details: bool,
 ) -> Result<StartupSnapshotResult, String> {
@@ -133,6 +167,8 @@ pub(crate) fn read_startup_snapshot_for_actor(
             day_end_ts,
             include_api_models,
             include_api_keys,
+            include_accounts,
+            include_usage_snapshots,
             include_account_runtime,
             include_account_details,
         );

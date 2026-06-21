@@ -23,6 +23,8 @@ interface UseDashboardStatsOptions {
   includeAccountHints?: boolean;
   includeApiModels?: boolean;
   includeApiKeys?: boolean;
+  includeAccounts?: boolean;
+  includeUsageSnapshots?: boolean;
   includeAccountRuntime?: boolean;
   includeAccountDetails?: boolean;
 }
@@ -51,6 +53,8 @@ export function useDashboardStats(options: UseDashboardStatsOptions = {}) {
   const includeAccountHints = options.includeAccountHints ?? true;
   const includeApiModels = options.includeApiModels ?? true;
   const includeApiKeys = options.includeApiKeys ?? true;
+  const includeAccounts = options.includeAccounts ?? true;
+  const includeUsageSnapshots = options.includeUsageSnapshots ?? true;
   const includeAccountRuntime = options.includeAccountRuntime ?? true;
   const includeAccountDetails = options.includeAccountDetails ?? true;
   const isSnapshotQueryEnabled = useDeferredDesktopActivation(
@@ -74,6 +78,8 @@ export function useDashboardStats(options: UseDashboardStatsOptions = {}) {
       localDayRange.dayEndTs,
       includeApiModels,
       includeApiKeys,
+      includeAccounts,
+      includeUsageSnapshots,
       includeAccountRuntime,
       includeAccountDetails,
     ),
@@ -84,6 +90,8 @@ export function useDashboardStats(options: UseDashboardStatsOptions = {}) {
         dayEndTs: localDayRange.dayEndTs,
         includeApiModels,
         includeApiKeys,
+        includeAccounts,
+        includeUsageSnapshots,
         includeAccountRuntime,
         includeAccountDetails,
       }),

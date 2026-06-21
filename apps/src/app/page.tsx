@@ -770,6 +770,8 @@ function AdminDashboard() {
     includeAccountHints: false,
     includeApiModels: false,
     includeApiKeys: false,
+    includeAccounts: false,
+    includeUsageSnapshots: false,
     includeAccountRuntime: false,
     includeAccountDetails: false,
   });

@@ -22,6 +22,9 @@ pub(super) fn try_handle(req: &JsonRpcRequest, actor: &RpcActor) -> Option<JsonR
             let day_end_ts = super::i64_param(req, "dayEndTs");
             let include_api_models = super::bool_param(req, "includeApiModels").unwrap_or(true);
             let include_api_keys = super::bool_param(req, "includeApiKeys").unwrap_or(true);
+            let include_accounts = super::bool_param(req, "includeAccounts").unwrap_or(true);
+            let include_usage_snapshots =
+                super::bool_param(req, "includeUsageSnapshots").unwrap_or(true);
             let include_account_runtime =
                 super::bool_param(req, "includeAccountRuntime").unwrap_or(true);
             let include_account_details =
@@ -33,6 +36,8 @@ pub(super) fn try_handle(req: &JsonRpcRequest, actor: &RpcActor) -> Option<JsonR
                 day_end_ts,
                 include_api_models,
                 include_api_keys,
+                include_accounts,
+                include_usage_snapshots,
                 include_account_runtime,
                 include_account_details,
             ))
