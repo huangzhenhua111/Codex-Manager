@@ -1087,6 +1087,9 @@ impl Storage {
         self.conn.execute_batch(include_str!(
             "../../migrations/103_app_project_user_lookup_indexes.sql"
         ))?;
+        self.conn.execute_batch(include_str!(
+            "../../migrations/104_billing_rules_owner_lookup_indexes.sql"
+        ))?;
         Ok(())
     }
 }
@@ -1194,6 +1197,33 @@ mod tests {
             plan.contains("idx_billing_rules_active_order"),
             "expected active billing rules order index in plan, got {plan}"
         );
+    }
+
+    #[test]
+    fn billing_rule_owner_delete_paths_use_lookup_indexes() {
+        let storage = Storage::open_in_memory().expect("open storage");
+        storage.init().expect("init storage");
+
+        for (sql, expected_index) in [
+            (
+                "EXPLAIN QUERY PLAN DELETE FROM billing_rules WHERE user_id = 'user-1'",
+                "idx_billing_rules_user_lookup",
+            ),
+            (
+                "EXPLAIN QUERY PLAN DELETE FROM billing_rules WHERE project_id = 'project-1'",
+                "idx_billing_rules_project_lookup",
+            ),
+            (
+                "EXPLAIN QUERY PLAN DELETE FROM billing_rules WHERE api_key_id = 'key-1'",
+                "idx_billing_rules_api_key_lookup",
+            ),
+        ] {
+            let plan = collect_query_plan(&storage, sql);
+            assert!(
+                plan.contains(expected_index),
+                "expected billing rule delete path to use {expected_index}, got {plan}"
+            );
+        }
     }
 
     fn billing_rule(id: &str) -> BillingRule {
