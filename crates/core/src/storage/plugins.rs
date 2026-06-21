@@ -2031,6 +2031,52 @@ mod tests {
     }
 
     #[test]
+    fn list_plugin_tasks_uses_list_order_indexes() {
+        let storage = Storage::open_in_memory().expect("open storage");
+        storage.init().expect("init storage");
+
+        let queries = [
+            (
+                "EXPLAIN QUERY PLAN
+                 SELECT id, plugin_id
+                 FROM plugin_tasks
+                 ORDER BY next_run_at ASC, created_at ASC",
+                "idx_plugin_tasks_list_order",
+                "global plugin task list",
+            ),
+            (
+                "EXPLAIN QUERY PLAN
+                 SELECT id, plugin_id
+                 FROM plugin_tasks
+                 WHERE plugin_id = 'plugin-a'
+                 ORDER BY next_run_at ASC, created_at ASC",
+                "idx_plugin_tasks_plugin_list_order",
+                "per-plugin task list",
+            ),
+        ];
+
+        for (sql, expected_index, label) in queries {
+            let mut stmt = storage.conn.prepare(sql).expect("prepare explain");
+            let mut rows = stmt.query([]).expect("query explain");
+            let mut plan = String::new();
+            while let Some(row) = rows.next().expect("read explain row") {
+                let detail: String = row.get(3).expect("plan detail");
+                plan.push_str(&detail);
+                plan.push('\n');
+            }
+
+            assert!(
+                plan.contains(expected_index),
+                "expected {label} to use {expected_index}, got {plan}"
+            );
+            assert!(
+                !plan.contains("USE TEMP B-TREE FOR ORDER BY"),
+                "expected {label} to avoid temp sorting, got {plan}"
+            );
+        }
+    }
+
+    #[test]
     fn list_due_plugin_tasks_uses_due_lookup_index() {
         let storage = Storage::open_in_memory().expect("open storage");
         storage.init().expect("init storage");

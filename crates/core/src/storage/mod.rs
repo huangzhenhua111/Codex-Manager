@@ -1777,6 +1777,10 @@ impl Storage {
             include_str!("../../migrations/106_account_manager_created_by_lookup_indexes.sql"),
             |s| s.ensure_account_manager_tables(),
         )?;
+        self.apply_sql_migration(
+            "107_plugin_tasks_list_order_indexes",
+            include_str!("../../migrations/107_plugin_tasks_list_order_indexes.sql"),
+        )?;
         self.ensure_api_key_rotation_columns()?;
         self.ensure_aggregate_apis_table()?;
         self.ensure_aggregate_api_supplier_model_tables()?;
