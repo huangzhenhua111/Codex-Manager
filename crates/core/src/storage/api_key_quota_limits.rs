@@ -131,51 +131,25 @@ impl Storage {
     }
 
     pub fn api_key_remaining_quota_tokens(&self) -> Result<i64> {
-        self.api_key_quota_overview_stats()
-            .map(|stats| stats.total_remaining_tokens)
+        let sql = format!(
+            "{key_usage_cte}
+             SELECT
+                IFNULL(
+                    SUM(MAX(q.quota_limit_tokens - IFNULL(u.used_tokens, 0), 0)),
+                    0
+                ) AS total_remaining_tokens
+             FROM api_key_quota_limits q
+             INNER JOIN api_keys k ON k.id = q.key_id
+             LEFT JOIN key_usage u ON u.key_id = q.key_id
+             WHERE q.quota_limit_tokens > 0",
+            key_usage_cte = api_key_usage_cte_sql(false),
+        );
+        self.conn.query_row(&sql, [], |row| row.get(0))
     }
 
     pub fn api_key_quota_overview_stats(&self) -> Result<ApiKeyQuotaOverviewStats> {
-        self.conn.query_row(
-            "WITH key_usage AS (
-                SELECT
-                    key_id,
-                    IFNULL(SUM(IFNULL(total_tokens, 0)), 0) AS used_tokens,
-                    IFNULL(SUM(IFNULL(estimated_cost_usd, 0.0)), 0.0) AS estimated_cost_usd
-                FROM (
-                    SELECT
-                        key_id,
-                        CASE
-                            WHEN total_tokens IS NOT NULL THEN
-                                CASE WHEN total_tokens > 0 THEN total_tokens ELSE 0 END
-                            ELSE
-                                CASE
-                                    WHEN IFNULL(input_tokens, 0) - IFNULL(cached_input_tokens, 0) + IFNULL(output_tokens, 0) > 0
-                                        THEN IFNULL(input_tokens, 0) - IFNULL(cached_input_tokens, 0) + IFNULL(output_tokens, 0)
-                                    ELSE 0
-                                END
-                        END AS total_tokens,
-                        CASE WHEN IFNULL(estimated_cost_usd, 0.0) > 0.0 THEN estimated_cost_usd ELSE 0.0 END AS estimated_cost_usd
-                    FROM request_token_stats
-                    WHERE key_id IS NOT NULL AND TRIM(key_id) <> ''
-                    UNION ALL
-                    SELECT
-                        NULLIF(TRIM(key_id), '') AS key_id,
-                        CASE WHEN IFNULL(total_tokens, 0) > 0 THEN total_tokens ELSE 0 END AS total_tokens,
-                        CASE WHEN IFNULL(estimated_cost_usd, 0.0) > 0.0 THEN estimated_cost_usd ELSE 0.0 END AS estimated_cost_usd
-                    FROM request_token_stat_hourly_rollups
-                    WHERE key_id IS NOT NULL AND TRIM(key_id) <> ''
-                    UNION ALL
-                    SELECT
-                        NULLIF(TRIM(key_id), '') AS key_id,
-                        CASE WHEN IFNULL(total_tokens, 0) > 0 THEN total_tokens ELSE 0 END AS total_tokens,
-                        CASE WHEN IFNULL(estimated_cost_usd, 0.0) > 0.0 THEN estimated_cost_usd ELSE 0.0 END AS estimated_cost_usd
-                    FROM request_token_stat_rollups
-                    WHERE key_id IS NOT NULL AND TRIM(key_id) <> ''
-                )
-                WHERE key_id IS NOT NULL AND TRIM(key_id) <> ''
-                GROUP BY key_id
-             )
+        let sql = format!(
+            "{key_usage_cte}
              SELECT
                 COUNT(k.id) AS key_count,
                 IFNULL(SUM(CASE WHEN q.quota_limit_tokens > 0 THEN 1 ELSE 0 END), 0) AS limited_key_count,
@@ -197,18 +171,18 @@ impl Storage {
                ON q.key_id = k.id
               AND q.quota_limit_tokens > 0
              LEFT JOIN key_usage u ON u.key_id = k.id",
-            [],
-            |row| {
-                Ok(ApiKeyQuotaOverviewStats {
-                    key_count: row.get(0)?,
-                    limited_key_count: row.get(1)?,
-                    total_limit_tokens: row.get(2)?,
-                    total_used_tokens: row.get(3)?,
-                    total_remaining_tokens: row.get(4)?,
-                    estimated_cost_usd: row.get(5)?,
-                })
-            },
-        )
+            key_usage_cte = api_key_usage_cte_sql(true),
+        );
+        self.conn.query_row(&sql, [], |row| {
+            Ok(ApiKeyQuotaOverviewStats {
+                key_count: row.get(0)?,
+                limited_key_count: row.get(1)?,
+                total_limit_tokens: row.get(2)?,
+                total_used_tokens: row.get(3)?,
+                total_remaining_tokens: row.get(4)?,
+                estimated_cost_usd: row.get(5)?,
+            })
+        })
     }
 
     pub(super) fn ensure_api_key_quota_limits_table(&self) -> Result<()> {
@@ -228,6 +202,65 @@ impl Storage {
         )?;
         Ok(())
     }
+}
+
+fn api_key_usage_cte_sql(include_cost: bool) -> String {
+    let raw_cost_select = if include_cost {
+        ",
+                        CASE WHEN IFNULL(estimated_cost_usd, 0.0) > 0.0 THEN estimated_cost_usd ELSE 0.0 END AS estimated_cost_usd"
+    } else {
+        ""
+    };
+    let rollup_cost_select = if include_cost {
+        ",
+                        CASE WHEN IFNULL(estimated_cost_usd, 0.0) > 0.0 THEN estimated_cost_usd ELSE 0.0 END AS estimated_cost_usd"
+    } else {
+        ""
+    };
+    let grouped_cost_select = if include_cost {
+        ",
+                    IFNULL(SUM(IFNULL(estimated_cost_usd, 0.0)), 0.0) AS estimated_cost_usd"
+    } else {
+        ""
+    };
+
+    format!(
+        "WITH key_usage AS (
+                SELECT
+                    key_id,
+                    IFNULL(SUM(IFNULL(total_tokens, 0)), 0) AS used_tokens{grouped_cost_select}
+                FROM (
+                    SELECT
+                        key_id,
+                        CASE
+                            WHEN total_tokens IS NOT NULL THEN
+                                CASE WHEN total_tokens > 0 THEN total_tokens ELSE 0 END
+                            ELSE
+                                CASE
+                                    WHEN IFNULL(input_tokens, 0) - IFNULL(cached_input_tokens, 0) + IFNULL(output_tokens, 0) > 0
+                                        THEN IFNULL(input_tokens, 0) - IFNULL(cached_input_tokens, 0) + IFNULL(output_tokens, 0)
+                                    ELSE 0
+                                END
+                        END AS total_tokens{raw_cost_select}
+                    FROM request_token_stats
+                    WHERE key_id IS NOT NULL AND TRIM(key_id) <> ''
+                    UNION ALL
+                    SELECT
+                        NULLIF(TRIM(key_id), '') AS key_id,
+                        CASE WHEN IFNULL(total_tokens, 0) > 0 THEN total_tokens ELSE 0 END AS total_tokens{rollup_cost_select}
+                    FROM request_token_stat_hourly_rollups
+                    WHERE key_id IS NOT NULL AND TRIM(key_id) <> ''
+                    UNION ALL
+                    SELECT
+                        NULLIF(TRIM(key_id), '') AS key_id,
+                        CASE WHEN IFNULL(total_tokens, 0) > 0 THEN total_tokens ELSE 0 END AS total_tokens{rollup_cost_select}
+                    FROM request_token_stat_rollups
+                    WHERE key_id IS NOT NULL AND TRIM(key_id) <> ''
+                )
+                WHERE key_id IS NOT NULL AND TRIM(key_id) <> ''
+                GROUP BY key_id
+             )",
+    )
 }
 
 fn list_api_key_quota_limits_for_ids_chunk(
