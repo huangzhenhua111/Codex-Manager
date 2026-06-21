@@ -1355,7 +1355,7 @@ function MemberUsageTrendCard({
           })}
         </div>
 
-        <div className="grid gap-4 md:grid-cols-2">
+        <div className="max-w-md">
           <TopUsageList
             title={t("Top 模型")}
             icon={BarChart3}
@@ -1366,20 +1366,6 @@ function MemberUsageTrendCard({
               value: formatCompactTokenAmount(item.totalTokens),
               sub: formatUsd(item.estimatedCostUsd),
             }))}
-          />
-          <TopUsageList
-            title={t("Top Key")}
-            icon={KeyRound}
-            emptyText={t("暂无 Key 用量")}
-            items={summary.topKeys
-              .filter((item) => item.todayTokens > 0 || item.totalTokens > 0)
-              .slice(0, 4)
-              .map((item) => ({
-                key: item.keyId,
-                label: item.name || item.keyId,
-                value: formatCompactTokenAmount(item.todayTokens || item.totalTokens),
-                sub: item.modelSlug || "auto",
-              }))}
           />
         </div>
       </CardContent>

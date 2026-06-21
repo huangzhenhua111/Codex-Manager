@@ -74,3 +74,13 @@ test("首页账户统计优先使用启动快照汇总", async () => {
   assert.match(normalizeSource, /function normalizeStartupAccountSummary/);
   assert.match(normalizeSource, /accountSummary: normalizeStartupAccountSummary/);
 });
+
+test("成员用量趋势卡不再重复展示 Top Key", async () => {
+  const source = await readDashboardSource();
+  const trendCard = source.slice(
+    source.indexOf("function MemberUsageTrendCard"),
+    source.indexOf("function TopUsageList"),
+  );
+  assert.match(trendCard, /title=\{t\("Top 模型"\)\}/);
+  assert.doesNotMatch(trendCard, /title=\{t\("Top Key"\)\}/);
+});
