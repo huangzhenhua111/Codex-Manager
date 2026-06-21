@@ -338,13 +338,13 @@ impl Storage {
         limit: i64,
         key_ids: &[String],
     ) -> Result<Vec<RequestLog>> {
-        let Some(key_filter) = KeyIdSqlFilter::create(self, "r.key_id", key_ids)? else {
-            return Ok(Vec::new());
-        };
         let normalized_limit = normalize_request_log_limit(limit);
         if normalized_limit == 0 {
             return Ok(Vec::new());
         }
+        let Some(key_filter) = KeyIdSqlFilter::create(self, "r.key_id", key_ids)? else {
+            return Ok(Vec::new());
+        };
         let normalized_offset = offset.max(0);
         let include_account_lookup = self.has_table("accounts")?;
         let filters = build_request_log_filters(
