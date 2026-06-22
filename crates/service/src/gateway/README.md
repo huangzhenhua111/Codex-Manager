@@ -49,7 +49,8 @@
 
 高风险文件：
 
-- `observability/http_bridge.rs`
+- `observability/http_bridge/delivery.rs`
+- `observability/http_bridge/stream_readers/`
 
 ### `protocol_adapter/`
 
@@ -243,24 +244,26 @@
 优先查看：
 
 - `protocol_adapter/request_router.rs`
-- `request/request_rewrite_*.rs`
+- `request/request_rewrite.rs`
+- `request/request_rewrite_chat_completions.rs`
+- `request/request_rewrite_shared.rs`
 
 ### 改 tools / `tool_calls`
 
 优先查看：
 
-- `official_responses_http.rs`
+- `request/official_responses_http.rs`
 - `http/responses_websocket.rs`
-- `observability/http_bridge/aggregate/*.rs`
+- `observability/http_bridge/stream_readers/`
 
 ### 改日志/错误头/trace
 
 优先查看：
 
-- `observability/http_bridge.rs`
-- `request_log.rs`
-- `trace_log.rs`
-- `error_response.rs`
+- `observability/http_bridge/delivery.rs`
+- `observability/request_log.rs`
+- `observability/trace_log.rs`
+- `upstream/response.rs`
 
 ### 改代理/重试/超时
 
@@ -268,9 +271,10 @@
 
 - `upstream/config.rs`
 - `upstream/proxy.rs`
-- `upstream/retry.rs`
-- `upstream/transport.rs`
-- `upstream/deadline.rs`
+- `upstream/support/retry.rs`
+- `upstream/support/deadline.rs`
+- `upstream/attempt_flow/transport.rs`
+- `upstream/proxy_pipeline/`
 
 ## 测试入口
 

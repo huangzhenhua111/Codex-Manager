@@ -5,7 +5,9 @@ use reqwest::Client;
 use reqwest::Method;
 use reqwest::StatusCode;
 use std::future::Future;
-use std::sync::OnceLock;
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{OnceLock, RwLock};
 use std::time::Duration;
 use tokio::runtime::{Builder, Runtime};
 
@@ -14,9 +16,23 @@ const OAI_REQUEST_ID_HEADER: &str = "x-oai-request-id";
 const CF_RAY_HEADER: &str = "cf-ray";
 const AUTH_ERROR_HEADER: &str = "x-openai-authorization-error";
 static MODEL_PICKER_RUNTIME: OnceLock<Runtime> = OnceLock::new();
+static MODEL_PICKER_CLIENT: OnceLock<RwLock<ModelPickerClientEntry>> = OnceLock::new();
+#[cfg(test)]
+static MODEL_PICKER_CLIENT_BUILD_COUNT: AtomicUsize = AtomicUsize::new(0);
 const MODEL_PICKER_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const MODEL_PICKER_TOTAL_TIMEOUT: Duration = Duration::from_secs(120);
 const MODEL_PICKER_RESPONSE_READ_TIMEOUT: Duration = Duration::from_secs(30);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ModelPickerClientConfig {
+    user_agent: String,
+    proxy_url: Option<String>,
+}
+
+struct ModelPickerClientEntry {
+    config: ModelPickerClientConfig,
+    client: Client,
+}
 
 fn append_client_version_query(url: &str) -> String {
     if url.contains("client_version=") {
@@ -208,6 +224,44 @@ where
     model_picker_runtime().block_on(future)
 }
 
+fn current_model_picker_client_config() -> ModelPickerClientConfig {
+    ModelPickerClientConfig {
+        user_agent: crate::gateway::current_codex_user_agent(),
+        proxy_url: crate::gateway::current_upstream_proxy_url(),
+    }
+}
+
+fn model_picker_client_lock() -> &'static RwLock<ModelPickerClientEntry> {
+    MODEL_PICKER_CLIENT.get_or_init(|| {
+        let config = current_model_picker_client_config();
+        RwLock::new(ModelPickerClientEntry {
+            client: build_model_picker_client_for_config(&config),
+            config,
+        })
+    })
+}
+
+fn model_picker_client() -> Client {
+    let config = current_model_picker_client_config();
+    {
+        let cached =
+            crate::lock_utils::read_recover(model_picker_client_lock(), "model_picker_client");
+        if cached.config == config {
+            return cached.client.clone();
+        }
+    }
+
+    let client = build_model_picker_client_for_config(&config);
+    let mut cached =
+        crate::lock_utils::write_recover(model_picker_client_lock(), "model_picker_client");
+    if cached.config == config {
+        return cached.client.clone();
+    }
+    cached.config = config;
+    cached.client = client.clone();
+    client
+}
+
 /// 函数 `build_model_picker_client`
 ///
 /// 作者: gaohongshun
@@ -219,22 +273,51 @@ where
 ///
 /// # 返回
 /// 返回函数执行结果
+#[cfg(test)]
 fn build_model_picker_client() -> Client {
+    let config = current_model_picker_client_config();
+    build_model_picker_client_for_config(&config)
+}
+
+fn refresh_model_picker_client() -> Client {
+    let config = current_model_picker_client_config();
+    let client = build_model_picker_client_for_config(&config);
+    let mut cached =
+        crate::lock_utils::write_recover(model_picker_client_lock(), "model_picker_client");
+    cached.config = config;
+    cached.client = client.clone();
+    client
+}
+
+fn build_model_picker_client_for_config(config: &ModelPickerClientConfig) -> Client {
+    #[cfg(test)]
+    MODEL_PICKER_CLIENT_BUILD_COUNT.fetch_add(1, Ordering::SeqCst);
+
     let builder = Client::builder()
         .connect_timeout(MODEL_PICKER_CONNECT_TIMEOUT)
         .timeout(MODEL_PICKER_TOTAL_TIMEOUT)
         .pool_max_idle_per_host(8)
         .pool_idle_timeout(Some(Duration::from_secs(60)))
-        .user_agent(crate::gateway::current_codex_user_agent());
+        .user_agent(config.user_agent.as_str());
     let builder = crate::gateway::apply_async_upstream_proxy(
         builder,
-        crate::gateway::current_upstream_proxy_url().as_deref(),
+        config.proxy_url.as_deref(),
         "model_picker_proxy_invalid",
     );
     builder.build().unwrap_or_else(|err| {
         log::warn!("event=model_picker_client_build_failed err={}", err);
         Client::new()
     })
+}
+
+#[cfg(test)]
+fn reset_model_picker_client_build_count_for_test() {
+    MODEL_PICKER_CLIENT_BUILD_COUNT.store(0, Ordering::SeqCst);
+}
+
+#[cfg(test)]
+fn model_picker_client_build_count_for_test() -> usize {
+    MODEL_PICKER_CLIENT_BUILD_COUNT.load(Ordering::SeqCst)
 }
 
 /// 函数 `read_response_text`
@@ -353,7 +436,7 @@ async fn send_models_request_async(
         .or_else(|| account.workspace_id.as_deref())
         .map(str::to_string);
     let include_account_header = !super::super::is_openai_api_base(upstream_base);
-    let client = build_model_picker_client();
+    let client = model_picker_client();
     let build_request = |http: &Client| {
         let mut builder = http.request(method.clone(), &url);
         for (name, value) in build_models_request_headers(
@@ -372,7 +455,7 @@ async fn send_models_request_async(
     let response = match build_request(&client).send().await {
         Ok(resp) => resp,
         Err(first_err) => {
-            let fresh = build_model_picker_client();
+            let fresh = refresh_model_picker_client();
             match build_request(&fresh).send().await {
                 Ok(resp) => resp,
                 Err(second_err) => {
@@ -412,7 +495,9 @@ async fn send_models_request_async(
 #[cfg(test)]
 mod tests {
     use super::{
-        append_client_version_query, build_models_request_headers, build_models_request_url,
+        append_client_version_query, build_model_picker_client, build_models_request_headers,
+        build_models_request_url, model_picker_client, model_picker_client_build_count_for_test,
+        refresh_model_picker_client, reset_model_picker_client_build_count_for_test,
         summarize_models_error_response,
     };
     use reqwest::header::{HeaderMap, HeaderValue};
@@ -616,6 +701,41 @@ mod tests {
         assert!(find("Cookie").is_none());
         assert!(find("ChatGPT-Account-ID").is_none());
         assert!(find(crate::gateway::runtime_config::RESIDENCY_HEADER_NAME).is_none());
+    }
+
+    #[test]
+    fn model_picker_client_reuses_cached_client_until_config_changes() {
+        let _guard = crate::test_env_guard();
+        crate::gateway::set_upstream_proxy_url(None).expect("clear proxy");
+        crate::gateway::set_codex_user_agent_version("0.201.0")
+            .expect("set codex user agent version");
+        reset_model_picker_client_build_count_for_test();
+
+        let first = model_picker_client();
+        let after_first = model_picker_client_build_count_for_test();
+        let second = model_picker_client();
+
+        assert_eq!(model_picker_client_build_count_for_test(), after_first);
+        drop(first);
+        drop(second);
+
+        crate::gateway::set_codex_user_agent_version("0.201.1")
+            .expect("change codex user agent version");
+        let refreshed = model_picker_client();
+        assert_eq!(model_picker_client_build_count_for_test(), after_first + 1);
+        drop(refreshed);
+
+        let fresh = build_model_picker_client();
+        assert_eq!(model_picker_client_build_count_for_test(), after_first + 2);
+        drop(fresh);
+
+        let refreshed_retry = refresh_model_picker_client();
+        let after_refresh = model_picker_client_build_count_for_test();
+        assert_eq!(after_refresh, after_first + 3);
+        let reused_after_refresh = model_picker_client();
+        assert_eq!(model_picker_client_build_count_for_test(), after_refresh);
+        drop(refreshed_retry);
+        drop(reused_after_refresh);
     }
 
     /// 函数 `summarize_models_error_response_uses_stable_challenge_hint_and_debug_headers`

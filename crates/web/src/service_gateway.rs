@@ -15,6 +15,23 @@ pub(super) fn should_spawn_service() -> bool {
     read_env_trim("CODEXMANAGER_WEB_NO_SPAWN_SERVICE").is_none()
 }
 
+static SERVICE_PROBE_CLIENT: std::sync::OnceLock<Result<reqwest::Client, String>> =
+    std::sync::OnceLock::new();
+
+fn build_service_probe_client() -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_millis(1200))
+        .build()
+        .map_err(|err| format!("probe client init failed: {err}"))
+}
+
+fn service_probe_client() -> Result<reqwest::Client, String> {
+    SERVICE_PROBE_CLIENT
+        .get_or_init(build_service_probe_client)
+        .clone()
+}
+
 /// 函数 `service_rpc_probe`
 ///
 /// 作者: gaohongshun
@@ -27,17 +44,17 @@ pub(super) fn should_spawn_service() -> bool {
 ///
 /// # 返回
 /// 返回函数执行结果
-async fn service_rpc_probe(service_addr: &str, rpc_token: &str) -> Result<(), String> {
+async fn service_rpc_probe(
+    client: &reqwest::Client,
+    service_addr: &str,
+    rpc_token: &str,
+) -> Result<(), String> {
     let trimmed = service_addr.trim();
     if trimmed.is_empty() {
         return Err("service address is empty".to_string());
     }
 
-    let response = reqwest::Client::builder()
-        .no_proxy()
-        .timeout(Duration::from_millis(1200))
-        .build()
-        .map_err(|err| format!("probe client init failed: {err}"))?
+    let response = client
         .post(format!("http://{trimmed}/rpc"))
         .header("content-type", "application/json")
         .header("x-codexmanager-rpc-token", rpc_token)
@@ -202,8 +219,13 @@ pub(super) async fn ensure_service_running(
     dir: &Path,
     spawned_service: &Arc<Mutex<bool>>,
 ) -> Option<String> {
+    let probe_client = match service_probe_client() {
+        Ok(client) => client,
+        Err(err) => return Some(err),
+    };
+
     if tcp_probe(service_addr).await {
-        match service_rpc_probe(service_addr, rpc_token).await {
+        match service_rpc_probe(&probe_client, service_addr, rpc_token).await {
             Ok(()) => return None,
             Err(err) if err == "rpc_token_mismatch" && should_spawn_service() => {
                 if !shutdown_existing_service(service_addr).await {
@@ -241,7 +263,7 @@ pub(super) async fn ensure_service_running(
     let mut last_probe_error: Option<String> = None;
     for _ in 0..50 {
         if tcp_probe(service_addr).await {
-            match service_rpc_probe(service_addr, rpc_token).await {
+            match service_rpc_probe(&probe_client, service_addr, rpc_token).await {
                 Ok(()) => return None,
                 Err(err) => {
                     last_probe_error = Some(format!(
@@ -622,8 +644,8 @@ pub(super) async fn quit(State(state): State<Arc<AppState>>) -> impl IntoRespons
 mod tests {
     use super::{
         format_upstream_error_message, gateway_proxy_max_body_bytes, gateway_proxy_target_url,
-        should_skip_gateway_request_header, should_skip_gateway_response_header,
-        ENV_GATEWAY_PROXY_MAX_BODY_BYTES,
+        service_probe_client, should_skip_gateway_request_header,
+        should_skip_gateway_response_header, ENV_GATEWAY_PROXY_MAX_BODY_BYTES,
     };
     use axum::http::{header, HeaderValue, Uri};
     use std::sync::{Mutex, MutexGuard};
@@ -669,6 +691,13 @@ mod tests {
         let message = format_upstream_error_message("host.docker.internal:9760", &err);
         assert!(message.contains("host.docker.internal"));
         assert!(message.contains("codexmanager-service:48760"));
+    }
+
+    #[test]
+    fn service_probe_client_builds_with_dedicated_config_and_reuses_cache() {
+        let first = service_probe_client().expect("build first probe client");
+        let second = service_probe_client().expect("reuse probe client");
+        drop((first, second));
     }
 
     #[test]

@@ -12,6 +12,8 @@ use reqwest::StatusCode;
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use std::future::Future;
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::OnceLock;
 use std::thread;
 use std::time::Duration;
@@ -25,7 +27,10 @@ use crate::auth_callback::resolve_redirect_uri;
 use crate::storage_helpers::open_storage;
 
 static OPENAI_AUTH_HTTP_CLIENT: OnceLock<Client> = OnceLock::new();
+static OPENAI_AUTH_LOOPBACK_HTTP_CLIENT: OnceLock<Client> = OnceLock::new();
 static OPENAI_AUTH_RUNTIME: OnceLock<Runtime> = OnceLock::new();
+#[cfg(test)]
+static OPENAI_AUTH_LOOPBACK_HTTP_CLIENT_BUILDS: AtomicUsize = AtomicUsize::new(0);
 const OPENAI_AUTH_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const OPENAI_AUTH_READ_TIMEOUT: Duration = Duration::from_secs(30);
 const OPENAI_AUTH_TOTAL_TIMEOUT: Duration = Duration::from_secs(60);
@@ -790,6 +795,24 @@ fn openai_auth_http_client() -> &'static Client {
     })
 }
 
+fn openai_auth_loopback_http_client() -> &'static Client {
+    OPENAI_AUTH_LOOPBACK_HTTP_CLIENT.get_or_init(|| {
+        #[cfg(test)]
+        OPENAI_AUTH_LOOPBACK_HTTP_CLIENT_BUILDS.fetch_add(1, Ordering::SeqCst);
+        Client::builder()
+            .connect_timeout(OPENAI_AUTH_CONNECT_TIMEOUT)
+            .timeout(OPENAI_AUTH_TOTAL_TIMEOUT)
+            .no_proxy()
+            .build()
+            .unwrap_or_else(|_| Client::new())
+    })
+}
+
+#[cfg(test)]
+fn openai_auth_loopback_http_client_build_count() -> usize {
+    OPENAI_AUTH_LOOPBACK_HTTP_CLIENT_BUILDS.load(Ordering::SeqCst)
+}
+
 /// 函数 `issuer_uses_loopback_host`
 ///
 /// 作者: gaohongshun
@@ -821,12 +844,7 @@ pub(crate) fn issuer_uses_loopback_host(issuer: &str) -> bool {
 /// 返回函数执行结果
 fn auth_http_client_for_issuer(issuer: &str) -> Client {
     if issuer_uses_loopback_host(issuer) {
-        return Client::builder()
-            .connect_timeout(OPENAI_AUTH_CONNECT_TIMEOUT)
-            .timeout(OPENAI_AUTH_TOTAL_TIMEOUT)
-            .no_proxy()
-            .build()
-            .unwrap_or_else(|_| Client::new());
+        return openai_auth_loopback_http_client().clone();
     }
 
     openai_auth_http_client().clone()

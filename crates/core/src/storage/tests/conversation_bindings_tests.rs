@@ -1,4 +1,8 @@
 use super::super::{ConversationBinding, Storage};
+use super::{
+    conversation_binding_lookup_sql, delete_conversation_bindings_for_account_sql,
+    delete_stale_conversation_bindings_sql,
+};
 
 /// 函数 `sample_binding`
 ///
@@ -171,4 +175,56 @@ fn conversation_binding_delete_helpers_remove_rows() {
         .get_conversation_binding("key-hash-1", "conv-2")
         .expect("load remaining binding")
         .is_none());
+}
+
+#[test]
+fn conversation_binding_lookup_and_cleanup_queries_use_indexes() {
+    let storage = Storage::open_in_memory().expect("open in memory");
+    storage.init().expect("init schema");
+
+    let binding_lookup_plan = storage
+        .conn
+        .query_row(
+            &format!("EXPLAIN QUERY PLAN {}", conversation_binding_lookup_sql()),
+            ("key-hash-1", "conv-1"),
+            |row| row.get::<_, String>(3),
+        )
+        .expect("explain binding lookup");
+    assert!(
+        binding_lookup_plan.contains("sqlite_autoindex_conversation_bindings_1")
+            || binding_lookup_plan.contains("PRIMARY KEY"),
+        "expected conversation binding primary key lookup, got {binding_lookup_plan}"
+    );
+
+    let account_delete_plan = storage
+        .conn
+        .query_row(
+            &format!(
+                "EXPLAIN QUERY PLAN {}",
+                delete_conversation_bindings_for_account_sql()
+            ),
+            ["acc-1"],
+            |row| row.get::<_, String>(3),
+        )
+        .expect("explain account cleanup");
+    assert!(
+        account_delete_plan.contains("idx_conversation_bindings_account_id"),
+        "expected account cleanup index in plan, got {account_delete_plan}"
+    );
+
+    let stale_delete_plan = storage
+        .conn
+        .query_row(
+            &format!(
+                "EXPLAIN QUERY PLAN {}",
+                delete_stale_conversation_bindings_sql()
+            ),
+            [85_i64],
+            |row| row.get::<_, String>(3),
+        )
+        .expect("explain stale cleanup");
+    assert!(
+        stale_delete_plan.contains("idx_conversation_bindings_last_used_at"),
+        "expected stale cleanup index in plan, got {stale_delete_plan}"
+    );
 }

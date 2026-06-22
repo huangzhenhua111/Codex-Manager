@@ -859,7 +859,7 @@ pub(in super::super) fn proxy_aggregate_request(
         return Ok(());
     }
 
-    let client = super::super::super::fresh_upstream_client();
+    let client = super::super::super::upstream_client();
     let mut request = Some(request);
     let mut attempted_aggregate_api_ids = Vec::new();
     let mut last_attempt_url: Option<String> = None;

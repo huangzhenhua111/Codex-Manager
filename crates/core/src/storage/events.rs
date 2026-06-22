@@ -108,6 +108,10 @@ impl Storage {
     }
 }
 
+pub(super) fn delete_events_for_account_sql() -> &'static str {
+    "DELETE FROM events WHERE account_id = ?1"
+}
+
 fn latest_account_status_reasons_chunk(
     storage: &Storage,
     account_ids: &[String],
@@ -115,23 +119,7 @@ fn latest_account_status_reasons_chunk(
     let Some((condition, params)) = text_id_in_clause("account_id", account_ids) else {
         return Ok(HashMap::new());
     };
-    let sql = format!(
-        "WITH ranked AS (
-            SELECT
-                account_id,
-                message,
-                ROW_NUMBER() OVER (
-                    PARTITION BY account_id
-                    ORDER BY created_at DESC, id DESC
-                ) AS rn
-            FROM events
-            WHERE type = 'account_status_update'
-              AND {condition}
-        )
-        SELECT account_id, message
-        FROM ranked
-        WHERE rn = 1"
-    );
+    let sql = latest_account_status_reasons_chunk_sql(&condition);
 
     let mut stmt = storage.conn.prepare(&sql)?;
     let mut rows = stmt.query(params_from_iter(params))?;
@@ -153,20 +141,26 @@ fn latest_account_status_blocked_ids_chunk(
     let Some((condition, params)) = text_id_in_clause("account_id", account_ids) else {
         return Ok(Vec::new());
     };
+    let sql = latest_account_status_blocked_ids_chunk_sql(&condition);
+
+    let mut stmt = storage.conn.prepare(&sql)?;
+    let rows = stmt.query_map(params_from_iter(params), |row| row.get(0))?;
+    rows.collect()
+}
+
+fn latest_account_status_reasons_chunk_sql(account_condition: &str) -> String {
+    format!(
+        "{cte}
+        SELECT account_id, message
+        FROM ranked
+        WHERE rn = 1",
+        cte = latest_account_status_ranked_cte_sql("message", account_condition, false),
+    )
+}
+
+fn latest_account_status_blocked_ids_chunk_sql(account_condition: &str) -> String {
     let sql = format!(
-        "WITH ranked AS (
-            SELECT
-                account_id,
-                LOWER(TRIM(SUBSTR(message, INSTR(message, ' reason=') + LENGTH(' reason=')))) AS reason,
-                ROW_NUMBER() OVER (
-                    PARTITION BY account_id
-                    ORDER BY created_at DESC, id DESC
-                ) AS rn
-            FROM events
-            WHERE type = 'account_status_update'
-              AND INSTR(message, ' reason=') > 0
-              AND {condition}
-        )
+        "{cte}
         SELECT account_id
         FROM ranked
         WHERE rn = 1
@@ -175,12 +169,41 @@ fn latest_account_status_blocked_ids_chunk(
               'workspace_deactivated',
               'deactivated_workspace',
               'refresh_token_region_blocked'
-          )"
+          )",
+        cte = latest_account_status_ranked_cte_sql(
+            "LOWER(TRIM(SUBSTR(message, INSTR(message, ' reason=') + LENGTH(' reason=')))) AS reason",
+            account_condition,
+            true,
+        ),
     );
+    sql
+}
 
-    let mut stmt = storage.conn.prepare(&sql)?;
-    let rows = stmt.query_map(params_from_iter(params), |row| row.get(0))?;
-    rows.collect()
+fn latest_account_status_ranked_cte_sql(
+    select_columns: &str,
+    account_condition: &str,
+    require_reason_marker: bool,
+) -> String {
+    let reason_filter = if require_reason_marker {
+        "AND INSTR(message, ' reason=') > 0"
+    } else {
+        ""
+    };
+    format!(
+        "WITH ranked AS (
+            SELECT
+                account_id,
+                {select_columns},
+                ROW_NUMBER() OVER (
+                    PARTITION BY account_id
+                    ORDER BY created_at DESC, id DESC
+                ) AS rn
+            FROM events
+            WHERE type = 'account_status_update'
+              {reason_filter}
+              AND {account_condition}
+        )"
+    )
 }
 
 /// 函数 `extract_status_reason_from_event_message`

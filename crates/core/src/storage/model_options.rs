@@ -15,6 +15,10 @@ const STRING_ITEM_KIND_ADDITIONAL_SPEED_TIERS: &str = "additional_speed_tiers";
 const STRING_ITEM_KIND_EXPERIMENTAL_SUPPORTED_TOOLS: &str = "experimental_supported_tools";
 const STRING_ITEM_KIND_INPUT_MODALITIES: &str = "input_modalities";
 const STRING_ITEM_KIND_AVAILABLE_IN_PLANS: &str = "available_in_plans";
+const MODEL_CATALOG_MODEL_ORDER_CLAUSE: &str = "ORDER BY sort_index ASC, updated_at DESC, slug ASC";
+const MODEL_CATALOG_API_AVAILABLE_CONDITION: &str = "TRIM(slug) <> ''
+               AND COALESCE(supported_in_api, 1) = 1
+               AND LOWER(TRIM(COALESCE(visibility, ''))) NOT IN ('hide', 'hidden', 'disabled', 'unavailable')";
 
 fn normalize_model_catalog_slugs(slugs: &[String]) -> Vec<String> {
     let mut normalized = slugs
@@ -42,6 +46,103 @@ fn model_catalog_model_select_sql() -> &'static str {
         minimal_client_version_json, supports_search_tool,
         extra_json, sort_index, updated_at
      FROM model_catalog_models"
+}
+fn model_catalog_scope_by_scope_sql() -> &'static str {
+    "SELECT scope, extra_json, updated_at
+     FROM model_catalog_scopes
+     WHERE scope = ?1
+     LIMIT 1"
+}
+
+fn model_catalog_models_for_scope_sql() -> String {
+    format!(
+        "{select_sql}
+         WHERE scope = ?1
+         {order_clause}",
+        select_sql = model_catalog_model_select_sql(),
+        order_clause = MODEL_CATALOG_MODEL_ORDER_CLAUSE,
+    )
+}
+
+fn model_catalog_ordered_slug_sql(extra_conditions: &[&str], limit: Option<i64>) -> String {
+    let mut sql = "SELECT slug
+         FROM model_catalog_models
+         WHERE scope = ?1"
+        .to_string();
+    for condition in extra_conditions {
+        sql.push_str("\n           AND ");
+        sql.push_str(condition);
+    }
+    sql.push('\n');
+    sql.push_str("         ");
+    sql.push_str(MODEL_CATALOG_MODEL_ORDER_CLAUSE);
+    if let Some(limit) = limit {
+        sql.push_str(&format!("\n         LIMIT {limit}"));
+    }
+    sql
+}
+
+fn existing_model_catalog_slugs_chunk_sql(slug_condition: &str) -> String {
+    format!(
+        "SELECT slug
+         FROM model_catalog_models
+         WHERE scope = ?1
+           AND {slug_condition}"
+    )
+}
+
+fn remote_unedited_model_catalog_models_for_slugs_chunk_sql(slug_condition: &str) -> String {
+    format!(
+        "{select_sql}
+         WHERE scope = ?1
+           AND {slug_condition}
+           AND source_kind = 'remote'
+           AND COALESCE(user_edited, 0) = 0",
+        select_sql = model_catalog_model_select_sql(),
+    )
+}
+
+fn model_catalog_reasoning_levels_list_sql() -> &'static str {
+    "SELECT scope, slug, effort, description, extra_json, sort_index, updated_at
+     FROM model_catalog_reasoning_levels
+     WHERE scope = ?1
+     ORDER BY slug ASC, sort_index ASC, effort ASC"
+}
+
+fn model_catalog_string_items_list_sql() -> &'static str {
+    "SELECT scope, slug, value, sort_index, updated_at
+     FROM model_catalog_string_items
+     WHERE scope = ?1 AND item_kind = ?2
+     ORDER BY slug ASC, sort_index ASC, value ASC"
+}
+
+fn model_catalog_string_items_for_kinds_sql(placeholders: &str) -> String {
+    format!(
+        "SELECT item_kind, scope, slug, value, sort_index, updated_at
+         FROM model_catalog_string_items
+         WHERE scope = ?1 AND item_kind IN ({placeholders})
+         ORDER BY item_kind ASC, slug ASC, sort_index ASC, value ASC"
+    )
+}
+
+fn delete_model_catalog_model_sql() -> &'static str {
+    "DELETE FROM model_catalog_models WHERE scope = ?1 AND slug = ?2"
+}
+
+fn delete_model_catalog_reasoning_levels_sql() -> &'static str {
+    "DELETE FROM model_catalog_reasoning_levels WHERE scope = ?1 AND slug = ?2"
+}
+
+fn delete_model_catalog_string_items_sql() -> &'static str {
+    "DELETE FROM model_catalog_string_items
+     WHERE scope = ?1 AND slug = ?2 AND item_kind = ?3"
+}
+
+fn delete_model_catalog_string_item_kinds_sql(condition: &str) -> String {
+    format!(
+        "DELETE FROM model_catalog_string_items
+         WHERE scope = ?1 AND slug = ?2 AND {condition}"
+    )
 }
 
 fn map_model_catalog_model_record(row: &Row<'_>) -> rusqlite::Result<ModelCatalogModelRecord> {
@@ -103,12 +204,7 @@ impl Storage {
         &self,
         scope: &str,
     ) -> rusqlite::Result<Option<ModelCatalogScopeRecord>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT scope, extra_json, updated_at
-             FROM model_catalog_scopes
-             WHERE scope = ?1
-             LIMIT 1",
-        )?;
+        let mut stmt = self.conn.prepare(model_catalog_scope_by_scope_sql())?;
         let mut rows = stmt.query([scope])?;
         if let Some(row) = rows.next()? {
             return Ok(Some(ModelCatalogScopeRecord {
@@ -273,12 +369,7 @@ impl Storage {
         &self,
         scope: &str,
     ) -> rusqlite::Result<Vec<ModelCatalogModelRecord>> {
-        let sql = format!(
-            "{select_sql}
-             WHERE scope = ?1
-             ORDER BY sort_index ASC, updated_at DESC, slug ASC",
-            select_sql = model_catalog_model_select_sql(),
-        );
+        let sql = model_catalog_models_for_scope_sql();
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map([scope], map_model_catalog_model_record)?;
         let mut items = Vec::new();
@@ -345,14 +436,7 @@ impl Storage {
             let Some((slug_condition, slug_params)) = text_id_in_clause("slug", chunk) else {
                 continue;
             };
-            let sql = format!(
-                "{select_sql}
-                 WHERE scope = ?1
-                   AND {slug_condition}
-                   AND source_kind = 'remote'
-                   AND COALESCE(user_edited, 0) = 0",
-                select_sql = model_catalog_model_select_sql(),
-            );
+            let sql = remote_unedited_model_catalog_models_for_slugs_chunk_sql(&slug_condition);
             let mut values = Vec::with_capacity(slug_params.len() + 1);
             values.push(SqlValue::Text(scope.trim().to_string()));
             values.extend(slug_params);
@@ -375,14 +459,11 @@ impl Storage {
         &self,
         scope: &str,
     ) -> rusqlite::Result<Vec<String>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT slug
-             FROM model_catalog_models
-             WHERE scope = ?1
-               AND source_kind = 'remote'
-               AND COALESCE(user_edited, 0) = 0
-             ORDER BY sort_index ASC, updated_at DESC, slug ASC",
-        )?;
+        let sql = model_catalog_ordered_slug_sql(
+            &["source_kind = 'remote'", "COALESCE(user_edited, 0) = 0"],
+            None,
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map([scope], |row| row.get::<_, String>(0))?;
         rows.collect()
     }
@@ -391,15 +472,8 @@ impl Storage {
         &self,
         scope: &str,
     ) -> rusqlite::Result<Vec<String>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT slug
-             FROM model_catalog_models
-             WHERE scope = ?1
-               AND TRIM(slug) <> ''
-               AND COALESCE(supported_in_api, 1) = 1
-               AND LOWER(TRIM(COALESCE(visibility, ''))) NOT IN ('hide', 'hidden', 'disabled', 'unavailable')
-             ORDER BY sort_index ASC, updated_at DESC, slug ASC",
-        )?;
+        let sql = model_catalog_ordered_slug_sql(&[MODEL_CATALOG_API_AVAILABLE_CONDITION], None);
+        let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map([scope], |row| row.get::<_, String>(0))?;
         rows.collect()
     }
@@ -408,19 +482,9 @@ impl Storage {
         &self,
         scope: &str,
     ) -> rusqlite::Result<Option<String>> {
+        let sql = model_catalog_ordered_slug_sql(&[MODEL_CATALOG_API_AVAILABLE_CONDITION], Some(1));
         self.conn
-            .query_row(
-                "SELECT slug
-                 FROM model_catalog_models
-                 WHERE scope = ?1
-                   AND TRIM(slug) <> ''
-                   AND COALESCE(supported_in_api, 1) = 1
-                   AND LOWER(TRIM(COALESCE(visibility, ''))) NOT IN ('hide', 'hidden', 'disabled', 'unavailable')
-                 ORDER BY sort_index ASC, updated_at DESC, slug ASC
-                 LIMIT 1",
-                [scope],
-                |row| row.get::<_, String>(0),
-            )
+            .query_row(&sql, [scope], |row| row.get::<_, String>(0))
             .optional()
     }
 
@@ -434,16 +498,14 @@ impl Storage {
             return self.list_api_available_model_catalog_slugs(scope);
         }
         let like_pattern = format!("{normalized_prefix}%");
-        let mut stmt = self.conn.prepare(
-            "SELECT slug
-             FROM model_catalog_models
-             WHERE scope = ?1
-               AND TRIM(slug) <> ''
-               AND COALESCE(supported_in_api, 1) = 1
-               AND LOWER(TRIM(COALESCE(visibility, ''))) NOT IN ('hide', 'hidden', 'disabled', 'unavailable')
-               AND LOWER(TRIM(slug)) LIKE ?2
-             ORDER BY sort_index ASC, updated_at DESC, slug ASC",
-        )?;
+        let sql = model_catalog_ordered_slug_sql(
+            &[
+                MODEL_CATALOG_API_AVAILABLE_CONDITION,
+                "LOWER(TRIM(slug)) LIKE ?2",
+            ],
+            None,
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map(params![scope, like_pattern], |row| row.get::<_, String>(0))?;
         rows.collect()
     }
@@ -480,12 +542,7 @@ impl Storage {
             let Some((slug_condition, slug_params)) = text_id_in_clause("slug", chunk) else {
                 continue;
             };
-            let sql = format!(
-                "SELECT slug
-                 FROM model_catalog_models
-                 WHERE scope = ?1
-                   AND {slug_condition}",
-            );
+            let sql = existing_model_catalog_slugs_chunk_sql(&slug_condition);
             let mut values = Vec::with_capacity(slug_params.len() + 1);
             values.push(SqlValue::Text(scope.trim().to_string()));
             values.extend(slug_params);
@@ -501,23 +558,18 @@ impl Storage {
     }
 
     pub fn count_available_model_catalog_models(&self, scope: &str) -> rusqlite::Result<i64> {
-        self.conn.query_row(
+        let sql = format!(
             "SELECT COUNT(1)
              FROM model_catalog_models
              WHERE scope = ?1
-               AND TRIM(slug) <> ''
-               AND COALESCE(supported_in_api, 1) = 1
-               AND LOWER(TRIM(COALESCE(visibility, ''))) NOT IN ('hide', 'hidden', 'disabled', 'unavailable')",
-            [scope],
-            |row| row.get(0),
-        )
+               AND {MODEL_CATALOG_API_AVAILABLE_CONDITION}"
+        );
+        self.conn.query_row(&sql, [scope], |row| row.get(0))
     }
 
     pub fn delete_model_catalog_model(&self, scope: &str, slug: &str) -> rusqlite::Result<()> {
-        self.conn.execute(
-            "DELETE FROM model_catalog_models WHERE scope = ?1 AND slug = ?2",
-            params![scope, slug],
-        )?;
+        self.conn
+            .execute(delete_model_catalog_model_sql(), params![scope, slug])?;
         Ok(())
     }
 
@@ -555,12 +607,9 @@ impl Storage {
         &self,
         scope: &str,
     ) -> rusqlite::Result<Vec<ModelCatalogReasoningLevelRecord>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT scope, slug, effort, description, extra_json, sort_index, updated_at
-             FROM model_catalog_reasoning_levels
-             WHERE scope = ?1
-             ORDER BY slug ASC, sort_index ASC, effort ASC",
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare(model_catalog_reasoning_levels_list_sql())?;
         let rows = stmt.query_map([scope], |row| {
             Ok(ModelCatalogReasoningLevelRecord {
                 scope: row.get(0)?,
@@ -585,7 +634,7 @@ impl Storage {
         slug: &str,
     ) -> rusqlite::Result<()> {
         self.conn.execute(
-            "DELETE FROM model_catalog_reasoning_levels WHERE scope = ?1 AND slug = ?2",
+            delete_model_catalog_reasoning_levels_sql(),
             params![scope, slug],
         )?;
         Ok(())
@@ -654,8 +703,7 @@ impl Storage {
         item_kind: &str,
     ) -> rusqlite::Result<()> {
         self.conn.execute(
-            "DELETE FROM model_catalog_string_items
-             WHERE scope = ?1 AND slug = ?2 AND item_kind = ?3",
+            delete_model_catalog_string_items_sql(),
             params![scope, slug, item_kind],
         )?;
         Ok(())
@@ -674,10 +722,7 @@ impl Storage {
         let Some((condition, mut values)) = text_id_in_clause("item_kind", &item_kinds) else {
             return Ok(());
         };
-        let sql = format!(
-            "DELETE FROM model_catalog_string_items
-             WHERE scope = ?1 AND slug = ?2 AND {condition}"
-        );
+        let sql = delete_model_catalog_string_item_kinds_sql(&condition);
         values.insert(0, SqlValue::Text(slug.to_string()));
         values.insert(0, SqlValue::Text(scope.to_string()));
         self.conn.execute(&sql, params_from_iter(values))?;
@@ -718,12 +763,7 @@ impl Storage {
         item_kind: &str,
         scope: &str,
     ) -> rusqlite::Result<Vec<ModelCatalogStringItemRecord>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT scope, slug, value, sort_index, updated_at
-             FROM model_catalog_string_items
-             WHERE scope = ?1 AND item_kind = ?2
-             ORDER BY slug ASC, sort_index ASC, value ASC",
-        )?;
+        let mut stmt = self.conn.prepare(model_catalog_string_items_list_sql())?;
         let rows = stmt.query_map(params![scope, item_kind], |row| {
             Ok(ModelCatalogStringItemRecord {
                 scope: row.get(0)?,
@@ -752,12 +792,7 @@ impl Storage {
             .map(|index| format!("?{}", index + 2))
             .collect::<Vec<_>>()
             .join(", ");
-        let sql = format!(
-            "SELECT item_kind, scope, slug, value, sort_index, updated_at
-             FROM model_catalog_string_items
-             WHERE scope = ?1 AND item_kind IN ({placeholders})
-             ORDER BY item_kind ASC, slug ASC, sort_index ASC, value ASC"
-        );
+        let sql = model_catalog_string_items_for_kinds_sql(&placeholders);
         let mut values = Vec::with_capacity(item_kinds.len() + 1);
         values.push(SqlValue::Text(scope.trim().to_string()));
         values.extend(
@@ -1473,12 +1508,35 @@ mod tests {
     fn collect_query_plan_details(storage: &Storage, sql: &str) -> Vec<String> {
         let mut stmt = storage.conn.prepare(sql).expect("prepare explain");
         let mut rows = stmt.query([]).expect("query explain");
+        collect_query_plan_rows(&mut rows)
+    }
+
+    fn collect_query_plan_details_with_params(
+        storage: &Storage,
+        sql: &str,
+        params: Vec<SqlValue>,
+    ) -> Vec<String> {
+        let mut stmt = storage.conn.prepare(sql).expect("prepare explain");
+        let mut rows = stmt.query(params_from_iter(params)).expect("query explain");
+        collect_query_plan_rows(&mut rows)
+    }
+
+    fn collect_query_plan_rows(rows: &mut rusqlite::Rows<'_>) -> Vec<String> {
         let mut details = Vec::new();
         while let Some(row) = rows.next().expect("next explain row") {
             let detail: String = row.get(3).expect("detail");
             details.push(detail.to_ascii_lowercase());
         }
         details
+    }
+
+    fn assert_no_temp_ordering(details: &[String], label: &str) {
+        assert!(
+            !details
+                .iter()
+                .any(|detail| detail.contains("use temp b-tree for order by")),
+            "{label} should avoid temp ORDER BY sorting, got {details:?}"
+        );
     }
 
     #[test]
@@ -1559,25 +1617,34 @@ mod tests {
         let storage = Storage::open_in_memory().expect("open");
         storage.init().expect("init");
 
-        let existing_details = collect_query_plan_details(
+        let existing_sql =
+            existing_model_catalog_slugs_chunk_sql("slug IN ('available-a', 'available-b')");
+        let existing_details = collect_query_plan_details_with_params(
             &storage,
-            "EXPLAIN QUERY PLAN
-             SELECT slug
-             FROM model_catalog_models
-             WHERE scope = 'default'
-               AND slug IN ('available-a', 'available-b')",
+            &format!("EXPLAIN QUERY PLAN {existing_sql}"),
+            vec![SqlValue::Text("default".to_string())],
         );
-        let remote_details = collect_query_plan_details(
+        let remote_sql = remote_unedited_model_catalog_models_for_slugs_chunk_sql(
+            "slug IN ('available-a', 'available-b')",
+        );
+        let remote_details = collect_query_plan_details_with_params(
             &storage,
-            "EXPLAIN QUERY PLAN
-             SELECT slug, sort_index, updated_at
-             FROM model_catalog_models
-             WHERE scope = 'default'
-               AND slug IN ('available-a', 'available-b')
-               AND source_kind = 'remote'
-               AND COALESCE(user_edited, 0) = 0",
+            &format!("EXPLAIN QUERY PLAN {remote_sql}"),
+            vec![SqlValue::Text("default".to_string())],
         );
 
+        assert!(
+            existing_details
+                .iter()
+                .any(|detail| detail.contains("model_catalog_models") && detail.contains("index")),
+            "existing slug chunk query should use a model catalog lookup index, got {existing_details:?}"
+        );
+        assert!(
+            remote_details
+                .iter()
+                .any(|detail| detail.contains("model_catalog_models") && detail.contains("index")),
+            "remote catalog chunk query should use a model catalog lookup index, got {remote_details:?}"
+        );
         assert!(
             !existing_details
                 .iter()
@@ -1824,13 +1891,11 @@ mod tests {
         let storage = Storage::open_in_memory().expect("open");
         storage.init().expect("init");
 
-        let details = collect_query_plan_details(
+        let sql = model_catalog_models_for_scope_sql();
+        let details = collect_query_plan_details_with_params(
             &storage,
-            "EXPLAIN QUERY PLAN
-             SELECT slug
-             FROM model_catalog_models
-             WHERE scope = 'default'
-             ORDER BY sort_index ASC, updated_at DESC, slug ASC",
+            &format!("EXPLAIN QUERY PLAN {sql}"),
+            vec![SqlValue::Text("default".to_string())],
         );
 
         assert!(
@@ -1839,6 +1904,122 @@ mod tests {
                 .any(|detail| detail.contains("idx_model_catalog_models_scope_order")),
             "expected model catalog scope order index, got {details:?}"
         );
+    }
+
+    #[test]
+    fn model_catalog_ordered_slug_queries_use_scope_order_index() {
+        let storage = Storage::open_in_memory().expect("open");
+        storage.init().expect("init");
+
+        let remote_sql = model_catalog_ordered_slug_sql(
+            &["source_kind = 'remote'", "COALESCE(user_edited, 0) = 0"],
+            None,
+        );
+        let api_sql =
+            model_catalog_ordered_slug_sql(&[MODEL_CATALOG_API_AVAILABLE_CONDITION], None);
+        let first_api_sql =
+            model_catalog_ordered_slug_sql(&[MODEL_CATALOG_API_AVAILABLE_CONDITION], Some(1));
+        let prefixed_api_sql = model_catalog_ordered_slug_sql(
+            &[
+                MODEL_CATALOG_API_AVAILABLE_CONDITION,
+                "LOWER(TRIM(slug)) LIKE ?2",
+            ],
+            None,
+        );
+
+        for (label, sql, params) in [
+            (
+                "remote unedited catalog slug list",
+                format!("EXPLAIN QUERY PLAN {remote_sql}"),
+                vec![SqlValue::Text("default".to_string())],
+            ),
+            (
+                "API available catalog slug list",
+                format!("EXPLAIN QUERY PLAN {api_sql}"),
+                vec![SqlValue::Text("default".to_string())],
+            ),
+            (
+                "first API available catalog slug",
+                format!("EXPLAIN QUERY PLAN {first_api_sql}"),
+                vec![SqlValue::Text("default".to_string())],
+            ),
+            (
+                "prefixed API available catalog slug list",
+                format!("EXPLAIN QUERY PLAN {prefixed_api_sql}"),
+                vec![
+                    SqlValue::Text("default".to_string()),
+                    SqlValue::Text("gpt-%".to_string()),
+                ],
+            ),
+        ] {
+            let details = collect_query_plan_details_with_params(&storage, &sql, params);
+            assert!(
+                details
+                    .iter()
+                    .any(|detail| detail.contains("idx_model_catalog_models_scope_order")),
+                "{label} should use model catalog scope order index, got {details:?}"
+            );
+            assert_no_temp_ordering(&details, label);
+        }
+    }
+
+    #[test]
+    fn model_catalog_child_list_queries_use_existing_order_indexes() {
+        let storage = Storage::open_in_memory().expect("open");
+        storage.init().expect("init");
+
+        let reasoning_details = collect_query_plan_details_with_params(
+            &storage,
+            &format!(
+                "EXPLAIN QUERY PLAN {}",
+                model_catalog_reasoning_levels_list_sql()
+            ),
+            vec![SqlValue::Text("default".to_string())],
+        );
+        assert!(
+            reasoning_details
+                .iter()
+                .any(|detail| detail.contains("idx_model_catalog_reasoning_levels_scope_sort")),
+            "reasoning level list should use scope sort index, got {reasoning_details:?}"
+        );
+        assert_no_temp_ordering(&reasoning_details, "reasoning level list");
+
+        let string_item_details = collect_query_plan_details_with_params(
+            &storage,
+            &format!(
+                "EXPLAIN QUERY PLAN {}",
+                model_catalog_string_items_list_sql()
+            ),
+            vec![
+                SqlValue::Text("default".to_string()),
+                SqlValue::Text(STRING_ITEM_KIND_INPUT_MODALITIES.to_string()),
+            ],
+        );
+        assert!(
+            string_item_details
+                .iter()
+                .any(|detail| detail.contains("idx_model_catalog_string_items_scope_kind_sort")),
+            "string item list should use scope kind sort index, got {string_item_details:?}"
+        );
+        assert_no_temp_ordering(&string_item_details, "string item list");
+
+        let multi_kind_sql = model_catalog_string_items_for_kinds_sql("?2, ?3");
+        let multi_kind_details = collect_query_plan_details_with_params(
+            &storage,
+            &format!("EXPLAIN QUERY PLAN {multi_kind_sql}"),
+            vec![
+                SqlValue::Text("default".to_string()),
+                SqlValue::Text(STRING_ITEM_KIND_INPUT_MODALITIES.to_string()),
+                SqlValue::Text(STRING_ITEM_KIND_AVAILABLE_IN_PLANS.to_string()),
+            ],
+        );
+        assert!(
+            multi_kind_details
+                .iter()
+                .any(|detail| detail.contains("idx_model_catalog_string_items_scope_kind_sort")),
+            "multi-kind string item list should use scope kind sort index, got {multi_kind_details:?}"
+        );
+        assert_no_temp_ordering(&multi_kind_details, "multi-kind string item list");
     }
 
     #[test]
@@ -1859,5 +2040,105 @@ mod tests {
         assert!(details.iter().any(
             |detail| detail.contains("search model_catalog_models") && detail.contains("index")
         ));
+    }
+
+    #[test]
+    fn model_catalog_delete_helpers_use_existing_lookup_indexes() {
+        let storage = Storage::open_in_memory().expect("open");
+        storage.init().expect("init");
+
+        let model_delete_details = collect_query_plan_details_with_params(
+            &storage,
+            &format!("EXPLAIN QUERY PLAN {}", delete_model_catalog_model_sql()),
+            vec![
+                SqlValue::Text("default".to_string()),
+                SqlValue::Text("gpt-test".to_string()),
+            ],
+        );
+        let reasoning_delete_details = collect_query_plan_details_with_params(
+            &storage,
+            &format!(
+                "EXPLAIN QUERY PLAN {}",
+                delete_model_catalog_reasoning_levels_sql()
+            ),
+            vec![
+                SqlValue::Text("default".to_string()),
+                SqlValue::Text("gpt-test".to_string()),
+            ],
+        );
+        let string_item_delete_details = collect_query_plan_details_with_params(
+            &storage,
+            &format!(
+                "EXPLAIN QUERY PLAN {}",
+                delete_model_catalog_string_items_sql()
+            ),
+            vec![
+                SqlValue::Text("default".to_string()),
+                SqlValue::Text("gpt-test".to_string()),
+                SqlValue::Text(STRING_ITEM_KIND_INPUT_MODALITIES.to_string()),
+            ],
+        );
+        let string_item_kind_sql = delete_model_catalog_string_item_kinds_sql(
+            "item_kind IN ('input_modalities', 'available_in_plans')",
+        );
+        let string_item_kind_delete_details = collect_query_plan_details_with_params(
+            &storage,
+            &format!("EXPLAIN QUERY PLAN {string_item_kind_sql}"),
+            vec![
+                SqlValue::Text("default".to_string()),
+                SqlValue::Text("gpt-test".to_string()),
+            ],
+        );
+
+        assert!(
+            model_delete_details.iter().any(|detail| {
+                detail.contains("model_catalog_models") && detail.contains("index")
+            }),
+            "model catalog model delete should use a model catalog lookup index, got {model_delete_details:?}"
+        );
+        assert!(
+            reasoning_delete_details.iter().any(|detail| {
+                detail.contains("idx_model_catalog_reasoning_levels_scope_sort")
+                    || detail.contains("sqlite_autoindex_model_catalog_reasoning_levels_1")
+            }),
+            "reasoning level delete should use an existing reasoning-level lookup index, got {reasoning_delete_details:?}"
+        );
+        for (label, details) in [
+            (
+                "single string item kind delete",
+                &string_item_delete_details,
+            ),
+            (
+                "multi string item kind delete",
+                &string_item_kind_delete_details,
+            ),
+        ] {
+            assert!(
+                details.iter().any(|detail| {
+                    detail.contains("sqlite_autoindex_model_catalog_string_items_1")
+                        || detail.contains("idx_model_catalog_string_items_scope_kind_sort")
+                }),
+                "{label} should use an existing string item lookup index, got {details:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn model_catalog_scope_lookup_uses_primary_key_index() {
+        let storage = Storage::open_in_memory().expect("open");
+        storage.init().expect("init");
+
+        let details = collect_query_plan_details_with_params(
+            &storage,
+            &format!("EXPLAIN QUERY PLAN {}", model_catalog_scope_by_scope_sql()),
+            vec![SqlValue::Text("default".to_string())],
+        );
+
+        assert!(
+            details.iter().any(|detail| {
+                detail.contains("search model_catalog_scopes") && detail.contains("index")
+            }),
+            "scope lookup should use the model catalog scope primary-key index, got {details:?}"
+        );
     }
 }

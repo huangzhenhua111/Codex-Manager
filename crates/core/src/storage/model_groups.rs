@@ -45,6 +45,116 @@ fn map_user_model_group(row: &Row<'_>) -> Result<UserModelGroup> {
     })
 }
 
+fn model_group_list_sql() -> &'static str {
+    "SELECT id, name, description, status, sort, is_default,
+            rate_multiplier_millis, created_at, updated_at
+     FROM model_groups
+     ORDER BY sort ASC, name ASC, created_at ASC"
+}
+
+fn model_group_models_list_sql() -> &'static str {
+    "SELECT group_id, platform_model_slug, enabled, rate_multiplier_millis,
+            billing_model_slug, note, created_at, updated_at
+     FROM model_group_models
+     ORDER BY group_id ASC, platform_model_slug ASC"
+}
+
+fn model_group_models_for_group_sql() -> &'static str {
+    "SELECT group_id, platform_model_slug, enabled, rate_multiplier_millis,
+            billing_model_slug, note, created_at, updated_at
+     FROM model_group_models
+     WHERE group_id = ?1
+     ORDER BY platform_model_slug ASC"
+}
+
+fn user_model_groups_list_sql() -> &'static str {
+    "SELECT user_id, group_id, status, expires_at, created_at, updated_at
+     FROM user_model_groups
+     ORDER BY user_id ASC, group_id ASC"
+}
+
+fn user_model_groups_for_user_sql() -> &'static str {
+    "SELECT user_id, group_id, status, expires_at, created_at, updated_at
+     FROM user_model_groups
+     WHERE user_id = ?1
+     ORDER BY group_id ASC"
+}
+
+fn delete_user_model_groups_for_group_sql() -> &'static str {
+    "DELETE FROM user_model_groups WHERE group_id = ?1"
+}
+
+fn delete_model_group_models_for_platform_model_sql() -> &'static str {
+    "DELETE FROM model_group_models WHERE platform_model_slug = ?1"
+}
+
+fn clear_other_default_model_groups_sql() -> &'static str {
+    "UPDATE model_groups SET is_default = 0 WHERE id <> ?1"
+}
+
+fn delete_non_default_model_group_by_id_sql() -> &'static str {
+    "DELETE FROM model_groups WHERE id = ?1 AND is_default = 0"
+}
+
+fn delete_model_group_models_for_group_sql() -> &'static str {
+    "DELETE FROM model_group_models WHERE group_id = ?1"
+}
+
+fn prune_default_model_group_models_not_in_catalog_sql() -> &'static str {
+    "DELETE FROM model_group_models
+     WHERE group_id IN (SELECT id FROM model_groups WHERE is_default = 1)
+       AND EXISTS (
+           SELECT 1
+           FROM model_catalog_models
+           WHERE scope = 'default'
+             AND COALESCE(supported_in_api, 1) = 1
+             AND TRIM(slug) <> ''
+       )
+       AND platform_model_slug NOT IN (
+           SELECT slug
+           FROM model_catalog_models
+           WHERE scope = 'default'
+             AND COALESCE(supported_in_api, 1) = 1
+             AND TRIM(slug) <> ''
+       )"
+}
+
+fn allowed_model_slugs_for_user_sql() -> &'static str {
+    "SELECT DISTINCT m.platform_model_slug
+     FROM user_model_groups u
+     JOIN model_groups g ON g.id = u.group_id
+     JOIN model_group_models m ON m.group_id = g.id
+     JOIN model_catalog_models c
+       ON c.scope = 'default'
+      AND c.slug = m.platform_model_slug
+      AND COALESCE(c.supported_in_api, 1) = 1
+      AND TRIM(c.slug) <> ''
+     WHERE u.user_id = ?1
+       AND u.status = 'active'
+       AND (u.expires_at IS NULL OR u.expires_at > ?2)
+       AND g.status = 'active'
+       AND m.enabled = 1
+     ORDER BY m.platform_model_slug ASC"
+}
+
+fn model_group_access_for_user_sql() -> &'static str {
+    "SELECT g.id, g.name, m.platform_model_slug, g.rate_multiplier_millis,
+            m.rate_multiplier_millis, m.billing_model_slug
+     FROM user_model_groups u
+     JOIN model_groups g ON g.id = u.group_id
+     JOIN model_group_models m ON m.group_id = g.id
+     JOIN model_catalog_models c
+       ON c.scope = 'default'
+      AND c.slug = m.platform_model_slug
+      AND COALESCE(c.supported_in_api, 1) = 1
+      AND TRIM(c.slug) <> ''
+     WHERE u.user_id = ?1
+       AND m.platform_model_slug = ?2
+       AND u.status = 'active'
+       AND (u.expires_at IS NULL OR u.expires_at > ?3)
+       AND g.status = 'active'
+       AND m.enabled = 1"
+}
 impl Storage {
     pub(super) fn ensure_model_group_tables(&self) -> Result<()> {
         self.conn.execute_batch(
@@ -134,25 +244,8 @@ impl Storage {
     }
 
     pub fn prune_default_model_group_models_not_in_catalog(&self) -> Result<()> {
-        self.conn.execute(
-            "DELETE FROM model_group_models
-             WHERE group_id IN (SELECT id FROM model_groups WHERE is_default = 1)
-               AND EXISTS (
-                   SELECT 1
-                   FROM model_catalog_models
-                   WHERE scope = 'default'
-                     AND COALESCE(supported_in_api, 1) = 1
-                     AND TRIM(slug) <> ''
-               )
-               AND platform_model_slug NOT IN (
-                   SELECT slug
-                   FROM model_catalog_models
-                   WHERE scope = 'default'
-                     AND COALESCE(supported_in_api, 1) = 1
-                     AND TRIM(slug) <> ''
-               )",
-            [],
-        )?;
+        self.conn
+            .execute(prune_default_model_group_models_not_in_catalog_sql(), [])?;
         Ok(())
     }
 
@@ -162,7 +255,7 @@ impl Storage {
             return Ok(());
         }
         self.conn.execute(
-            "DELETE FROM model_group_models WHERE platform_model_slug = ?1",
+            delete_model_group_models_for_platform_model_sql(),
             params![slug],
         )?;
         Ok(())
@@ -179,12 +272,7 @@ impl Storage {
     }
 
     pub fn list_model_groups(&self) -> Result<Vec<ModelGroup>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, name, description, status, sort, is_default,
-                    rate_multiplier_millis, created_at, updated_at
-             FROM model_groups
-             ORDER BY sort ASC, name ASC, created_at ASC",
-        )?;
+        let mut stmt = self.conn.prepare(model_group_list_sql())?;
         let rows = stmt.query_map([], map_model_group)?;
         rows.collect()
     }
@@ -213,10 +301,8 @@ impl Storage {
 
     pub fn upsert_model_group(&self, group: &ModelGroup) -> Result<()> {
         if group.is_default {
-            self.conn.execute(
-                "UPDATE model_groups SET is_default = 0 WHERE id <> ?1",
-                [&group.id],
-            )?;
+            self.conn
+                .execute(clear_other_default_model_groups_sql(), [&group.id])?;
         }
         self.conn.execute(
             "INSERT INTO model_groups (
@@ -247,20 +333,13 @@ impl Storage {
     }
 
     pub fn delete_model_group(&self, id: &str) -> Result<()> {
-        self.conn.execute(
-            "DELETE FROM model_groups WHERE id = ?1 AND is_default = 0",
-            [id],
-        )?;
+        self.conn
+            .execute(delete_non_default_model_group_by_id_sql(), [id])?;
         Ok(())
     }
 
     pub fn list_model_group_models(&self) -> Result<Vec<ModelGroupModel>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT group_id, platform_model_slug, enabled, rate_multiplier_millis,
-                    billing_model_slug, note, created_at, updated_at
-             FROM model_group_models
-             ORDER BY group_id ASC, platform_model_slug ASC",
-        )?;
+        let mut stmt = self.conn.prepare(model_group_models_list_sql())?;
         let rows = stmt.query_map([], map_model_group_model)?;
         rows.collect()
     }
@@ -269,13 +348,7 @@ impl Storage {
         &self,
         group_id: &str,
     ) -> Result<Vec<ModelGroupModel>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT group_id, platform_model_slug, enabled, rate_multiplier_millis,
-                    billing_model_slug, note, created_at, updated_at
-             FROM model_group_models
-             WHERE group_id = ?1
-             ORDER BY platform_model_slug ASC",
-        )?;
+        let mut stmt = self.conn.prepare(model_group_models_for_group_sql())?;
         let rows = stmt.query_map([group_id], map_model_group_model)?;
         rows.collect()
     }
@@ -286,10 +359,7 @@ impl Storage {
         models: &[ModelGroupModel],
     ) -> Result<()> {
         let tx = self.conn.unchecked_transaction()?;
-        tx.execute(
-            "DELETE FROM model_group_models WHERE group_id = ?1",
-            [group_id],
-        )?;
+        tx.execute(delete_model_group_models_for_group_sql(), [group_id])?;
         for model in models {
             tx.execute(
                 "INSERT INTO model_group_models (
@@ -312,11 +382,7 @@ impl Storage {
     }
 
     pub fn list_user_model_groups(&self) -> Result<Vec<UserModelGroup>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT user_id, group_id, status, expires_at, created_at, updated_at
-             FROM user_model_groups
-             ORDER BY user_id ASC, group_id ASC",
-        )?;
+        let mut stmt = self.conn.prepare(user_model_groups_list_sql())?;
         let rows = stmt.query_map([], map_user_model_group)?;
         rows.collect()
     }
@@ -329,12 +395,7 @@ impl Storage {
     }
 
     pub fn list_user_model_groups_for_user(&self, user_id: &str) -> Result<Vec<UserModelGroup>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT user_id, group_id, status, expires_at, created_at, updated_at
-             FROM user_model_groups
-             WHERE user_id = ?1
-             ORDER BY group_id ASC",
-        )?;
+        let mut stmt = self.conn.prepare(user_model_groups_for_user_sql())?;
         let rows = stmt.query_map([user_id], map_user_model_group)?;
         rows.collect()
     }
@@ -345,10 +406,7 @@ impl Storage {
         assignments: &[UserModelGroup],
     ) -> Result<()> {
         let tx = self.conn.unchecked_transaction()?;
-        tx.execute(
-            "DELETE FROM user_model_groups WHERE group_id = ?1",
-            [group_id],
-        )?;
+        tx.execute(delete_user_model_groups_for_group_sql(), [group_id])?;
         for assignment in assignments {
             tx.execute(
                 "INSERT INTO user_model_groups (
@@ -382,51 +440,17 @@ impl Storage {
     }
 
     pub fn allowed_model_slugs_for_user(&self, user_id: &str, now: i64) -> Result<Vec<String>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT DISTINCT m.platform_model_slug
-             FROM user_model_groups u
-             JOIN model_groups g ON g.id = u.group_id
-             JOIN model_group_models m ON m.group_id = g.id
-             JOIN model_catalog_models c
-               ON c.scope = 'default'
-              AND c.slug = m.platform_model_slug
-              AND COALESCE(c.supported_in_api, 1) = 1
-              AND TRIM(c.slug) <> ''
-             WHERE u.user_id = ?1
-               AND u.status = 'active'
-               AND (u.expires_at IS NULL OR u.expires_at > ?2)
-               AND g.status = 'active'
-               AND m.enabled = 1
-             ORDER BY m.platform_model_slug ASC",
-        )?;
+        let mut stmt = self.conn.prepare(allowed_model_slugs_for_user_sql())?;
         let rows = stmt.query_map(params![user_id, now], |row| row.get(0))?;
         rows.collect()
     }
-
     pub fn resolve_model_group_access_for_user(
         &self,
         user_id: &str,
         platform_model_slug: &str,
         now: i64,
     ) -> Result<Option<ModelGroupAccess>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT g.id, g.name, m.platform_model_slug, g.rate_multiplier_millis,
-                    m.rate_multiplier_millis, m.billing_model_slug
-             FROM user_model_groups u
-             JOIN model_groups g ON g.id = u.group_id
-             JOIN model_group_models m ON m.group_id = g.id
-             JOIN model_catalog_models c
-               ON c.scope = 'default'
-              AND c.slug = m.platform_model_slug
-              AND COALESCE(c.supported_in_api, 1) = 1
-              AND TRIM(c.slug) <> ''
-             WHERE u.user_id = ?1
-               AND m.platform_model_slug = ?2
-               AND u.status = 'active'
-               AND (u.expires_at IS NULL OR u.expires_at > ?3)
-               AND g.status = 'active'
-               AND m.enabled = 1",
-        )?;
+        let mut stmt = self.conn.prepare(model_group_access_for_user_sql())?;
         let rows = stmt.query_map(params![user_id, platform_model_slug, now], |row| {
             let group_rate = row.get::<_, i64>(3)?.max(0);
             let model_rate = row.get::<_, Option<i64>>(4)?.unwrap_or(1000).max(0);
@@ -494,6 +518,18 @@ mod tests {
             sort_index: 0,
             updated_at: now_ts(),
         }
+    }
+
+    fn collect_query_plan(storage: &Storage, sql: &str) -> String {
+        let mut stmt = storage.conn.prepare(sql).expect("prepare explain");
+        let mut rows = stmt.query([]).expect("query explain");
+        let mut plan = String::new();
+        while let Some(row) = rows.next().expect("read explain row") {
+            let detail: String = row.get(3).expect("plan detail");
+            plan.push_str(&detail);
+            plan.push('\n');
+        }
+        plan
     }
 
     #[test]
@@ -687,23 +723,10 @@ mod tests {
         let storage = Storage::open_in_memory().expect("open storage");
         storage.init().expect("init storage");
 
-        let mut stmt = storage
-            .conn
-            .prepare(
-                "EXPLAIN QUERY PLAN
-                 SELECT id, name, description, status, sort, is_default,
-                        rate_multiplier_millis, created_at, updated_at
-                 FROM model_groups
-                 ORDER BY sort ASC, name ASC, created_at ASC",
-            )
-            .expect("prepare explain");
-        let mut rows = stmt.query([]).expect("query explain");
-        let mut plan = String::new();
-        while let Some(row) = rows.next().expect("read explain row") {
-            let detail: String = row.get(3).expect("plan detail");
-            plan.push_str(&detail);
-            plan.push('\n');
-        }
+        let plan = collect_query_plan(
+            &storage,
+            &format!("EXPLAIN QUERY PLAN {}", model_group_list_sql()),
+        );
 
         assert!(
             plan.contains("idx_model_groups_list_order"),
@@ -716,25 +739,196 @@ mod tests {
     }
 
     #[test]
+    fn model_group_model_lists_use_primary_key_ordering() {
+        let storage = Storage::open_in_memory().expect("open storage");
+        storage.init().expect("init storage");
+
+        let list_plan = collect_query_plan(
+            &storage,
+            &format!("EXPLAIN QUERY PLAN {}", model_group_models_list_sql()),
+        );
+        let group_plan = collect_query_plan(
+            &storage,
+            &format!(
+                "EXPLAIN QUERY PLAN {}",
+                model_group_models_for_group_sql().replace("?1", "'mg_default'")
+            ),
+        );
+
+        for (label, plan) in [
+            ("global model-group model list", list_plan),
+            ("per-group model list", group_plan),
+        ] {
+            assert!(
+                plan.contains("sqlite_autoindex_model_group_models_1"),
+                "expected {label} to use model-group model primary-key order, got {plan}"
+            );
+            assert!(
+                !plan.contains("USE TEMP B-TREE FOR ORDER BY"),
+                "expected {label} to avoid temp sorting, got {plan}"
+            );
+        }
+    }
+
+    #[test]
+    fn user_model_group_lists_use_primary_key_ordering() {
+        let storage = Storage::open_in_memory().expect("open storage");
+        storage.init().expect("init storage");
+
+        let list_plan = collect_query_plan(
+            &storage,
+            &format!("EXPLAIN QUERY PLAN {}", user_model_groups_list_sql()),
+        );
+        let user_plan = collect_query_plan(
+            &storage,
+            &format!(
+                "EXPLAIN QUERY PLAN {}",
+                user_model_groups_for_user_sql().replace("?1", "'usr_default'")
+            ),
+        );
+
+        for (label, plan) in [
+            ("global user model-group assignment list", list_plan),
+            ("per-user model-group assignment list", user_plan),
+        ] {
+            assert!(
+                plan.contains("sqlite_autoindex_user_model_groups_1"),
+                "expected {label} to use user model-group primary-key order, got {plan}"
+            );
+            assert!(
+                !plan.contains("USE TEMP B-TREE FOR ORDER BY"),
+                "expected {label} to avoid temp sorting, got {plan}"
+            );
+        }
+    }
+
+    #[test]
+    fn member_access_queries_use_existing_lookup_indexes() {
+        let storage = Storage::open_in_memory().expect("open storage");
+        storage.init().expect("init storage");
+
+        let allowed_plan = collect_query_plan(
+            &storage,
+            &format!(
+                "EXPLAIN QUERY PLAN {}",
+                allowed_model_slugs_for_user_sql()
+                    .replace("?1", "'usr_default'")
+                    .replace("?2", "1700000000")
+            ),
+        );
+        let access_plan = collect_query_plan(
+            &storage,
+            &format!(
+                "EXPLAIN QUERY PLAN {}",
+                model_group_access_for_user_sql()
+                    .replace("?1", "'usr_default'")
+                    .replace("?2", "'gpt-test'")
+                    .replace("?3", "1700000000")
+            ),
+        );
+
+        for (label, plan) in [
+            ("allowed model slugs", &allowed_plan),
+            ("model group access", &access_plan),
+        ] {
+            assert!(
+                plan.contains("idx_user_model_groups_user_status"),
+                "expected {label} to use user/status assignment lookup, got {plan}"
+            );
+            assert!(
+                plan.contains("sqlite_autoindex_model_groups_1"),
+                "expected {label} to use model group primary-key lookup, got {plan}"
+            );
+            assert!(
+                plan.contains("sqlite_autoindex_model_group_models_1"),
+                "expected {label} to use model-group model primary-key lookup, got {plan}"
+            );
+            assert!(
+                plan.contains("idx_model_catalog_models_scope_supported_in_api")
+                    || plan.contains("sqlite_autoindex_model_catalog_models_1"),
+                "expected {label} to use a model catalog lookup index, got {plan}"
+            );
+        }
+
+        assert!(
+            !allowed_plan.contains("USE TEMP B-TREE FOR ORDER BY"),
+            "allowed model slug query should read in model order without temp sorting, got {allowed_plan}"
+        );
+    }
+    #[test]
+    fn model_group_write_delete_helpers_use_existing_lookup_indexes() {
+        let storage = Storage::open_in_memory().expect("open storage");
+        storage.init().expect("init storage");
+
+        let group_models_delete_plan = collect_query_plan(
+            &storage,
+            &format!(
+                "EXPLAIN QUERY PLAN {}",
+                delete_model_group_models_for_group_sql().replace("?1", "'mg_default'")
+            ),
+        );
+        let platform_model_delete_plan = collect_query_plan(
+            &storage,
+            &format!(
+                "EXPLAIN QUERY PLAN {}",
+                delete_model_group_models_for_platform_model_sql().replace("?1", "'gpt-test'")
+            ),
+        );
+        let group_delete_plan = collect_query_plan(
+            &storage,
+            &format!(
+                "EXPLAIN QUERY PLAN {}",
+                delete_non_default_model_group_by_id_sql().replace("?1", "'mg_custom'")
+            ),
+        );
+        let default_prune_plan = collect_query_plan(
+            &storage,
+            &format!(
+                "EXPLAIN QUERY PLAN {}",
+                prune_default_model_group_models_not_in_catalog_sql()
+            ),
+        );
+
+        assert!(
+            group_models_delete_plan.contains("sqlite_autoindex_model_group_models_1"),
+            "expected group-scoped model delete to use model-group model primary-key index, got {group_models_delete_plan}"
+        );
+        assert!(
+            platform_model_delete_plan.contains("idx_model_group_models_model"),
+            "expected platform-model delete to use platform model lookup index, got {platform_model_delete_plan}"
+        );
+        assert!(
+            group_delete_plan.contains("sqlite_autoindex_model_groups_1"),
+            "expected non-default model group delete to use model group primary-key index, got {group_delete_plan}"
+        );
+        assert!(
+            default_prune_plan.contains("sqlite_autoindex_model_group_models_1"),
+            "expected default model prune to use model-group model primary-key index, got {default_prune_plan}"
+        );
+        assert!(
+            default_prune_plan.contains("idx_model_groups_default")
+                || default_prune_plan.contains("sqlite_autoindex_model_groups_1"),
+            "expected default model prune to use default-group lookup, got {default_prune_plan}"
+        );
+        assert!(
+            default_prune_plan.contains("idx_model_catalog_models_scope_supported_in_api")
+                || default_prune_plan.contains("sqlite_autoindex_model_catalog_models_1"),
+            "expected default model prune to use model catalog lookup, got {default_prune_plan}"
+        );
+    }
+
+    #[test]
     fn replace_user_model_groups_for_group_uses_group_lookup_index() {
         let storage = Storage::open_in_memory().expect("open storage");
         storage.init().expect("init storage");
 
-        let mut stmt = storage
-            .conn
-            .prepare(
-                "EXPLAIN QUERY PLAN
-                 DELETE FROM user_model_groups
-                 WHERE group_id = ?1",
-            )
-            .expect("prepare explain");
-        let mut rows = stmt.query(["mg_default"]).expect("query explain");
-        let mut plan = String::new();
-        while let Some(row) = rows.next().expect("read explain row") {
-            let detail: String = row.get(3).expect("plan detail");
-            plan.push_str(&detail);
-            plan.push('\n');
-        }
+        let plan = collect_query_plan(
+            &storage,
+            &format!(
+                "EXPLAIN QUERY PLAN {}",
+                delete_user_model_groups_for_group_sql().replace("?1", "'mg_default'")
+            ),
+        );
 
         assert!(
             plan.contains("idx_user_model_groups_group_lookup"),

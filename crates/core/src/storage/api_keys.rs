@@ -1,5 +1,6 @@
 use rusqlite::{params_from_iter, Result, Row};
 
+use super::api_key_quota_limits::delete_api_key_quota_limit_by_key_sql;
 use super::key_id_filters::{key_id_in_clause, normalize_key_ids, SQLITE_IN_CLAUSE_BATCH_SIZE};
 use super::{
     now_ts, ApiKey, ApiKeyCodexProfileCandidate, ApiKeyGatewayAuth, ApiKeyListSummary,
@@ -149,9 +150,7 @@ impl Storage {
     /// # 返回
     /// 返回函数执行结果
     pub fn list_api_keys(&self) -> Result<Vec<ApiKey>> {
-        let mut stmt = self
-            .conn
-            .prepare(&format!("{API_KEY_SELECT_SQL} ORDER BY k.created_at DESC"))?;
+        let mut stmt = self.conn.prepare(&api_key_list_sql())?;
         let mut rows = stmt.query([])?;
         let mut out = Vec::new();
         while let Some(row) = rows.next()? {
@@ -161,17 +160,13 @@ impl Storage {
     }
 
     pub fn list_api_key_summaries(&self) -> Result<Vec<ApiKeyListSummary>> {
-        let mut stmt = self.conn.prepare(&format!(
-            "{API_KEY_SUMMARY_SELECT_SQL} ORDER BY k.created_at DESC"
-        ))?;
+        let mut stmt = self.conn.prepare(&api_key_summary_list_sql())?;
         let rows = stmt.query_map([], map_api_key_summary_row)?;
         rows.collect()
     }
 
     pub fn list_api_key_quota_summaries(&self) -> Result<Vec<ApiKeyQuotaSummary>> {
-        let mut stmt = self.conn.prepare(&format!(
-            "{API_KEY_QUOTA_SUMMARY_SELECT_SQL} ORDER BY k.created_at DESC, k.id ASC"
-        ))?;
+        let mut stmt = self.conn.prepare(&api_key_quota_summary_list_sql())?;
         let rows = stmt.query_map([], map_api_key_quota_summary_row)?;
         rows.collect()
     }
@@ -179,11 +174,9 @@ impl Storage {
     pub fn list_api_key_codex_profile_candidates(
         &self,
     ) -> Result<Vec<ApiKeyCodexProfileCandidate>> {
-        let mut stmt = self.conn.prepare(&format!(
-            "{API_KEY_CODEX_PROFILE_CANDIDATE_SELECT_SQL}
-             WHERE k.status IS NULL OR LOWER(TRIM(k.status)) <> 'disabled'
-             ORDER BY k.created_at DESC, k.id ASC"
-        ))?;
+        let mut stmt = self
+            .conn
+            .prepare(&api_key_codex_profile_candidate_list_sql())?;
         let rows = stmt.query_map([], map_api_key_codex_profile_candidate_row)?;
         rows.collect()
     }
@@ -214,14 +207,7 @@ impl Storage {
         if user_id.is_empty() {
             return Ok(Vec::new());
         }
-        let sql = format!(
-            "{API_KEY_SUMMARY_SELECT_SQL}
-             INNER JOIN api_key_owners owner
-                ON owner.key_id = k.id
-               AND owner.owner_kind = 'user'
-               AND owner.owner_user_id = ?1
-             ORDER BY k.created_at DESC, k.id ASC"
-        );
+        let sql = api_key_summary_for_user_sql();
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map([user_id], map_api_key_summary_row)?;
         rows.collect()
@@ -270,11 +256,7 @@ impl Storage {
     /// # 返回
     /// 返回函数执行结果
     pub fn find_api_key_by_hash(&self, key_hash: &str) -> Result<Option<ApiKey>> {
-        let mut stmt = self.conn.prepare(&format!(
-            "{API_KEY_SELECT_SQL}
-             WHERE k.key_hash = ?1
-             LIMIT 1"
-        ))?;
+        let mut stmt = self.conn.prepare(&api_key_by_hash_sql())?;
         let mut rows = stmt.query([key_hash])?;
         if let Some(row) = rows.next()? {
             Ok(Some(map_api_key_row(row)?))
@@ -296,11 +278,7 @@ impl Storage {
     /// # 返回
     /// 返回函数执行结果
     pub fn find_api_key_by_id(&self, key_id: &str) -> Result<Option<ApiKey>> {
-        let mut stmt = self.conn.prepare(&format!(
-            "{API_KEY_SELECT_SQL}
-             WHERE k.id = ?1
-             LIMIT 1"
-        ))?;
+        let mut stmt = self.conn.prepare(&api_key_by_id_sql())?;
         let mut rows = stmt.query([key_id])?;
         if let Some(row) = rows.next()? {
             Ok(Some(map_api_key_row(row)?))
@@ -310,12 +288,7 @@ impl Storage {
     }
 
     pub fn find_api_key_status_by_id(&self, key_id: &str) -> Result<Option<ApiKeyStatus>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, status
-             FROM api_keys
-             WHERE id = ?1
-             LIMIT 1",
-        )?;
+        let mut stmt = self.conn.prepare(api_key_status_by_id_sql())?;
         let mut rows = stmt.query([key_id])?;
         if let Some(row) = rows.next()? {
             Ok(Some(ApiKeyStatus {
@@ -331,13 +304,7 @@ impl Storage {
         &self,
         key_id: &str,
     ) -> Result<Option<ApiKeyGatewayAuth>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT k.id, k.status, s.key_value
-             FROM api_keys k
-             LEFT JOIN api_key_secrets s ON s.key_id = k.id
-             WHERE k.id = ?1
-             LIMIT 1",
-        )?;
+        let mut stmt = self.conn.prepare(api_key_gateway_auth_by_id_sql())?;
         let mut rows = stmt.query([key_id])?;
         if let Some(row) = rows.next()? {
             Ok(Some(ApiKeyGatewayAuth {
@@ -354,17 +321,7 @@ impl Storage {
         &self,
         key_id: &str,
     ) -> Result<Option<ApiKeyProfileConfig>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT
-                COALESCE(p.protocol_type, 'openai_compat'),
-                p.upstream_base_url,
-                p.static_headers_json,
-                p.service_tier
-             FROM api_keys k
-             LEFT JOIN api_key_profiles p ON p.key_id = k.id
-             WHERE k.id = ?1
-             LIMIT 1",
-        )?;
+        let mut stmt = self.conn.prepare(api_key_profile_config_by_id_sql())?;
         let mut rows = stmt.query([key_id])?;
         if let Some(row) = rows.next()? {
             Ok(Some(ApiKeyProfileConfig {
@@ -379,19 +336,13 @@ impl Storage {
     }
 
     pub fn api_key_exists(&self, key_id: &str) -> Result<bool> {
-        self.conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM api_keys WHERE id = ?1)",
-            [key_id],
-            |row| row.get(0),
-        )
+        self.conn
+            .query_row(api_key_exists_sql(), [key_id], |row| row.get(0))
     }
 
     pub fn api_key_hash_exists(&self, key_hash: &str) -> Result<bool> {
-        self.conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM api_keys WHERE key_hash = ?1)",
-            [key_hash],
-            |row| row.get(0),
-        )
+        self.conn
+            .query_row(api_key_hash_exists_sql(), [key_hash], |row| row.get(0))
     }
 
     /// 函数 `update_api_key_last_used`
@@ -407,10 +358,8 @@ impl Storage {
     /// # 返回
     /// 返回函数执行结果
     pub fn update_api_key_last_used(&self, key_hash: &str) -> Result<()> {
-        self.conn.execute(
-            "UPDATE api_keys SET last_used_at = ?1 WHERE key_hash = ?2",
-            (now_ts(), key_hash),
-        )?;
+        self.conn
+            .execute(api_key_touch_last_used_by_hash_sql(), (now_ts(), key_hash))?;
         Ok(())
     }
 
@@ -428,10 +377,8 @@ impl Storage {
     /// # 返回
     /// 返回函数执行结果
     pub fn update_api_key_status(&self, key_id: &str, status: &str) -> Result<()> {
-        self.conn.execute(
-            "UPDATE api_keys SET status = ?1 WHERE id = ?2",
-            (status, key_id),
-        )?;
+        self.conn
+            .execute(api_key_update_status_by_id_sql(), (status, key_id))?;
         Ok(())
     }
 
@@ -457,8 +404,13 @@ impl Storage {
         account_plan_filter: Option<&str>,
     ) -> Result<()> {
         self.conn.execute(
-            "UPDATE api_keys SET rotation_strategy = ?1, aggregate_api_id = ?2, account_plan_filter = ?3 WHERE id = ?4",
-            (rotation_strategy, aggregate_api_id, account_plan_filter, key_id),
+            api_key_update_rotation_config_by_id_sql(),
+            (
+                rotation_strategy,
+                aggregate_api_id,
+                account_plan_filter,
+                key_id,
+            ),
         )?;
         Ok(())
     }
@@ -477,10 +429,8 @@ impl Storage {
     /// # 返回
     /// 返回函数执行结果
     pub fn update_api_key_name(&self, key_id: &str, name: Option<&str>) -> Result<()> {
-        self.conn.execute(
-            "UPDATE api_keys SET name = ?1 WHERE id = ?2",
-            (name, key_id),
-        )?;
+        self.conn
+            .execute(api_key_update_name_by_id_sql(), (name, key_id))?;
         Ok(())
     }
 
@@ -498,10 +448,8 @@ impl Storage {
     /// # 返回
     /// 返回函数执行结果
     pub fn update_api_key_model_slug(&self, key_id: &str, model_slug: Option<&str>) -> Result<()> {
-        self.conn.execute(
-            "UPDATE api_keys SET model_slug = ?1 WHERE id = ?2",
-            (model_slug, key_id),
-        )?;
+        self.conn
+            .execute(api_key_update_model_slug_by_id_sql(), (model_slug, key_id))?;
         Ok(())
     }
 
@@ -528,7 +476,7 @@ impl Storage {
         service_tier: Option<&str>,
     ) -> Result<()> {
         self.conn.execute(
-            "UPDATE api_keys SET model_slug = ?1, reasoning_effort = ?2 WHERE id = ?3",
+            api_key_update_model_config_by_id_sql(),
             (model_slug, reasoning_effort, key_id),
         )?;
         let now = now_ts();
@@ -661,14 +609,11 @@ impl Storage {
     /// # 返回
     /// 返回函数执行结果
     pub fn delete_api_key(&self, key_id: &str) -> Result<()> {
-        self.conn.execute(
-            "DELETE FROM api_key_quota_limits WHERE key_id = ?1",
-            [key_id],
-        )?;
         self.conn
-            .execute("DELETE FROM api_key_secrets WHERE key_id = ?1", [key_id])?;
+            .execute(delete_api_key_quota_limit_by_key_sql(), [key_id])?;
         self.conn
-            .execute("DELETE FROM api_keys WHERE id = ?1", [key_id])?;
+            .execute(delete_api_key_secret_by_id_sql(), [key_id])?;
+        self.conn.execute(delete_api_key_by_id_sql(), [key_id])?;
         Ok(())
     }
 
@@ -711,9 +656,7 @@ impl Storage {
     /// # 返回
     /// 返回函数执行结果
     pub fn find_api_key_secret_by_id(&self, key_id: &str) -> Result<Option<String>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT key_value FROM api_key_secrets WHERE key_id = ?1 LIMIT 1")?;
+        let mut stmt = self.conn.prepare(api_key_secret_by_id_sql())?;
         let mut rows = stmt.query([key_id])?;
         if let Some(row) = rows.next()? {
             Ok(Some(row.get(0)?))
@@ -912,10 +855,7 @@ fn list_api_keys_for_ids_chunk(storage: &Storage, key_ids: &[String]) -> Result<
     let Some((clause, params)) = key_id_in_clause("k.id", key_ids) else {
         return Ok(Vec::new());
     };
-    let sql = format!(
-        "{API_KEY_SELECT_SQL}
-         WHERE {clause}"
-    );
+    let sql = api_keys_for_ids_chunk_sql(&clause);
     let mut stmt = storage.conn.prepare(&sql)?;
     let mut rows = stmt.query(params_from_iter(params))?;
     let mut out = Vec::new();
@@ -925,6 +865,131 @@ fn list_api_keys_for_ids_chunk(storage: &Storage, key_ids: &[String]) -> Result<
     Ok(out)
 }
 
+fn api_keys_for_ids_chunk_sql(key_condition: &str) -> String {
+    format!(
+        "{API_KEY_SELECT_SQL}
+         WHERE {key_condition}"
+    )
+}
+
+fn api_key_list_sql() -> String {
+    format!("{API_KEY_SELECT_SQL} ORDER BY k.created_at DESC, k.id ASC")
+}
+
+fn api_key_summary_list_sql() -> String {
+    format!("{API_KEY_SUMMARY_SELECT_SQL} ORDER BY k.created_at DESC, k.id ASC")
+}
+
+fn api_key_quota_summary_list_sql() -> String {
+    format!("{API_KEY_QUOTA_SUMMARY_SELECT_SQL} ORDER BY k.created_at DESC, k.id ASC")
+}
+
+fn api_key_codex_profile_candidate_list_sql() -> String {
+    format!(
+        "{API_KEY_CODEX_PROFILE_CANDIDATE_SELECT_SQL}
+         WHERE k.status IS NULL OR LOWER(TRIM(k.status)) <> 'disabled'
+         ORDER BY k.created_at DESC, k.id ASC"
+    )
+}
+
+fn api_key_summary_for_user_sql() -> String {
+    format!(
+        "{API_KEY_SUMMARY_SELECT_SQL}
+         INNER JOIN api_key_owners owner
+            ON owner.key_id = k.id
+           AND owner.owner_kind = 'user'
+           AND owner.owner_user_id = ?1
+         ORDER BY k.created_at DESC, k.id ASC"
+    )
+}
+
+fn api_key_by_hash_sql() -> String {
+    format!(
+        "{API_KEY_SELECT_SQL}
+         WHERE k.key_hash = ?1
+         LIMIT 1"
+    )
+}
+
+fn api_key_by_id_sql() -> String {
+    format!(
+        "{API_KEY_SELECT_SQL}
+         WHERE k.id = ?1
+         LIMIT 1"
+    )
+}
+
+fn api_key_status_by_id_sql() -> &'static str {
+    "SELECT id, status
+     FROM api_keys
+     WHERE id = ?1
+     LIMIT 1"
+}
+
+fn api_key_exists_sql() -> &'static str {
+    "SELECT EXISTS(SELECT 1 FROM api_keys WHERE id = ?1)"
+}
+
+fn api_key_hash_exists_sql() -> &'static str {
+    "SELECT EXISTS(SELECT 1 FROM api_keys WHERE key_hash = ?1)"
+}
+
+fn api_key_touch_last_used_by_hash_sql() -> &'static str {
+    "UPDATE api_keys SET last_used_at = ?1 WHERE key_hash = ?2"
+}
+
+fn api_key_update_status_by_id_sql() -> &'static str {
+    "UPDATE api_keys SET status = ?1 WHERE id = ?2"
+}
+
+fn api_key_update_rotation_config_by_id_sql() -> &'static str {
+    "UPDATE api_keys SET rotation_strategy = ?1, aggregate_api_id = ?2, account_plan_filter = ?3 WHERE id = ?4"
+}
+
+fn api_key_update_name_by_id_sql() -> &'static str {
+    "UPDATE api_keys SET name = ?1 WHERE id = ?2"
+}
+
+fn api_key_update_model_slug_by_id_sql() -> &'static str {
+    "UPDATE api_keys SET model_slug = ?1 WHERE id = ?2"
+}
+
+fn api_key_update_model_config_by_id_sql() -> &'static str {
+    "UPDATE api_keys SET model_slug = ?1, reasoning_effort = ?2 WHERE id = ?3"
+}
+
+fn api_key_gateway_auth_by_id_sql() -> &'static str {
+    "SELECT k.id, k.status, s.key_value
+     FROM api_keys k
+     LEFT JOIN api_key_secrets s ON s.key_id = k.id
+     WHERE k.id = ?1
+     LIMIT 1"
+}
+
+fn api_key_profile_config_by_id_sql() -> &'static str {
+    "SELECT
+        COALESCE(p.protocol_type, 'openai_compat'),
+        p.upstream_base_url,
+        p.static_headers_json,
+        p.service_tier
+     FROM api_keys k
+     LEFT JOIN api_key_profiles p ON p.key_id = k.id
+     WHERE k.id = ?1
+     LIMIT 1"
+}
+
+fn api_key_secret_by_id_sql() -> &'static str {
+    "SELECT key_value FROM api_key_secrets WHERE key_id = ?1 LIMIT 1"
+}
+
+fn delete_api_key_secret_by_id_sql() -> &'static str {
+    "DELETE FROM api_key_secrets WHERE key_id = ?1"
+}
+
+fn delete_api_key_by_id_sql() -> &'static str {
+    "DELETE FROM api_keys WHERE id = ?1"
+}
+
 fn list_api_key_summaries_for_ids_chunk(
     storage: &Storage,
     key_ids: &[String],
@@ -932,13 +997,17 @@ fn list_api_key_summaries_for_ids_chunk(
     let Some((clause, params)) = key_id_in_clause("k.id", key_ids) else {
         return Ok(Vec::new());
     };
-    let sql = format!(
-        "{API_KEY_SUMMARY_SELECT_SQL}
-         WHERE {clause}"
-    );
+    let sql = api_key_summaries_for_ids_chunk_sql(&clause);
     let mut stmt = storage.conn.prepare(&sql)?;
     let rows = stmt.query_map(params_from_iter(params), map_api_key_summary_row)?;
     rows.collect()
+}
+
+fn api_key_summaries_for_ids_chunk_sql(key_condition: &str) -> String {
+    format!(
+        "{API_KEY_SUMMARY_SELECT_SQL}
+         WHERE {key_condition}"
+    )
 }
 
 /// 函数 `map_api_key_row`

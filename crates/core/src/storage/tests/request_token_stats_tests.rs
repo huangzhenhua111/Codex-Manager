@@ -1,17 +1,28 @@
-use rusqlite::params;
+use rusqlite::{params, params_from_iter, types::Value};
 
 use super::{RequestTokenStat, Storage};
 use crate::storage::{ApiKey, ApiKeyOwner, AppUser, RequestLog};
 
-fn collect_query_plan_details(storage: &Storage, sql: &str) -> Vec<String> {
+fn collect_query_plan_details_with_params(
+    storage: &Storage,
+    sql: &str,
+    params: Vec<Value>,
+) -> Vec<String> {
     let mut stmt = storage.conn.prepare(sql).expect("prepare explain");
-    let mut rows = stmt.query([]).expect("query explain");
+    let mut rows = stmt.query(params_from_iter(params)).expect("query explain");
     let mut details = Vec::new();
     while let Some(row) = rows.next().expect("next explain row") {
         let detail: String = row.get(3).expect("detail");
         details.push(detail.to_ascii_lowercase());
     }
     details
+}
+
+fn assert_uses_index(details: &[String], index_name: &str, label: &str) {
+    assert!(
+        details.iter().any(|detail| detail.contains(index_name)),
+        "{label} should use {index_name}, got {details:?}"
+    );
 }
 
 /// 函数 `insert_rollup_row`
@@ -668,20 +679,136 @@ fn dashboard_top_usage_queries_limit_in_sql_and_include_hourly_rollups() {
 fn daily_range_query_matches_created_at_index() {
     let storage = Storage::open_in_memory().expect("open");
     storage.init().expect("init");
-    let details = collect_query_plan_details(
+    let sql = super::raw_token_rollup_select(
+        "?1 + CAST((t.created_at - ?1) / ?3 AS INTEGER) * ?3 AS bucket_start,",
+        "t.created_at >= ?1 AND t.created_at < ?2",
+        "GROUP BY bucket_start",
+        false,
+    );
+    let details = collect_query_plan_details_with_params(
         &storage,
-        "EXPLAIN QUERY PLAN
-         SELECT
-            0 + CAST((t.created_at - 0) / 86400 AS INTEGER) * 86400 AS bucket_start,
-            IFNULL(SUM(IFNULL(t.total_tokens, 0)), 0) AS total_tokens
-         FROM request_token_stats t
-         LEFT JOIN request_logs r ON r.id = t.request_log_id
-         WHERE t.created_at >= 0 AND t.created_at < 604800
-         GROUP BY bucket_start",
+        &format!("EXPLAIN QUERY PLAN {sql}"),
+        vec![
+            Value::Integer(0),
+            Value::Integer(604800),
+            Value::Integer(86400),
+        ],
     );
     assert!(details
         .iter()
         .any(|detail| detail.contains("idx_request_token_stats_created_at")));
+}
+
+#[test]
+fn raw_stat_rollup_maintenance_queries_match_created_at_index() {
+    let storage = Storage::open_in_memory().expect("open");
+    storage.init().expect("init");
+
+    let maintenance_queries = [
+        (
+            "pending rollup exists",
+            super::request_token_stats_pending_rollup_exists_sql(),
+        ),
+        (
+            "delete rolled-up raw stats",
+            super::delete_request_token_stats_before_sql(),
+        ),
+    ];
+
+    for (label, sql) in maintenance_queries {
+        let details = collect_query_plan_details_with_params(
+            &storage,
+            &format!("EXPLAIN QUERY PLAN {sql}"),
+            vec![Value::Integer(86_400)],
+        );
+        assert_uses_index(&details, "idx_request_token_stats_created_at", label);
+    }
+}
+#[test]
+fn hourly_rollup_report_queries_match_existing_lookup_indexes() {
+    let storage = Storage::open_in_memory().expect("open");
+    storage.init().expect("init");
+
+    let bucket_sql = super::hourly_token_rollup_select("", super::hourly_rollup_range_clause(), "");
+    let bucket_details = collect_query_plan_details_with_params(
+        &storage,
+        &format!("EXPLAIN QUERY PLAN {bucket_sql}"),
+        vec![Value::Integer(0), Value::Integer(604800)],
+    );
+    assert_uses_index(
+        &bucket_details,
+        "idx_request_token_stat_hourly_rollups_bucket_start",
+        "hourly rollup bucket range query",
+    );
+
+    let key_sql = super::hourly_key_usage_select(
+        "",
+        &format!("h.key_id = ?3 AND {}", super::hourly_rollup_range_clause()),
+        "GROUP BY key_id",
+    );
+    let key_details = collect_query_plan_details_with_params(
+        &storage,
+        &format!("EXPLAIN QUERY PLAN {key_sql}"),
+        vec![
+            Value::Integer(0),
+            Value::Integer(604800),
+            Value::Text("key-a".to_string()),
+        ],
+    );
+    assert_uses_index(
+        &key_details,
+        "idx_request_token_stat_hourly_rollups_key_bucket",
+        "hourly rollup key range query",
+    );
+
+    let owner_sql = super::hourly_token_rollup_select(
+        "h.owner_user_id,",
+        &format!(
+            "h.owner_user_id = ?3 AND {}",
+            super::hourly_rollup_range_clause()
+        ),
+        "GROUP BY h.owner_user_id",
+    );
+    let owner_details = collect_query_plan_details_with_params(
+        &storage,
+        &format!("EXPLAIN QUERY PLAN {owner_sql}"),
+        vec![
+            Value::Integer(0),
+            Value::Integer(604800),
+            Value::Text("user-a".to_string()),
+        ],
+    );
+    assert_uses_index(
+        &owner_details,
+        "idx_request_token_stat_hourly_rollups_owner_bucket",
+        "hourly rollup owner range query",
+    );
+
+    let source_sql = super::hourly_token_rollup_select(
+        "h.actual_source_kind, h.actual_source_id,",
+        &format!(
+            "h.actual_source_kind = ?3
+            AND h.actual_source_id = ?4
+            AND {}",
+            super::hourly_rollup_range_clause()
+        ),
+        "GROUP BY h.actual_source_kind, h.actual_source_id",
+    );
+    let source_details = collect_query_plan_details_with_params(
+        &storage,
+        &format!("EXPLAIN QUERY PLAN {source_sql}"),
+        vec![
+            Value::Integer(0),
+            Value::Integer(604800),
+            Value::Text("openai_account".to_string()),
+            Value::Text("acc-a".to_string()),
+        ],
+    );
+    assert_uses_index(
+        &source_details,
+        "idx_request_token_stat_hourly_rollups_source_bucket",
+        "hourly rollup source range query",
+    );
 }
 
 #[test]
@@ -1149,16 +1276,23 @@ fn hourly_dashboard_rollups_respect_partial_range_boundaries() {
 fn key_model_range_query_matches_composite_index() {
     let storage = Storage::open_in_memory().expect("open");
     storage.init().expect("init");
-    let details = collect_query_plan_details(
+    let sql = super::raw_key_usage_select(
+        "",
+        "t.key_id = ?1
+            AND t.model = ?2
+            AND t.created_at >= ?3
+            AND t.created_at < ?4",
+        "GROUP BY t.key_id, normalized_model",
+    );
+    let details = collect_query_plan_details_with_params(
         &storage,
-        "EXPLAIN QUERY PLAN
-         SELECT key_id, model, IFNULL(SUM(IFNULL(total_tokens, 0)), 0)
-         FROM request_token_stats
-         WHERE key_id = 'key-a'
-           AND model = 'gpt-5'
-           AND created_at >= 0
-           AND created_at < 604800
-         GROUP BY key_id, model",
+        &format!("EXPLAIN QUERY PLAN {sql}"),
+        vec![
+            Value::Text("key-a".to_string()),
+            Value::Text("gpt-5".to_string()),
+            Value::Integer(0),
+            Value::Integer(604800),
+        ],
     );
     assert!(details
         .iter()

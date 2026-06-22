@@ -1,6 +1,6 @@
 use rusqlite::{params, params_from_iter, types::Value, Result, Row};
 
-use super::key_id_filters::{KeyIdSqlFilter, PairedKeyIdSqlFilter};
+use super::key_id_filters::KeyIdSqlFilter;
 use super::request_log_filters::{
     account_join_clause, build_request_log_filters, token_stats_join_clause, RequestLogSqlFilters,
 };
@@ -10,6 +10,11 @@ use super::{
 
 const DEFAULT_REQUEST_LOG_RETENTION_DAYS: i64 = 14;
 const REQUEST_LOG_RETENTION_DAYS_ENV: &str = "CODEXMANAGER_REQUEST_LOG_RETENTION_DAYS";
+const REQUEST_LOG_LIST_SELECT_COLUMNS: &str = "r.trace_id, r.key_id, r.account_id, r.initial_account_id, r.attempted_account_ids_json, r.initial_aggregate_api_id, r.attempted_aggregate_api_ids_json,
+                r.request_path, r.original_path, r.adapted_path,
+                r.method, r.request_type, r.gateway_mode, r.route_strategy, r.route_source, r.transparent_mode, r.enhanced_mode, r.client_model, r.model, r.model_source, r.upstream_model, r.actual_source_kind, r.actual_source_id, r.client_reasoning_effort, r.reasoning_effort, r.reasoning_source, r.service_tier, r.effective_service_tier, r.service_tier_source, r.response_adapter, r.upstream_url, r.aggregate_api_supplier_name, r.aggregate_api_url, r.status_code, r.duration_ms, r.first_response_ms,
+                t.input_tokens, t.cached_input_tokens, t.output_tokens, t.total_tokens, t.reasoning_output_tokens, t.estimated_cost_usd,
+                r.error, r.created_at";
 
 fn request_log_retention_days() -> i64 {
     std::env::var(REQUEST_LOG_RETENTION_DAYS_ENV)
@@ -20,6 +25,14 @@ fn request_log_retention_days() -> i64 {
 
 fn empty_optional_range(start_ts: Option<i64>, end_ts: Option<i64>) -> bool {
     matches!((start_ts, end_ts), (Some(start), Some(end)) if end <= start)
+}
+
+fn clear_request_logs_sql() -> &'static str {
+    "DELETE FROM request_logs"
+}
+
+fn prune_request_logs_before_sql() -> &'static str {
+    "DELETE FROM request_logs WHERE created_at < ?1"
 }
 
 impl Storage {
@@ -322,16 +335,8 @@ impl Storage {
             return Ok(Vec::new());
         }
         let normalized_offset = offset.max(0);
-        let include_account_lookup = self.has_table("accounts")?;
-        let filters = build_request_log_filters(
-            query,
-            status_filter,
-            start_ts,
-            end_ts,
-            include_account_lookup,
-            None,
-            true,
-        );
+        let filters =
+            self.request_log_filters(query, status_filter, start_ts, end_ts, None, true)?;
         self.list_request_logs_with_filter(filters, normalized_offset, normalized_limit)
     }
 
@@ -356,16 +361,14 @@ impl Storage {
             return Ok(Vec::new());
         };
         let normalized_offset = offset.max(0);
-        let include_account_lookup = self.has_table("accounts")?;
-        let filters = build_request_log_filters(
+        let filters = self.request_log_filters(
             query,
             status_filter,
             start_ts,
             end_ts,
-            include_account_lookup,
             Some(&key_filter),
             false,
-        );
+        )?;
         self.list_request_logs_with_filter(filters, normalized_offset, normalized_limit)
     }
 
@@ -375,48 +378,7 @@ impl Storage {
         offset: i64,
         limit: i64,
     ) -> Result<Vec<RequestLog>> {
-        let account_join = account_join_clause(filters.uses_account_lookup);
-        let sql = if filters.uses_token_stats {
-            format!(
-                "SELECT
-                r.trace_id, r.key_id, r.account_id, r.initial_account_id, r.attempted_account_ids_json, r.initial_aggregate_api_id, r.attempted_aggregate_api_ids_json,
-                r.request_path, r.original_path, r.adapted_path,
-                r.method, r.request_type, r.gateway_mode, r.route_strategy, r.route_source, r.transparent_mode, r.enhanced_mode, r.client_model, r.model, r.model_source, r.upstream_model, r.actual_source_kind, r.actual_source_id, r.client_reasoning_effort, r.reasoning_effort, r.reasoning_source, r.service_tier, r.effective_service_tier, r.service_tier_source, r.response_adapter, r.upstream_url, r.aggregate_api_supplier_name, r.aggregate_api_url, r.status_code, r.duration_ms, r.first_response_ms,
-                t.input_tokens, t.cached_input_tokens, t.output_tokens, t.total_tokens, t.reasoning_output_tokens, t.estimated_cost_usd,
-                r.error, r.created_at
-             FROM request_logs r
-             {account_join}
-             LEFT JOIN request_token_stats t ON t.request_log_id = r.id
-             {where_clause}
-             ORDER BY r.created_at DESC, r.id DESC
-             LIMIT ? OFFSET ?",
-                account_join = account_join,
-                where_clause = filters.where_clause
-            )
-        } else {
-            format!(
-                "WITH page_ids AS (
-                    SELECT r.id
-                    FROM request_logs r
-                    {account_join}
-                    {where_clause}
-                    ORDER BY r.created_at DESC, r.id DESC
-                    LIMIT ? OFFSET ?
-                )
-                SELECT
-                    r.trace_id, r.key_id, r.account_id, r.initial_account_id, r.attempted_account_ids_json, r.initial_aggregate_api_id, r.attempted_aggregate_api_ids_json,
-                    r.request_path, r.original_path, r.adapted_path,
-                    r.method, r.request_type, r.gateway_mode, r.route_strategy, r.route_source, r.transparent_mode, r.enhanced_mode, r.client_model, r.model, r.model_source, r.upstream_model, r.actual_source_kind, r.actual_source_id, r.client_reasoning_effort, r.reasoning_effort, r.reasoning_source, r.service_tier, r.effective_service_tier, r.service_tier_source, r.response_adapter, r.upstream_url, r.aggregate_api_supplier_name, r.aggregate_api_url, r.status_code, r.duration_ms, r.first_response_ms,
-                    t.input_tokens, t.cached_input_tokens, t.output_tokens, t.total_tokens, t.reasoning_output_tokens, t.estimated_cost_usd,
-                    r.error, r.created_at
-                 FROM page_ids p
-                 JOIN request_logs r ON r.id = p.id
-                 LEFT JOIN request_token_stats t ON t.request_log_id = r.id
-                 ORDER BY r.created_at DESC, r.id DESC",
-                account_join = account_join,
-                where_clause = filters.where_clause
-            )
-        };
+        let sql = request_log_list_sql(&filters);
         let mut params = filters.params;
         params.push(Value::Integer(limit));
         params.push(Value::Integer(offset));
@@ -453,26 +415,9 @@ impl Storage {
         if empty_optional_range(start_ts, end_ts) {
             return Ok(0);
         }
-        let include_account_lookup = self.has_table("accounts")?;
-        let filters = build_request_log_filters(
-            query,
-            status_filter,
-            start_ts,
-            end_ts,
-            include_account_lookup,
-            None,
-            true,
-        );
-        let sql = format!(
-            "SELECT COUNT(1)
-             FROM request_logs r
-             {account_join}
-             {token_stats_join}
-             {where_clause}",
-            account_join = account_join_clause(filters.uses_account_lookup),
-            token_stats_join = token_stats_join_clause(filters.uses_token_stats),
-            where_clause = filters.where_clause
-        );
+        let filters =
+            self.request_log_filters(query, status_filter, start_ts, end_ts, None, true)?;
+        let sql = request_log_count_sql(&filters);
         self.conn
             .query_row(&sql, params_from_iter(filters.params.iter()), |row| {
                 row.get(0)
@@ -493,26 +438,15 @@ impl Storage {
         let Some(key_filter) = KeyIdSqlFilter::create(self, "r.key_id", key_ids)? else {
             return Ok(0);
         };
-        let include_account_lookup = self.has_table("accounts")?;
-        let filters = build_request_log_filters(
+        let filters = self.request_log_filters(
             query,
             status_filter,
             start_ts,
             end_ts,
-            include_account_lookup,
             Some(&key_filter),
             false,
-        );
-        let sql = format!(
-            "SELECT COUNT(1)
-             FROM request_logs r
-             {account_join}
-             {token_stats_join}
-             {where_clause}",
-            account_join = account_join_clause(filters.uses_account_lookup),
-            token_stats_join = token_stats_join_clause(filters.uses_token_stats),
-            where_clause = filters.where_clause
-        );
+        )?;
+        let sql = request_log_count_sql(&filters);
         self.conn
             .query_row(&sql, params_from_iter(filters.params.iter()), |row| {
                 row.get(0)
@@ -545,51 +479,9 @@ impl Storage {
         if should_summarize_request_logs_from_token_stats(query, status_filter) {
             return self.summarize_request_token_stats_query_between(start_ts, end_ts);
         }
-        let include_account_lookup = self.has_table("accounts")?;
-        let filters = build_request_log_filters(
-            query,
-            status_filter,
-            start_ts,
-            end_ts,
-            include_account_lookup,
-            None,
-            true,
-        );
-        let sql = format!(
-            "SELECT
-                COUNT(1),
-                IFNULL(SUM(CASE WHEN r.status_code >= 200 AND r.status_code <= 299 THEN 1 ELSE 0 END), 0),
-                IFNULL(SUM(CASE WHEN IFNULL(r.status_code, 0) >= 400 OR TRIM(IFNULL(r.error, '')) <> '' THEN 1 ELSE 0 END), 0),
-                IFNULL(SUM(
-                    CASE
-                        WHEN t.total_tokens IS NOT NULL THEN
-                            CASE WHEN t.total_tokens > 0 THEN t.total_tokens ELSE 0 END
-                        ELSE
-                            CASE
-                                WHEN IFNULL(t.input_tokens, 0) - IFNULL(t.cached_input_tokens, 0) + IFNULL(t.output_tokens, 0) > 0
-                                    THEN IFNULL(t.input_tokens, 0) - IFNULL(t.cached_input_tokens, 0) + IFNULL(t.output_tokens, 0)
-                                ELSE 0
-                            END
-                    END
-                ), 0),
-                IFNULL(SUM(IFNULL(t.estimated_cost_usd, 0.0)), 0.0)
-             FROM request_logs r
-             {account_join}
-             LEFT JOIN request_token_stats t ON t.request_log_id = r.id
-             {where_clause}",
-            account_join = account_join_clause(filters.uses_account_lookup),
-            where_clause = filters.where_clause
-        );
-        self.conn
-            .query_row(&sql, params_from_iter(filters.params.iter()), |row| {
-                Ok(RequestLogQuerySummary {
-                    count: row.get(0)?,
-                    success_count: row.get(1)?,
-                    error_count: row.get(2)?,
-                    total_tokens: row.get(3)?,
-                    estimated_cost_usd: row.get(4)?,
-                })
-            })
+        let filters =
+            self.request_log_filters(query, status_filter, start_ts, end_ts, None, true)?;
+        self.summarize_request_logs_with_filter(filters)
     }
 
     pub fn summarize_request_logs_filtered_for_keys(
@@ -610,16 +502,42 @@ impl Storage {
         let Some(key_filter) = KeyIdSqlFilter::create(self, "r.key_id", key_ids)? else {
             return Ok(empty_request_log_query_summary());
         };
+        let filters = self.request_log_filters(
+            query,
+            status_filter,
+            start_ts,
+            end_ts,
+            Some(&key_filter),
+            false,
+        )?;
+        self.summarize_request_logs_with_filter(filters)
+    }
+
+    fn request_log_filters(
+        &self,
+        query: Option<&str>,
+        status_filter: Option<&str>,
+        start_ts: Option<i64>,
+        end_ts: Option<i64>,
+        key_filter: Option<&KeyIdSqlFilter<'_>>,
+        include_route_detail_fields: bool,
+    ) -> Result<RequestLogSqlFilters> {
         let include_account_lookup = self.has_table("accounts")?;
-        let filters = build_request_log_filters(
+        Ok(build_request_log_filters(
             query,
             status_filter,
             start_ts,
             end_ts,
             include_account_lookup,
-            Some(&key_filter),
-            false,
-        );
+            key_filter,
+            include_route_detail_fields,
+        ))
+    }
+
+    fn summarize_request_logs_with_filter(
+        &self,
+        filters: RequestLogSqlFilters,
+    ) -> Result<RequestLogQuerySummary> {
         let sql = format!(
             "SELECT
                 COUNT(1),
@@ -647,13 +565,7 @@ impl Storage {
         );
         self.conn
             .query_row(&sql, params_from_iter(filters.params.iter()), |row| {
-                Ok(RequestLogQuerySummary {
-                    count: row.get(0)?,
-                    success_count: row.get(1)?,
-                    error_count: row.get(2)?,
-                    total_tokens: row.get(3)?,
-                    estimated_cost_usd: row.get(4)?,
-                })
+                map_request_log_query_summary_row(row)
             })
     }
 
@@ -671,7 +583,7 @@ impl Storage {
     pub fn clear_request_logs(&self) -> Result<()> {
         // 中文注释：先把状态计数写入 hourly rollup，再移除可浏览请求明细，避免清日志后仪表盘成功率丢失。
         let rolled_up = self.rollup_all_request_token_stats()?;
-        let deleted_logs = self.conn.execute("DELETE FROM request_logs", [])?;
+        let deleted_logs = self.conn.execute(clear_request_logs_sql(), [])?;
         if rolled_up.saturating_add(deleted_logs) > 0 {
             let _ = self
                 .conn
@@ -685,10 +597,8 @@ impl Storage {
             return Ok(0);
         }
         self.rollup_request_token_stats_before(cutoff_ts)?;
-        self.conn.execute(
-            "DELETE FROM request_logs WHERE created_at < ?1",
-            [cutoff_ts],
-        )
+        self.conn
+            .execute(prune_request_logs_before_sql(), [cutoff_ts])
     }
 
     pub fn prune_request_logs_by_retention(&self, now: i64) -> Result<usize> {
@@ -727,66 +637,7 @@ impl Storage {
         end_ts: i64,
         key_ids: &[String],
     ) -> Result<RequestLogTodaySummary> {
-        if end_ts <= start_ts {
-            return Ok(empty_request_log_today_summary());
-        }
-        let Some(key_filter) = PairedKeyIdSqlFilter::create(self, "s.key_id", "h.key_id", key_ids)?
-        else {
-            return Ok(empty_request_log_today_summary());
-        };
-        let sql = format!(
-            "WITH combined AS (
-                SELECT
-                    IFNULL(SUM(s.input_tokens), 0) AS input_tokens,
-                    IFNULL(SUM(s.cached_input_tokens), 0) AS cached_input_tokens,
-                    IFNULL(SUM(s.output_tokens), 0) AS output_tokens,
-                    IFNULL(SUM(s.reasoning_output_tokens), 0) AS reasoning_output_tokens,
-                    IFNULL(SUM(s.estimated_cost_usd), 0.0) AS estimated_cost_usd
-                FROM request_token_stats s
-                WHERE s.created_at >= ?
-                  AND s.created_at < ?
-                  AND {raw_key_condition}
-                UNION ALL
-                SELECT
-                    IFNULL(SUM(h.input_tokens), 0) AS input_tokens,
-                    IFNULL(SUM(h.cached_input_tokens), 0) AS cached_input_tokens,
-                    IFNULL(SUM(h.output_tokens), 0) AS output_tokens,
-                    IFNULL(SUM(h.reasoning_output_tokens), 0) AS reasoning_output_tokens,
-                    IFNULL(SUM(h.estimated_cost_usd), 0.0) AS estimated_cost_usd
-                FROM request_token_stat_hourly_rollups h
-                WHERE h.bucket_start >= ?
-                  AND h.bucket_end <= ?
-                  AND {hourly_key_condition}
-             )
-             SELECT
-                IFNULL(SUM(input_tokens), 0),
-                IFNULL(SUM(cached_input_tokens), 0),
-                IFNULL(SUM(output_tokens), 0),
-                IFNULL(SUM(reasoning_output_tokens), 0),
-                IFNULL(SUM(estimated_cost_usd), 0.0)
-             FROM combined",
-            raw_key_condition = key_filter.first_condition(),
-            hourly_key_condition = key_filter.second_condition()
-        );
-        let paired_params = key_filter.params();
-        let split_at = paired_params.len() / 2;
-        let (raw_key_params, hourly_key_params) = paired_params.split_at(split_at);
-        let mut params = Vec::with_capacity(paired_params.len() + 4);
-        params.push(Value::Integer(start_ts));
-        params.push(Value::Integer(end_ts));
-        params.extend_from_slice(raw_key_params);
-        params.push(Value::Integer(start_ts));
-        params.push(Value::Integer(end_ts));
-        params.extend_from_slice(hourly_key_params);
-        self.conn.query_row(&sql, params_from_iter(params), |row| {
-            Ok(RequestLogTodaySummary {
-                input_tokens: row.get(0)?,
-                cached_input_tokens: row.get(1)?,
-                output_tokens: row.get(2)?,
-                reasoning_output_tokens: row.get(3)?,
-                estimated_cost_usd: row.get(4)?,
-            })
-        })
+        self.summarize_request_token_stats_between_for_keys(start_ts, end_ts, key_ids)
     }
 
     /// 函数 `ensure_request_logs_table`
@@ -1140,6 +991,58 @@ impl Storage {
     }
 }
 
+fn request_log_list_sql(filters: &RequestLogSqlFilters) -> String {
+    let account_join = account_join_clause(filters.uses_account_lookup);
+    if filters.uses_token_stats {
+        return format!(
+            "SELECT
+                {select_columns}
+             FROM request_logs r
+             {account_join}
+             LEFT JOIN request_token_stats t ON t.request_log_id = r.id
+             {where_clause}
+             ORDER BY r.created_at DESC, r.id DESC
+             LIMIT ? OFFSET ?",
+            select_columns = REQUEST_LOG_LIST_SELECT_COLUMNS,
+            account_join = account_join,
+            where_clause = filters.where_clause
+        );
+    }
+
+    format!(
+        "WITH page_ids AS (
+            SELECT r.id
+            FROM request_logs r
+            {account_join}
+            {where_clause}
+            ORDER BY r.created_at DESC, r.id DESC
+            LIMIT ? OFFSET ?
+        )
+        SELECT
+            {select_columns}
+         FROM page_ids p
+         JOIN request_logs r ON r.id = p.id
+         LEFT JOIN request_token_stats t ON t.request_log_id = r.id
+         ORDER BY r.created_at DESC, r.id DESC",
+        select_columns = REQUEST_LOG_LIST_SELECT_COLUMNS,
+        account_join = account_join,
+        where_clause = filters.where_clause
+    )
+}
+
+fn request_log_count_sql(filters: &RequestLogSqlFilters) -> String {
+    format!(
+        "SELECT COUNT(1)
+         FROM request_logs r
+         {account_join}
+         {token_stats_join}
+         {where_clause}",
+        account_join = account_join_clause(filters.uses_account_lookup),
+        token_stats_join = token_stats_join_clause(filters.uses_token_stats),
+        where_clause = filters.where_clause
+    )
+}
+
 /// 函数 `map_request_log_row`
 ///
 /// 作者: gaohongshun
@@ -1200,6 +1103,16 @@ fn map_request_log_row(row: &Row<'_>) -> Result<RequestLog> {
     })
 }
 
+fn map_request_log_query_summary_row(row: &Row<'_>) -> Result<RequestLogQuerySummary> {
+    Ok(RequestLogQuerySummary {
+        count: row.get(0)?,
+        success_count: row.get(1)?,
+        error_count: row.get(2)?,
+        total_tokens: row.get(3)?,
+        estimated_cost_usd: row.get(4)?,
+    })
+}
+
 /// 函数 `normalize_request_log_limit`
 ///
 /// 作者: gaohongshun
@@ -1233,16 +1146,6 @@ fn normalize_request_log_limit(value: i64) -> i64 {
 ///
 /// # 返回
 /// 返回函数执行结果
-fn empty_request_log_today_summary() -> RequestLogTodaySummary {
-    RequestLogTodaySummary {
-        input_tokens: 0,
-        cached_input_tokens: 0,
-        output_tokens: 0,
-        reasoning_output_tokens: 0,
-        estimated_cost_usd: 0.0,
-    }
-}
-
 fn empty_request_log_query_summary() -> RequestLogQuerySummary {
     RequestLogQuerySummary::default()
 }

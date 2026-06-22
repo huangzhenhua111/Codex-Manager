@@ -2,6 +2,51 @@ use rusqlite::params;
 
 use super::{ConversationBinding, Storage};
 
+pub(super) fn conversation_binding_lookup_sql() -> &'static str {
+    "SELECT
+        platform_key_hash,
+        conversation_id,
+        account_id,
+        thread_epoch,
+        thread_anchor,
+        status,
+        last_model,
+        last_switch_reason,
+        created_at,
+        updated_at,
+        last_used_at
+     FROM conversation_bindings
+     WHERE platform_key_hash = ?1
+       AND conversation_id = ?2
+     LIMIT 1"
+}
+
+fn touch_conversation_binding_sql() -> &'static str {
+    "UPDATE conversation_bindings
+     SET last_model = ?4,
+         last_used_at = ?5,
+         updated_at = ?5
+     WHERE platform_key_hash = ?1
+       AND conversation_id = ?2
+       AND account_id = ?3"
+}
+
+fn delete_conversation_binding_sql() -> &'static str {
+    "DELETE FROM conversation_bindings
+     WHERE platform_key_hash = ?1
+       AND conversation_id = ?2"
+}
+
+pub(super) fn delete_conversation_bindings_for_account_sql() -> &'static str {
+    "DELETE FROM conversation_bindings
+     WHERE account_id = ?1"
+}
+
+pub(super) fn delete_stale_conversation_bindings_sql() -> &'static str {
+    "DELETE FROM conversation_bindings
+     WHERE last_used_at < ?1"
+}
+
 impl Storage {
     /// 函数 `get_conversation_binding`
     ///
@@ -21,24 +66,7 @@ impl Storage {
         platform_key_hash: &str,
         conversation_id: &str,
     ) -> rusqlite::Result<Option<ConversationBinding>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT
-                platform_key_hash,
-                conversation_id,
-                account_id,
-                thread_epoch,
-                thread_anchor,
-                status,
-                last_model,
-                last_switch_reason,
-                created_at,
-                updated_at,
-                last_used_at
-             FROM conversation_bindings
-             WHERE platform_key_hash = ?1
-               AND conversation_id = ?2
-             LIMIT 1",
-        )?;
+        let mut stmt = self.conn.prepare(conversation_binding_lookup_sql())?;
         let mut rows = stmt.query([platform_key_hash, conversation_id])?;
         if let Some(row) = rows.next()? {
             return Ok(Some(ConversationBinding {
@@ -141,13 +169,7 @@ impl Storage {
         touched_at: i64,
     ) -> rusqlite::Result<bool> {
         let updated = self.conn.execute(
-            "UPDATE conversation_bindings
-             SET last_model = ?4,
-                 last_used_at = ?5,
-                 updated_at = ?5
-             WHERE platform_key_hash = ?1
-               AND conversation_id = ?2
-               AND account_id = ?3",
+            touch_conversation_binding_sql(),
             params![
                 platform_key_hash,
                 conversation_id,
@@ -178,9 +200,7 @@ impl Storage {
         conversation_id: &str,
     ) -> rusqlite::Result<()> {
         self.conn.execute(
-            "DELETE FROM conversation_bindings
-             WHERE platform_key_hash = ?1
-               AND conversation_id = ?2",
+            delete_conversation_binding_sql(),
             params![platform_key_hash, conversation_id],
         )?;
         Ok(())
@@ -202,11 +222,8 @@ impl Storage {
         &self,
         account_id: &str,
     ) -> rusqlite::Result<()> {
-        self.conn.execute(
-            "DELETE FROM conversation_bindings
-             WHERE account_id = ?1",
-            [account_id],
-        )?;
+        self.conn
+            .execute(delete_conversation_bindings_for_account_sql(), [account_id])?;
         Ok(())
     }
 
@@ -226,11 +243,8 @@ impl Storage {
         &self,
         older_than_ts: i64,
     ) -> rusqlite::Result<usize> {
-        self.conn.execute(
-            "DELETE FROM conversation_bindings
-             WHERE last_used_at < ?1",
-            [older_than_ts],
-        )
+        self.conn
+            .execute(delete_stale_conversation_bindings_sql(), [older_than_ts])
     }
 }
 

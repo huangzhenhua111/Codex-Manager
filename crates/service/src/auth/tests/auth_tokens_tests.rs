@@ -1,4 +1,7 @@
-use super::{next_account_sort, resolve_existing_account_for_login};
+use super::{
+    auth_http_client_for_issuer, next_account_sort, openai_auth_loopback_http_client_build_count,
+    resolve_existing_account_for_login,
+};
 use crate::account_identity::{build_account_storage_id, pick_existing_account_id_by_identity};
 use crate::auth_tokens::{
     build_api_key_exchange_request, build_exchange_code_request, ensure_workspace_allowed,
@@ -707,6 +710,25 @@ fn issuer_uses_loopback_host_accepts_local_test_issuers() {
 #[test]
 fn issuer_uses_loopback_host_rejects_remote_issuers() {
     assert!(!issuer_uses_loopback_host("https://auth.openai.com"));
+}
+
+#[test]
+fn loopback_auth_http_client_reuses_cached_no_proxy_client() {
+    let before = openai_auth_loopback_http_client_build_count();
+
+    let _first = auth_http_client_for_issuer("http://127.0.0.1:1455");
+    let after_first = openai_auth_loopback_http_client_build_count();
+    let _second = auth_http_client_for_issuer("http://localhost:1455");
+    let after_second = openai_auth_loopback_http_client_build_count();
+
+    assert!(
+        after_first == before || after_first == before + 1,
+        "first loopback auth client access should initialize at most once; before={before}, after_first={after_first}"
+    );
+    assert_eq!(
+        after_second, after_first,
+        "second loopback auth client access should reuse the cached client"
+    );
 }
 
 /// 函数 `exchange_code_for_tokens_matches_official_login_server_headers`

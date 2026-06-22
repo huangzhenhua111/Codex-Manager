@@ -1,11 +1,13 @@
 use reqwest::blocking::Client;
 use semver::Version;
 use std::path::PathBuf;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub(super) const DEFAULT_UPDATE_REPO: &str = "qxcnm/Codex-Manager";
 pub(super) const PORTABLE_MARKER_FILE: &str = ".codexmanager-portable";
 pub(super) const USER_AGENT: &str = "CodexManager-Updater";
+static UPDATE_HTTP_CLIENT: OnceLock<Mutex<Option<Client>>> = OnceLock::new();
 
 #[cfg(target_os = "windows")]
 pub(super) const CREATE_NO_WINDOW: u32 = 0x08000000;
@@ -175,11 +177,35 @@ pub(super) fn should_include_prerelease_updates(current_version: &Version) -> bo
 ///
 /// # 返回
 /// 返回函数执行结果
-pub(super) fn http_client() -> Result<Client, String> {
+fn build_http_client() -> Result<Client, String> {
     Client::builder()
         .timeout(Duration::from_secs(30))
         .build()
         .map_err(|err| format!("创建 HTTP 客户端失败：{err}"))
+}
+
+/// 函数 `http_client`
+///
+/// 作者: gaohongshun
+///
+/// 时间: 2026-04-02
+///
+/// # 参数
+/// - super: 参数 super
+///
+/// # 返回
+/// 返回函数执行结果
+pub(super) fn http_client() -> Result<Client, String> {
+    let lock = UPDATE_HTTP_CLIENT.get_or_init(|| Mutex::new(None));
+    let mut cached = lock
+        .lock()
+        .map_err(|err| format!("更新 HTTP 客户端缓存锁定失败：{err}"))?;
+    if let Some(client) = cached.as_ref() {
+        return Ok(client.clone());
+    }
+    let client = build_http_client()?;
+    *cached = Some(client.clone());
+    Ok(client)
 }
 
 /// 函数 `resolve_github_token`
@@ -209,7 +235,7 @@ pub(super) fn resolve_github_token() -> Option<String> {
 mod tests {
     use semver::Version;
 
-    use super::{normalize_version, should_include_prerelease_updates_with_override};
+    use super::{http_client, normalize_version, should_include_prerelease_updates_with_override};
 
     /// 函数 `prerelease_channel_defaults_to_stable_latest`
     ///
@@ -258,5 +284,13 @@ mod tests {
     fn normalize_version_accepts_v_prefix() {
         let version = normalize_version(" v0.1.8 ").expect("normalized version");
         assert_eq!(version, Version::parse("0.1.8").expect("expected version"));
+    }
+
+    #[test]
+    fn http_client_can_be_reused() {
+        let first = http_client().expect("first updater http client");
+        let second = http_client().expect("second updater http client");
+        drop(first);
+        drop(second);
     }
 }

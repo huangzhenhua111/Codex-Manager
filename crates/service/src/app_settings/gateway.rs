@@ -425,7 +425,7 @@ fn sync_gateway_user_agent_version_from_codex_latest_url(
 fn fetch_codex_latest_version_from_url(
     registry_url: &str,
 ) -> Result<CodexLatestVersionInfo, String> {
-    let response = gateway::fresh_upstream_client()
+    let response = gateway::upstream_client()
         .get(registry_url)
         .header(reqwest::header::ACCEPT, "application/json")
         .timeout(Duration::from_secs(10))

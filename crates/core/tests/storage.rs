@@ -512,6 +512,120 @@ fn upsert_discovered_source_models_prunes_stale_discovered_routes() {
 }
 
 #[test]
+fn delete_aggregate_api_removes_aggregate_model_source_routes() {
+    let storage = Storage::open_in_memory().expect("open in memory");
+    storage.init().expect("init schema");
+    let now = now_ts();
+
+    storage
+        .insert_aggregate_api(&AggregateApi {
+            id: "agg-routing-delete".to_string(),
+            provider_type: "openai-compatible".to_string(),
+            supplier_name: Some("delete aggregate route".to_string()),
+            sort: 0,
+            url: "https://agg-routing-delete.example/v1".to_string(),
+            auth_type: "bearer".to_string(),
+            auth_params_json: None,
+            action: None,
+            model_override: None,
+            status: "active".to_string(),
+            created_at: now,
+            updated_at: now,
+            last_test_at: None,
+            last_test_status: None,
+            last_test_error: None,
+            balance_query_enabled: false,
+            balance_query_template: None,
+            balance_query_base_url: None,
+            balance_query_user_id: None,
+            balance_query_config_json: None,
+            last_balance_at: None,
+            last_balance_status: None,
+            last_balance_error: None,
+            last_balance_json: None,
+        })
+        .expect("insert aggregate api");
+    storage
+        .upsert_model_source_model(&ModelSourceModel {
+            source_kind: "aggregate_api".to_string(),
+            source_id: "agg-routing-delete".to_string(),
+            upstream_model: "gpt-platform".to_string(),
+            display_name: Some("GPT Platform".to_string()),
+            status: "available".to_string(),
+            discovery_kind: "synced".to_string(),
+            last_synced_at: Some(now),
+            extra_json: "{}".to_string(),
+            created_at: now,
+            updated_at: now,
+        })
+        .expect("upsert aggregate source model");
+    storage
+        .upsert_model_source_mapping(&ModelSourceMapping {
+            id: "map-agg-routing-delete".to_string(),
+            platform_model_slug: "gpt-platform".to_string(),
+            source_kind: "aggregate_api".to_string(),
+            source_id: "agg-routing-delete".to_string(),
+            upstream_model: "gpt-platform".to_string(),
+            enabled: true,
+            priority: 0,
+            weight: 1,
+            billing_model_slug: None,
+            created_at: now,
+            updated_at: now,
+        })
+        .expect("upsert aggregate mapping");
+    storage
+        .upsert_model_source_mapping_preference(
+            "aggregate_api",
+            "agg-routing-delete",
+            "gpt-platform",
+            "disabled",
+        )
+        .expect("upsert aggregate preference");
+    storage
+        .upsert_model_source_model(&ModelSourceModel {
+            source_kind: "openai_account".to_string(),
+            source_id: "agg-routing-delete".to_string(),
+            upstream_model: "gpt-platform".to_string(),
+            display_name: Some("Account GPT Platform".to_string()),
+            status: "available".to_string(),
+            discovery_kind: "synced".to_string(),
+            last_synced_at: Some(now),
+            extra_json: "{}".to_string(),
+            created_at: now,
+            updated_at: now,
+        })
+        .expect("upsert non-aggregate source model");
+
+    storage
+        .delete_aggregate_api("agg-routing-delete")
+        .expect("delete aggregate api");
+
+    assert!(storage
+        .find_aggregate_api_by_id("agg-routing-delete")
+        .expect("find deleted aggregate api")
+        .is_none());
+    assert!(storage
+        .list_model_source_models(Some("aggregate_api"), Some("agg-routing-delete"))
+        .expect("list aggregate source models")
+        .is_empty());
+    assert!(storage
+        .list_model_source_mappings(Some("gpt-platform"))
+        .expect("list mappings")
+        .is_empty());
+    assert!(storage
+        .list_model_source_mapping_preferences("aggregate_api", "agg-routing-delete")
+        .expect("list aggregate preferences")
+        .is_empty());
+    assert_eq!(
+        storage
+            .list_model_source_models(Some("openai_account"), Some("agg-routing-delete"))
+            .expect("list non-aggregate source models")
+            .len(),
+        1
+    );
+}
+#[test]
 fn delete_account_removes_openai_model_source_routes() {
     let mut storage = Storage::open_in_memory().expect("open in memory");
     storage.init().expect("init schema");

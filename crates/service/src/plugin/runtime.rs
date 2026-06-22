@@ -5,10 +5,43 @@ use codexmanager_core::storage::{
 use rhai::{Array, Dynamic, Engine, Map, Scope};
 use serde_json::{json, Value};
 use std::collections::HashSet;
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use crate::account_cleanup::{delete_banned_accounts, delete_unavailable_free_accounts};
 use crate::storage_helpers::open_storage;
+
+static PLUGIN_HTTP_CLIENT: OnceLock<Mutex<Option<reqwest::blocking::Client>>> = OnceLock::new();
+#[cfg(test)]
+static PLUGIN_HTTP_CLIENT_BUILD_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+fn build_plugin_http_client() -> Result<reqwest::blocking::Client, String> {
+    #[cfg(test)]
+    PLUGIN_HTTP_CLIENT_BUILD_COUNT.fetch_add(1, Ordering::SeqCst);
+
+    reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(20))
+        .build()
+        .map_err(|err| format!("build http client failed: {err}"))
+}
+
+fn plugin_http_client() -> Result<reqwest::blocking::Client, String> {
+    let lock = PLUGIN_HTTP_CLIENT.get_or_init(|| Mutex::new(None));
+    let mut cached = crate::lock_utils::lock_recover(lock, "plugin_http_client");
+    if let Some(client) = cached.as_ref() {
+        return Ok(client.clone());
+    }
+    let client = build_plugin_http_client()?;
+    *cached = Some(client.clone());
+    Ok(client)
+}
+
+#[cfg(test)]
+fn plugin_http_client_build_count_for_test() -> usize {
+    PLUGIN_HTTP_CLIENT_BUILD_COUNT.load(Ordering::SeqCst)
+}
 
 fn task_execution_row_from_task(task: PluginTask) -> PluginTaskExecutionRow {
     PluginTaskExecutionRow {
@@ -159,10 +192,7 @@ pub(super) fn run_loaded_plugin_task(
 /// # 返回
 /// 返回函数执行结果
 pub(crate) fn fetch_text(url: &str) -> Result<String, String> {
-    let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(20))
-        .build()
-        .map_err(|err| format!("build http client failed: {err}"))?;
+    let client = plugin_http_client()?;
     let response = client
         .get(url)
         .send()
@@ -306,10 +336,7 @@ fn execute_plugin_script(
 /// # 返回
 /// 返回函数执行结果
 fn fetch_http_value(method: &str, url: &str, body: Option<String>) -> Result<Value, String> {
-    let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(20))
-        .build()
-        .map_err(|err| format!("build http client failed: {err}"))?;
+    let client = plugin_http_client()?;
     let request = match method {
         "POST" => client.post(url),
         _ => client.get(url),
@@ -458,4 +485,26 @@ fn json_from_dynamic(value: Dynamic) -> Value {
         return Value::Object(out);
     }
     Value::Null
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{plugin_http_client, plugin_http_client_build_count_for_test};
+
+    #[test]
+    fn plugin_http_client_reuses_cached_client() {
+        let before = plugin_http_client_build_count_for_test();
+        let first = plugin_http_client().expect("first plugin http client");
+        let after_first = plugin_http_client_build_count_for_test();
+        let second = plugin_http_client().expect("second plugin http client");
+        let after_second = plugin_http_client_build_count_for_test();
+
+        assert!(
+            after_first == before || after_first == before + 1,
+            "expected first call to reuse an existing client or build one client, before={before}, after_first={after_first}"
+        );
+        assert_eq!(after_second, after_first);
+        drop(first);
+        drop(second);
+    }
 }

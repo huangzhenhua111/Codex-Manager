@@ -333,6 +333,29 @@ pub struct LoginSession {
     pub updated_at: i64,
 }
 
+fn login_session_select_columns() -> &'static str {
+    "login_id, code_verifier, state, status, error, workspace_id, note, tags, created_at, updated_at"
+}
+
+fn insert_login_session_sql() -> &'static str {
+    "INSERT INTO login_sessions (login_id, code_verifier, state, status, error, workspace_id, note, tags, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)"
+}
+
+fn login_session_by_id_sql() -> String {
+    format!(
+        "SELECT {columns} FROM login_sessions WHERE login_id = ?1",
+        columns = login_session_select_columns(),
+    )
+}
+
+fn update_login_session_status_sql() -> &'static str {
+    "UPDATE login_sessions SET status = ?1, error = ?2, updated_at = ?3 WHERE login_id = ?4"
+}
+
+fn update_login_session_code_verifier_sql() -> &'static str {
+    "UPDATE login_sessions SET code_verifier = ?1, updated_at = ?2 WHERE login_id = ?3"
+}
+
 #[derive(Debug, Clone)]
 pub struct UsageSnapshotRecord {
     pub account_id: String,
@@ -1234,6 +1257,25 @@ pub struct Storage {
 }
 
 impl Storage {
+    fn configure_connection(conn: &Connection) -> Result<()> {
+        // 中文注释：并发写入时给 SQLite 一点等待时间，避免瞬时 lock 导致请求直接失败。
+        conn.busy_timeout(Duration::from_millis(3000))?;
+        // 中文注释：复杂筛选/聚合的临时 B-tree 优先走内存，减少报表查询落盘开销。
+        conn.execute_batch("PRAGMA temp_store=MEMORY;")?;
+        Ok(())
+    }
+
+    fn configure_file_connection(conn: &Connection) -> Result<()> {
+        Self::configure_connection(conn)?;
+        // 中文注释：文件库启用 WAL + NORMAL，可明显降低并发读写互斥开销；
+        // 仅在 open(path) 上设置，避免影响 open_in_memory 的行为预期。
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL;
+             PRAGMA synchronous=NORMAL;",
+        )?;
+        Ok(())
+    }
+
     /// 函数 `open`
     ///
     /// 作者: gaohongshun
@@ -1247,14 +1289,7 @@ impl Storage {
     /// 返回函数执行结果
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let conn = Connection::open(path)?;
-        // 中文注释：并发写入时给 SQLite 一点等待时间，避免瞬时 lock 导致请求直接失败。
-        conn.busy_timeout(Duration::from_millis(3000))?;
-        // 中文注释：文件库启用 WAL + NORMAL，可明显降低并发读写互斥开销；
-        // 仅在 open(path) 上设置，避免影响 open_in_memory 的行为预期。
-        conn.execute_batch(
-            "PRAGMA journal_mode=WAL;
-             PRAGMA synchronous=NORMAL;",
-        )?;
+        Self::configure_file_connection(&conn)?;
         Ok(Self { conn })
     }
 
@@ -1271,7 +1306,7 @@ impl Storage {
     /// 返回函数执行结果
     pub fn open_in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
-        conn.busy_timeout(Duration::from_millis(3000))?;
+        Self::configure_connection(&conn)?;
         Ok(Self { conn })
     }
 
@@ -1902,7 +1937,7 @@ impl Storage {
     /// 返回函数执行结果
     pub fn insert_login_session(&self, session: &LoginSession) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO login_sessions (login_id, code_verifier, state, status, error, workspace_id, note, tags, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            insert_login_session_sql(),
             (
                 &session.login_id,
                 &session.code_verifier,
@@ -1932,9 +1967,7 @@ impl Storage {
     /// # 返回
     /// 返回函数执行结果
     pub fn get_login_session(&self, login_id: &str) -> Result<Option<LoginSession>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT login_id, code_verifier, state, status, error, workspace_id, note, tags, created_at, updated_at FROM login_sessions WHERE login_id = ?1",
-        )?;
+        let mut stmt = self.conn.prepare(&login_session_by_id_sql())?;
         let mut rows = stmt.query([login_id])?;
         if let Some(row) = rows.next()? {
             Ok(Some(LoginSession {
@@ -1976,7 +2009,7 @@ impl Storage {
         error: Option<&str>,
     ) -> Result<()> {
         self.conn.execute(
-            "UPDATE login_sessions SET status = ?1, error = ?2, updated_at = ?3 WHERE login_id = ?4",
+            update_login_session_status_sql(),
             (status, error, now_ts(), login_id),
         )?;
         Ok(())
@@ -2001,7 +2034,7 @@ impl Storage {
         code_verifier: &str,
     ) -> Result<()> {
         self.conn.execute(
-            "UPDATE login_sessions SET code_verifier = ?1, updated_at = ?2 WHERE login_id = ?3",
+            update_login_session_code_verifier_sql(),
             (code_verifier, now_ts(), login_id),
         )?;
         Ok(())
@@ -2228,6 +2261,68 @@ impl Storage {
                 .unwrap_or(false),
             _ => false,
         }
+    }
+}
+
+#[cfg(test)]
+mod login_session_query_plan_tests {
+    use rusqlite::{Params, Result};
+
+    use super::{
+        login_session_by_id_sql, update_login_session_code_verifier_sql,
+        update_login_session_status_sql, Storage,
+    };
+
+    fn collect_query_plan<P>(storage: &Storage, sql: &str, params: P) -> String
+    where
+        P: Params,
+    {
+        let mut stmt = storage.conn.prepare(sql).expect("prepare query plan");
+        let rows = stmt
+            .query_map(params, |row| row.get::<_, String>(3))
+            .expect("collect query plan rows");
+        rows.collect::<Result<Vec<_>>>()
+            .expect("query plan rows")
+            .join("\n")
+    }
+
+    #[test]
+    fn login_session_primary_key_helpers_use_primary_key_index() {
+        let storage = Storage::open_in_memory().expect("open in memory");
+        storage.init().expect("init schema");
+
+        let lookup_plan = collect_query_plan(
+            &storage,
+            &format!("EXPLAIN QUERY PLAN {}", login_session_by_id_sql()),
+            ["login-1"],
+        );
+        assert!(
+            lookup_plan.contains("sqlite_autoindex_login_sessions_1"),
+            "login session lookup should use primary key index:\n{lookup_plan}"
+        );
+
+        let status_update_plan = collect_query_plan(
+            &storage,
+            &format!("EXPLAIN QUERY PLAN {}", update_login_session_status_sql()),
+            ("done", Option::<&str>::None, 1_i64, "login-1"),
+        );
+        assert!(
+            status_update_plan.contains("sqlite_autoindex_login_sessions_1"),
+            "login session status update should use primary key index:\n{status_update_plan}"
+        );
+
+        let verifier_update_plan = collect_query_plan(
+            &storage,
+            &format!(
+                "EXPLAIN QUERY PLAN {}",
+                update_login_session_code_verifier_sql()
+            ),
+            ("verifier-2", 1_i64, "login-1"),
+        );
+        assert!(
+            verifier_update_plan.contains("sqlite_autoindex_login_sessions_1"),
+            "login session verifier update should use primary key index:\n{verifier_update_plan}"
+        );
     }
 }
 

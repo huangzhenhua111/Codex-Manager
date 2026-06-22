@@ -4,6 +4,7 @@ use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde::Serialize;
 use serde_json::json;
 use std::io::{BufRead, BufReader, Read};
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 use std::time::Instant;
 
@@ -18,6 +19,19 @@ const WARMUP_UPSTREAM_URL: &str = "https://chatgpt.com/backend-api/codex/respons
 const DEFAULT_WARMUP_MODEL: &str = "gpt-5.3-codex";
 const WARMUP_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const WARMUP_TOTAL_TIMEOUT: Duration = Duration::from_secs(90);
+static WARMUP_HTTP_CLIENT: OnceLock<Mutex<Option<WarmupClientCacheEntry>>> = OnceLock::new();
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct WarmupClientConfig {
+    user_agent: String,
+    proxy_url: Option<String>,
+}
+
+#[derive(Clone)]
+struct WarmupClientCacheEntry {
+    config: WarmupClientConfig,
+    client: Client,
+}
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -64,7 +78,7 @@ pub(crate) fn warmup_accounts(
         return Err("no account available for warmup".to_string());
     }
 
-    let client = build_warmup_client()?;
+    let client = warmup_client()?;
     let warmup_message = normalize_warmup_message(message);
     let warmup_model = resolve_warmup_model_slug(&storage);
     let mut results = Vec::with_capacity(accounts.len());
@@ -125,21 +139,69 @@ fn normalize_warmup_message(message: &str) -> String {
     }
 }
 
-fn build_warmup_client() -> Result<Client, String> {
+fn current_warmup_client_config() -> WarmupClientConfig {
+    WarmupClientConfig {
+        user_agent: crate::gateway::current_codex_user_agent(),
+        proxy_url: crate::gateway::current_upstream_proxy_url(),
+    }
+}
+
+fn warmup_client() -> Result<Client, String> {
+    let config = current_warmup_client_config();
+    let cache = WARMUP_HTTP_CLIENT.get_or_init(|| Mutex::new(None));
+    let mut guard = cache
+        .lock()
+        .map_err(|_| "warmup client cache lock poisoned".to_string())?;
+    if let Some(entry) = guard.as_ref() {
+        if entry.config == config {
+            return Ok(entry.client.clone());
+        }
+    }
+    let client = build_warmup_client_for_config(&config)?;
+    *guard = Some(WarmupClientCacheEntry {
+        config,
+        client: client.clone(),
+    });
+    Ok(client)
+}
+
+fn build_warmup_client_for_config(config: &WarmupClientConfig) -> Result<Client, String> {
+    #[cfg(test)]
+    WARMUP_CLIENT_BUILD_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
     let builder = Client::builder()
         .connect_timeout(WARMUP_CONNECT_TIMEOUT)
         .timeout(WARMUP_TOTAL_TIMEOUT)
         .pool_max_idle_per_host(4)
         .pool_idle_timeout(Some(Duration::from_secs(60)))
-        .user_agent(crate::gateway::current_codex_user_agent());
+        .user_agent(config.user_agent.as_str());
     let builder = crate::gateway::apply_blocking_upstream_proxy(
         builder,
-        crate::gateway::current_upstream_proxy_url().as_deref(),
+        config.proxy_url.as_deref(),
         "warmup_http_proxy_invalid",
     );
     builder
         .build()
         .map_err(|err| format!("build warmup client failed: {err}"))
+}
+
+#[cfg(test)]
+static WARMUP_CLIENT_BUILD_COUNT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+fn reset_warmup_client_cache_for_test() {
+    if let Some(cache) = WARMUP_HTTP_CLIENT.get() {
+        if let Ok(mut guard) = cache.lock() {
+            *guard = None;
+        }
+    }
+    WARMUP_CLIENT_BUILD_COUNT.store(0, std::sync::atomic::Ordering::SeqCst);
+}
+
+#[cfg(test)]
+fn warmup_client_build_count_for_test() -> usize {
+    WARMUP_CLIENT_BUILD_COUNT.load(std::sync::atomic::Ordering::SeqCst)
 }
 
 fn warmup_single_account(
@@ -479,8 +541,9 @@ fn summarize_warmup_stream_error(value: &serde_json::Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_warmup_headers, consume_warmup_stream, resolve_target_accounts,
-        resolve_warmup_model_slug, should_retry_warmup_with_refresh, DEFAULT_WARMUP_MODEL,
+        build_warmup_headers, consume_warmup_stream, reset_warmup_client_cache_for_test,
+        resolve_target_accounts, resolve_warmup_model_slug, should_retry_warmup_with_refresh,
+        warmup_client, warmup_client_build_count_for_test, DEFAULT_WARMUP_MODEL,
     };
     use crate::apikey_models::save_managed_model_catalog_with_storage;
     use codexmanager_core::rpc::types::{
@@ -531,6 +594,16 @@ mod tests {
         let storage = Storage::open_in_memory().expect("open in-memory storage");
         storage.init().expect("init in-memory storage");
         assert_eq!(resolve_warmup_model_slug(&storage), DEFAULT_WARMUP_MODEL);
+    }
+
+    #[test]
+    fn warmup_client_reuses_cached_client_for_stable_config() {
+        reset_warmup_client_cache_for_test();
+
+        let _first = warmup_client().expect("first warmup client");
+        let _second = warmup_client().expect("second warmup client");
+
+        assert_eq!(warmup_client_build_count_for_test(), 1);
     }
 
     #[test]

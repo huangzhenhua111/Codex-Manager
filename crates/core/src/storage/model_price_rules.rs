@@ -3,6 +3,34 @@ use rusqlite::{params, params_from_iter, types::Value, Result, Row};
 use super::key_id_filters::{normalize_text_ids, text_id_in_clause, SQLITE_IN_CLAUSE_BATCH_SIZE};
 use super::{ModelPriceRule, Storage};
 
+fn model_price_rule_select_columns() -> &'static str {
+    "id, provider, model_pattern, match_type, billing_mode,
+        currency, unit, input_price_per_1m, cached_input_price_per_1m,
+        output_price_per_1m, reasoning_output_price_per_1m,
+        cache_write_5m_price_per_1m, cache_write_1h_price_per_1m,
+        cache_hit_price_per_1m, long_context_threshold_tokens,
+        long_context_input_price_per_1m,
+        long_context_cached_input_price_per_1m,
+        long_context_output_price_per_1m, source, source_url,
+        seed_version, enabled, priority, created_at, updated_at"
+}
+
+fn model_price_rule_count_for_seed_sql() -> &'static str {
+    "SELECT COUNT(1)
+     FROM model_price_rules
+     WHERE source = 'official_seed' AND seed_version = ?1"
+}
+
+fn enabled_model_price_rules_sql() -> String {
+    format!(
+        "SELECT {columns}
+         FROM model_price_rules
+         WHERE enabled = 1
+         ORDER BY priority DESC, length(model_pattern) DESC, model_pattern ASC",
+        columns = model_price_rule_select_columns(),
+    )
+}
+
 impl Storage {
     pub fn upsert_model_price_rule(&self, rule: &ModelPriceRule) -> Result<()> {
         self.conn.execute(
@@ -84,30 +112,15 @@ impl Storage {
 
     pub fn count_model_price_rules_for_seed(&self, seed_version: &str) -> Result<i64> {
         self.conn.query_row(
-            "SELECT COUNT(1)
-             FROM model_price_rules
-             WHERE source = 'official_seed' AND seed_version = ?1",
+            model_price_rule_count_for_seed_sql(),
             [seed_version],
             |row| row.get(0),
         )
     }
 
     pub fn list_enabled_model_price_rules(&self) -> Result<Vec<ModelPriceRule>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT
-                id, provider, model_pattern, match_type, billing_mode,
-                currency, unit, input_price_per_1m, cached_input_price_per_1m,
-                output_price_per_1m, reasoning_output_price_per_1m,
-                cache_write_5m_price_per_1m, cache_write_1h_price_per_1m,
-                cache_hit_price_per_1m, long_context_threshold_tokens,
-                long_context_input_price_per_1m,
-                long_context_cached_input_price_per_1m,
-                long_context_output_price_per_1m, source, source_url,
-                seed_version, enabled, priority, created_at, updated_at
-             FROM model_price_rules
-             WHERE enabled = 1
-             ORDER BY priority DESC, length(model_pattern) DESC, model_pattern ASC",
-        )?;
+        let sql = enabled_model_price_rules_sql();
+        let mut stmt = self.conn.prepare(&sql)?;
         let mut rows = stmt.query([])?;
         let mut items = Vec::new();
         while let Some(row) = rows.next()? {
@@ -120,25 +133,9 @@ impl Storage {
         &self,
         model_pattern: &str,
     ) -> Result<Option<ModelPriceRule>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT
-                id, provider, model_pattern, match_type, billing_mode,
-                currency, unit, input_price_per_1m, cached_input_price_per_1m,
-                output_price_per_1m, reasoning_output_price_per_1m,
-                cache_write_5m_price_per_1m, cache_write_1h_price_per_1m,
-                cache_hit_price_per_1m, long_context_threshold_tokens,
-                long_context_input_price_per_1m,
-                long_context_cached_input_price_per_1m,
-                long_context_output_price_per_1m, source, source_url,
-                seed_version, enabled, priority, created_at, updated_at
-             FROM model_price_rules
-             WHERE source = 'custom'
-               AND enabled = 1
-               AND match_type = 'exact' COLLATE NOCASE
-               AND model_pattern = ?1 COLLATE NOCASE
-             ORDER BY priority DESC, id ASC
-             LIMIT 1",
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare(enabled_custom_exact_model_price_rule_sql())?;
         let mut rows = stmt.query([model_pattern.trim()])?;
         rows.next()?.map(map_model_price_rule_row).transpose()
     }
@@ -286,23 +283,55 @@ fn list_enabled_model_price_rule_patterns_for_patterns_chunk(
     let mut values = Vec::<Value>::with_capacity(params.len() + 1);
     values.push(Value::Integer(1));
     values.extend(params);
-    let sql = format!(
-        "SELECT DISTINCT LOWER(TRIM(model_pattern))
-         FROM model_price_rules
-         WHERE enabled = ?1 AND {condition}"
-    );
+    let sql = enabled_model_price_rule_patterns_for_patterns_chunk_sql(&condition);
     let mut stmt = storage.conn.prepare(&sql)?;
     let rows = stmt.query_map(params_from_iter(values), |row| row.get::<_, String>(0))?;
     rows.collect()
+}
+
+fn enabled_model_price_rule_patterns_for_patterns_chunk_sql(pattern_condition: &str) -> String {
+    format!(
+        "SELECT DISTINCT LOWER(TRIM(model_pattern))
+         FROM model_price_rules
+         WHERE enabled = ?1 AND {pattern_condition}"
+    )
+}
+
+fn enabled_custom_exact_model_price_rule_sql() -> &'static str {
+    "SELECT
+        id, provider, model_pattern, match_type, billing_mode,
+        currency, unit, input_price_per_1m, cached_input_price_per_1m,
+        output_price_per_1m, reasoning_output_price_per_1m,
+        cache_write_5m_price_per_1m, cache_write_1h_price_per_1m,
+        cache_hit_price_per_1m, long_context_threshold_tokens,
+        long_context_input_price_per_1m,
+        long_context_cached_input_price_per_1m,
+        long_context_output_price_per_1m, source, source_url,
+        seed_version, enabled, priority, created_at, updated_at
+     FROM model_price_rules
+     WHERE source = 'custom'
+       AND enabled = 1
+       AND match_type = 'exact' COLLATE NOCASE
+       AND model_pattern = ?1 COLLATE NOCASE
+     ORDER BY priority DESC, id ASC
+     LIMIT 1"
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn collect_query_plan_details(storage: &Storage, sql: &str) -> Vec<String> {
+    fn collect_query_plan_details_with_params(
+        storage: &Storage,
+        sql: &str,
+        params: Vec<Value>,
+    ) -> Vec<String> {
         let mut stmt = storage.conn.prepare(sql).expect("prepare explain");
-        let mut rows = stmt.query([]).expect("query explain");
+        let mut rows = stmt.query(params_from_iter(params)).expect("query explain");
+        collect_query_plan_rows(&mut rows)
+    }
+
+    fn collect_query_plan_rows(rows: &mut rusqlite::Rows<'_>) -> Vec<String> {
         let mut details = Vec::new();
         while let Some(row) = rows.next().expect("next explain row") {
             let detail: String = row.get(3).expect("detail");
@@ -342,20 +371,36 @@ mod tests {
     }
 
     #[test]
+    fn count_model_price_rules_for_seed_uses_source_seed_index() {
+        let storage = Storage::open_in_memory().expect("open");
+        storage.init().expect("init");
+        let details = collect_query_plan_details_with_params(
+            &storage,
+            &format!(
+                "EXPLAIN QUERY PLAN {}",
+                model_price_rule_count_for_seed_sql()
+            ),
+            vec![Value::Text("2026-06".to_string())],
+        );
+
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("idx_model_price_rules_source_seed")),
+            "expected seed count to use source/seed index, got {details:?}"
+        );
+    }
+    #[test]
     fn find_enabled_custom_exact_model_price_rule_uses_lookup_index() {
         let storage = Storage::open_in_memory().expect("open");
         storage.init().expect("init");
-        let details = collect_query_plan_details(
+        let details = collect_query_plan_details_with_params(
             &storage,
-            "EXPLAIN QUERY PLAN
-             SELECT id
-             FROM model_price_rules
-             WHERE source = 'custom'
-               AND enabled = 1
-               AND match_type = 'exact' COLLATE NOCASE
-               AND model_pattern = 'gpt-5' COLLATE NOCASE
-             ORDER BY priority DESC, id ASC
-             LIMIT 1",
+            &format!(
+                "EXPLAIN QUERY PLAN {}",
+                enabled_custom_exact_model_price_rule_sql()
+            ),
+            vec![Value::Text("gpt-5".to_string())],
         );
 
         assert!(
@@ -395,13 +440,13 @@ mod tests {
     fn enabled_model_price_rule_pattern_lookup_uses_index() {
         let storage = Storage::open_in_memory().expect("open");
         storage.init().expect("init");
-        let details = collect_query_plan_details(
+        let sql = enabled_model_price_rule_patterns_for_patterns_chunk_sql(
+            "LOWER(TRIM(model_pattern)) IN ('gpt-5', 'claude-test')",
+        );
+        let details = collect_query_plan_details_with_params(
             &storage,
-            "EXPLAIN QUERY PLAN
-             SELECT DISTINCT LOWER(TRIM(model_pattern))
-             FROM model_price_rules
-             WHERE enabled = 1
-               AND LOWER(TRIM(model_pattern)) IN ('gpt-5', 'claude-test')",
+            &format!("EXPLAIN QUERY PLAN {sql}"),
+            vec![Value::Integer(1)],
         );
 
         assert!(

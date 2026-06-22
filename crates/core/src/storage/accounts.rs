@@ -1,6 +1,16 @@
 use rusqlite::{params_from_iter, types::Value, Result, Row};
 
+use super::account_metadata::delete_account_metadata_for_account_sql;
+use super::account_subscriptions::delete_account_subscription_for_account_sql;
+use super::conversation_bindings::delete_conversation_bindings_for_account_sql;
+use super::events::delete_events_for_account_sql;
 use super::key_id_filters::{normalize_text_ids, text_id_in_clause, SQLITE_IN_CLAUSE_BATCH_SIZE};
+use super::model_sources::{
+    delete_model_source_mapping_preferences_for_source_sql,
+    delete_model_source_mappings_for_source_sql, delete_model_source_models_for_source_sql,
+};
+use super::tokens::delete_token_for_account_sql;
+use super::usage::delete_usage_snapshots_for_account_sql;
 
 use super::{
     now_ts, Account, AccountAuthRefreshTarget, AccountCleanupCandidate,
@@ -305,9 +315,7 @@ impl Storage {
     }
 
     pub fn list_account_ids(&self) -> Result<Vec<String>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT id FROM accounts ORDER BY sort ASC, updated_at DESC, id ASC")?;
+        let mut stmt = self.conn.prepare(account_ids_list_sql())?;
         let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
         rows.collect()
     }
@@ -430,11 +438,7 @@ impl Storage {
     }
 
     pub fn list_account_auth_refresh_targets(&self) -> Result<Vec<AccountAuthRefreshTarget>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, label, issuer
-             FROM accounts
-             ORDER BY sort ASC, updated_at DESC, id ASC",
-        )?;
+        let mut stmt = self.conn.prepare(account_auth_refresh_targets_list_sql())?;
         let rows = stmt.query_map([], |row| {
             Ok(AccountAuthRefreshTarget {
                 id: row.get(0)?,
@@ -469,11 +473,9 @@ impl Storage {
     }
 
     pub fn list_account_quota_source_summaries(&self) -> Result<Vec<AccountQuotaSourceSummary>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, label, status
-             FROM accounts
-             ORDER BY sort ASC, updated_at DESC, id ASC",
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare(account_quota_source_summaries_list_sql())?;
         let rows = stmt.query_map([], |row| {
             Ok(AccountQuotaSourceSummary {
                 id: row.get(0)?,
@@ -503,11 +505,7 @@ impl Storage {
     }
 
     pub fn list_account_import_snapshots(&self) -> Result<Vec<AccountImportSnapshot>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, label, issuer, chatgpt_account_id, workspace_id, sort, created_at
-             FROM accounts
-             ORDER BY sort ASC, updated_at DESC, id ASC",
-        )?;
+        let mut stmt = self.conn.prepare(account_import_snapshots_list_sql())?;
         let rows = stmt.query_map([], |row| {
             Ok(AccountImportSnapshot {
                 id: row.get(0)?,
@@ -523,11 +521,7 @@ impl Storage {
     }
 
     pub fn list_account_summary_rows(&self) -> Result<Vec<AccountListSummaryRow>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, label, group_name, sort, status
-             FROM accounts
-             ORDER BY sort ASC, updated_at DESC, id ASC",
-        )?;
+        let mut stmt = self.conn.prepare(account_summary_rows_list_sql())?;
         let rows = stmt.query_map([], |row| {
             Ok(AccountListSummaryRow {
                 id: row.get(0)?,
@@ -986,10 +980,8 @@ impl Storage {
     /// # 返回
     /// 返回函数执行结果
     pub fn update_account_sort(&self, account_id: &str, sort: i64) -> Result<()> {
-        self.conn.execute(
-            "UPDATE accounts SET sort = ?1, updated_at = ?2 WHERE id = ?3",
-            (sort, now_ts(), account_id),
-        )?;
+        self.conn
+            .execute(update_account_sort_sql(), (sort, now_ts(), account_id))?;
         Ok(())
     }
 
@@ -1007,10 +999,8 @@ impl Storage {
     /// # 返回
     /// 返回函数执行结果
     pub fn update_account_label(&self, account_id: &str, label: &str) -> Result<()> {
-        self.conn.execute(
-            "UPDATE accounts SET label = ?1, updated_at = ?2 WHERE id = ?3",
-            (label, now_ts(), account_id),
-        )?;
+        self.conn
+            .execute(update_account_label_sql(), (label, now_ts(), account_id))?;
         Ok(())
     }
 
@@ -1022,11 +1012,7 @@ impl Storage {
         updated_at: i64,
     ) -> Result<bool> {
         let updated = self.conn.execute(
-            "UPDATE accounts
-             SET chatgpt_account_id = ?1,
-                 workspace_id = ?2,
-                 updated_at = ?3
-             WHERE id = ?4",
+            update_account_workspace_identity_sql(),
             (chatgpt_account_id, workspace_id, updated_at, account_id),
         )?;
         Ok(updated > 0)
@@ -1045,10 +1031,8 @@ impl Storage {
     /// # 返回
     /// 返回函数执行结果
     pub fn touch_account_updated_at(&self, account_id: &str) -> Result<()> {
-        self.conn.execute(
-            "UPDATE accounts SET updated_at = ?1 WHERE id = ?2",
-            (now_ts(), account_id),
-        )?;
+        self.conn
+            .execute(touch_account_updated_at_sql(), (now_ts(), account_id))?;
         Ok(())
     }
 
@@ -1066,10 +1050,8 @@ impl Storage {
     /// # 返回
     /// 返回函数执行结果
     pub fn update_account_status(&self, account_id: &str, status: &str) -> Result<()> {
-        self.conn.execute(
-            "UPDATE accounts SET status = ?1, updated_at = ?2 WHERE id = ?3",
-            (status, now_ts(), account_id),
-        )?;
+        self.conn
+            .execute(update_account_status_sql(), (status, now_ts(), account_id))?;
         Ok(())
     }
 
@@ -1088,7 +1070,7 @@ impl Storage {
     /// 返回函数执行结果
     pub fn update_account_status_if_changed(&self, account_id: &str, status: &str) -> Result<bool> {
         let updated = self.conn.execute(
-            "UPDATE accounts SET status = ?1, updated_at = ?2 WHERE id = ?3 AND status != ?1",
+            update_account_status_if_changed_sql(),
             (status, now_ts(), account_id),
         )?;
         Ok(updated > 0)
@@ -1120,40 +1102,25 @@ impl Storage {
     /// 返回函数执行结果
     pub fn delete_account(&mut self, account_id: &str) -> Result<()> {
         let tx = self.conn.transaction()?;
+        tx.execute(delete_account_metadata_for_account_sql(), [account_id])?;
+        tx.execute(delete_account_subscription_for_account_sql(), [account_id])?;
+        tx.execute(delete_token_for_account_sql(), [account_id])?;
+        tx.execute(delete_usage_snapshots_for_account_sql(), [account_id])?;
+        tx.execute(delete_events_for_account_sql(), [account_id])?;
+        tx.execute(delete_conversation_bindings_for_account_sql(), [account_id])?;
         tx.execute(
-            "DELETE FROM account_metadata WHERE account_id = ?1",
-            [account_id],
+            delete_model_source_mappings_for_source_sql(),
+            (ACCOUNT_MODEL_SOURCE_KIND, account_id),
         )?;
         tx.execute(
-            "DELETE FROM account_subscriptions WHERE account_id = ?1",
-            [account_id],
-        )?;
-        tx.execute("DELETE FROM tokens WHERE account_id = ?1", [account_id])?;
-        tx.execute(
-            "DELETE FROM usage_snapshots WHERE account_id = ?1",
-            [account_id],
-        )?;
-        tx.execute("DELETE FROM events WHERE account_id = ?1", [account_id])?;
-        tx.execute(
-            "DELETE FROM conversation_bindings WHERE account_id = ?1",
-            [account_id],
+            delete_model_source_models_for_source_sql(),
+            (ACCOUNT_MODEL_SOURCE_KIND, account_id),
         )?;
         tx.execute(
-            "DELETE FROM model_source_mappings
-             WHERE source_kind = 'openai_account' AND source_id = ?1",
-            [account_id],
+            delete_model_source_mapping_preferences_for_source_sql(),
+            (ACCOUNT_MODEL_SOURCE_KIND, account_id),
         )?;
-        tx.execute(
-            "DELETE FROM model_source_models
-             WHERE source_kind = 'openai_account' AND source_id = ?1",
-            [account_id],
-        )?;
-        tx.execute(
-            "DELETE FROM model_source_mapping_preferences
-             WHERE source_kind = 'openai_account' AND source_id = ?1",
-            [account_id],
-        )?;
-        tx.execute("DELETE FROM accounts WHERE id = ?1", [account_id])?;
+        tx.execute(delete_account_by_id_sql(), [account_id])?;
         tx.commit()?;
         Ok(())
     }
@@ -1276,16 +1243,11 @@ impl Storage {
     pub fn set_preferred_account(&mut self, account_id: Option<&str>) -> Result<()> {
         let now = now_ts();
         let tx = self.conn.transaction()?;
-        tx.execute("UPDATE accounts SET preferred = 0 WHERE preferred != 0", [])?;
+        tx.execute(clear_preferred_accounts_sql(), [])?;
         if let Some(account_id) = account_id {
             let normalized_account_id = account_id.trim();
             if !normalized_account_id.is_empty() {
-                tx.execute(
-                    "UPDATE accounts
-                     SET preferred = 1, updated_at = ?1
-                     WHERE id = ?2",
-                    (now, normalized_account_id),
-                )?;
+                tx.execute(set_preferred_account_sql(), (now, normalized_account_id))?;
             }
         }
         tx.commit()?;
@@ -1310,7 +1272,7 @@ impl Storage {
             return Ok(false);
         }
         let updated = self.conn.execute(
-            "UPDATE accounts SET preferred = 0, updated_at = ?1 WHERE id = ?2 AND preferred = 1",
+            clear_preferred_account_by_id_sql(),
             (now_ts(), normalized_account_id),
         )?;
         Ok(updated > 0)
@@ -1354,13 +1316,8 @@ impl Storage {
     ) -> Result<Vec<Account>> {
         let mut params = Vec::new();
         let where_clause = build_account_where_clause(query, group_name, &mut params, "a");
-        let mut sql = format!(
-            "SELECT {} FROM accounts a{where_clause} ORDER BY a.sort ASC, a.updated_at DESC",
-            account_select_columns("a"),
-        );
-
+        let sql = account_query_sql(&where_clause, pagination.is_some());
         if let Some((offset, limit)) = pagination {
-            sql.push_str(" LIMIT ? OFFSET ?");
             params.push(Value::Integer(limit.max(1)));
             params.push(Value::Integer(offset.max(0)));
         }
@@ -1380,14 +1337,7 @@ impl Storage {
         identity: &str,
     ) -> Result<Option<Account>> {
         debug_assert!(matches!(column, "chatgpt_account_id" | "workspace_id"));
-        let sql = format!(
-            "SELECT {}
-             FROM accounts
-             WHERE {column} = ?1
-             ORDER BY updated_at DESC, id ASC
-             LIMIT 1",
-            account_select_columns("accounts"),
-        );
+        let sql = account_identity_lookup_sql(column);
         let mut stmt = self.conn.prepare(&sql)?;
         let mut rows = stmt.query([identity])?;
         if let Some(row) = rows.next()? {
@@ -1531,18 +1481,183 @@ fn qualified_column(table_name: &str, column: &str) -> String {
     format!("{table_name}.{column}")
 }
 
+fn update_account_sort_sql() -> &'static str {
+    "UPDATE accounts SET sort = ?1, updated_at = ?2 WHERE id = ?3"
+}
+
+fn update_account_label_sql() -> &'static str {
+    "UPDATE accounts SET label = ?1, updated_at = ?2 WHERE id = ?3"
+}
+
+fn update_account_workspace_identity_sql() -> &'static str {
+    "UPDATE accounts
+     SET chatgpt_account_id = ?1,
+         workspace_id = ?2,
+         updated_at = ?3
+     WHERE id = ?4"
+}
+
+fn touch_account_updated_at_sql() -> &'static str {
+    "UPDATE accounts SET updated_at = ?1 WHERE id = ?2"
+}
+
+fn update_account_status_sql() -> &'static str {
+    "UPDATE accounts SET status = ?1, updated_at = ?2 WHERE id = ?3"
+}
+
+fn update_account_status_if_changed_sql() -> &'static str {
+    "UPDATE accounts SET status = ?1, updated_at = ?2 WHERE id = ?3 AND status != ?1"
+}
+
+fn delete_account_by_id_sql() -> &'static str {
+    "DELETE FROM accounts WHERE id = ?1"
+}
+
+fn clear_preferred_accounts_sql() -> &'static str {
+    "UPDATE accounts SET preferred = 0 WHERE preferred != 0"
+}
+
+fn set_preferred_account_sql() -> &'static str {
+    "UPDATE accounts
+     SET preferred = 1, updated_at = ?1
+     WHERE id = ?2"
+}
+
+fn clear_preferred_account_by_id_sql() -> &'static str {
+    "UPDATE accounts SET preferred = 0, updated_at = ?1 WHERE id = ?2 AND preferred = 1"
+}
+fn account_ids_list_sql() -> &'static str {
+    "SELECT id FROM accounts ORDER BY sort ASC, updated_at DESC, id ASC"
+}
+fn account_auth_refresh_targets_list_sql() -> &'static str {
+    "SELECT id, label, issuer
+     FROM accounts
+     ORDER BY sort ASC, updated_at DESC, id ASC"
+}
+
+fn account_quota_source_summaries_list_sql() -> &'static str {
+    "SELECT id, label, status
+     FROM accounts
+     ORDER BY sort ASC, updated_at DESC, id ASC"
+}
+
+fn account_import_snapshots_list_sql() -> &'static str {
+    "SELECT id, label, issuer, chatgpt_account_id, workspace_id, sort, created_at
+     FROM accounts
+     ORDER BY sort ASC, updated_at DESC, id ASC"
+}
+
+fn account_summary_rows_list_sql() -> &'static str {
+    "SELECT id, label, group_name, sort, status
+     FROM accounts
+     ORDER BY sort ASC, updated_at DESC, id ASC"
+}
+
+fn account_query_sql(where_clause: &str, include_pagination: bool) -> String {
+    let mut sql = format!(
+        "SELECT {} FROM accounts a{where_clause} ORDER BY a.sort ASC, a.updated_at DESC",
+        account_select_columns("a"),
+    );
+    if include_pagination {
+        sql.push_str(" LIMIT ? OFFSET ?");
+    }
+    sql
+}
+
+fn account_identity_lookup_sql(column: &str) -> String {
+    debug_assert!(matches!(column, "chatgpt_account_id" | "workspace_id"));
+    format!(
+        "SELECT {}
+         FROM accounts
+         WHERE {column} = ?1
+         ORDER BY updated_at DESC, id ASC
+         LIMIT 1",
+        account_select_columns("accounts"),
+    )
+}
+
+fn account_ids_by_statuses_chunk_sql(condition: &str) -> String {
+    format!(
+        "SELECT id, sort, updated_at
+         FROM accounts
+         WHERE {condition}"
+    )
+}
+
+fn account_usage_refresh_targets_by_statuses_chunk_sql(condition: &str) -> String {
+    format!(
+        "SELECT id, status, workspace_id, sort, updated_at
+         FROM accounts
+         WHERE {condition}"
+    )
+}
+
+fn account_cleanup_candidates_by_statuses_chunk_sql(condition: &str) -> String {
+    format!(
+        "SELECT id, status, sort, updated_at
+         FROM accounts
+         WHERE {condition}"
+    )
+}
+
+fn account_ids_for_ids_chunk_sql(condition: &str) -> String {
+    format!(
+        "SELECT id, sort, updated_at
+         FROM accounts
+         WHERE {condition}"
+    )
+}
+
+fn accounts_by_statuses_chunk_sql(condition: &str) -> String {
+    format!(
+        "SELECT {}
+         FROM accounts a
+         WHERE {condition}",
+        account_select_columns("a"),
+    )
+}
+
+fn accounts_for_ids_chunk_sql(condition: &str) -> String {
+    format!(
+        "SELECT {}
+         FROM accounts a
+         WHERE {condition}",
+        account_select_columns("a"),
+    )
+}
+
+fn active_account_codex_profile_candidates_for_ids_chunk_sql(condition: &str) -> String {
+    format!(
+        "SELECT id, label, issuer, chatgpt_account_id, workspace_id, group_name, status, sort, updated_at
+         FROM accounts
+         WHERE {condition}
+           AND LOWER(TRIM(COALESCE(status, ''))) = 'active'"
+    )
+}
+
+fn account_token_refresh_issuers_for_ids_chunk_sql(condition: &str) -> String {
+    format!(
+        "SELECT id, issuer
+         FROM accounts
+         WHERE {condition}"
+    )
+}
+
+fn account_dashboard_source_metadata_for_ids_chunk_sql(condition: &str) -> String {
+    format!(
+        "SELECT id, label, status, sort, updated_at
+         FROM accounts
+         WHERE {condition}"
+    )
+}
+
 fn list_accounts_by_statuses_chunk(storage: &Storage, statuses: &[String]) -> Result<Vec<Account>> {
     let Some((condition, params)) =
         text_id_in_clause("LOWER(TRIM(COALESCE(a.status, '')))", statuses)
     else {
         return Ok(Vec::new());
     };
-    let sql = format!(
-        "SELECT {}
-         FROM accounts a
-         WHERE {condition}",
-        account_select_columns("a"),
-    );
+    let sql = accounts_by_statuses_chunk_sql(&condition);
     let mut stmt = storage.conn.prepare(&sql)?;
     let mut rows = stmt.query(params_from_iter(params))?;
     let mut out = Vec::new();
@@ -1561,11 +1676,7 @@ fn list_account_ids_by_statuses_chunk(
     else {
         return Ok(Vec::new());
     };
-    let sql = format!(
-        "SELECT id, sort, updated_at
-         FROM accounts
-         WHERE {condition}"
-    );
+    let sql = account_ids_by_statuses_chunk_sql(&condition);
     let mut stmt = storage.conn.prepare(&sql)?;
     let rows = stmt.query_map(params_from_iter(params), |row| {
         Ok((row.get(0)?, row.get(1)?, row.get(2)?))
@@ -1582,11 +1693,7 @@ fn list_account_usage_refresh_targets_by_statuses_chunk(
     else {
         return Ok(Vec::new());
     };
-    let sql = format!(
-        "SELECT id, status, workspace_id, sort, updated_at
-         FROM accounts
-         WHERE {condition}"
-    );
+    let sql = account_usage_refresh_targets_by_statuses_chunk_sql(&condition);
     let mut stmt = storage.conn.prepare(&sql)?;
     let rows = stmt.query_map(params_from_iter(params), |row| {
         Ok((
@@ -1611,14 +1718,7 @@ fn list_account_usage_refresh_targets_with_usable_tokens_by_statuses_chunk(
     else {
         return Ok(Vec::new());
     };
-    let sql = format!(
-        "SELECT a.id, a.status, a.workspace_id, a.sort, a.updated_at
-         FROM accounts a
-         INNER JOIN tokens t ON t.account_id = a.id
-         WHERE {condition}
-           AND TRIM(COALESCE(t.access_token, '')) <> ''
-           AND TRIM(COALESCE(t.refresh_token, '')) <> ''"
-    );
+    let sql = account_usage_refresh_targets_with_usable_tokens_by_statuses_chunk_sql(&condition);
     let mut stmt = storage.conn.prepare(&sql)?;
     let rows = stmt.query_map(params_from_iter(params), |row| {
         Ok((
@@ -1634,6 +1734,19 @@ fn list_account_usage_refresh_targets_with_usable_tokens_by_statuses_chunk(
     rows.collect()
 }
 
+fn account_usage_refresh_targets_with_usable_tokens_by_statuses_chunk_sql(
+    condition: &str,
+) -> String {
+    format!(
+        "SELECT a.id, a.status, a.workspace_id, a.sort, a.updated_at
+         FROM accounts a
+         INNER JOIN tokens t ON t.account_id = a.id
+         WHERE {condition}
+           AND TRIM(COALESCE(t.access_token, '')) <> ''
+           AND TRIM(COALESCE(t.refresh_token, '')) <> ''"
+    )
+}
+
 fn list_account_usage_refresh_token_targets_by_statuses_chunk(
     storage: &Storage,
     statuses: &[String],
@@ -1643,48 +1756,7 @@ fn list_account_usage_refresh_token_targets_by_statuses_chunk(
     else {
         return Ok(Vec::new());
     };
-    let sql = format!(
-        "WITH latest_status AS (
-            SELECT
-                account_id,
-                LOWER(TRIM(SUBSTR(message, INSTR(message, ' reason=') + LENGTH(' reason=')))) AS reason,
-                ROW_NUMBER() OVER (
-                    PARTITION BY account_id
-                    ORDER BY created_at DESC, id DESC
-                ) AS rn
-            FROM events
-            WHERE type = 'account_status_update'
-              AND INSTR(message, ' reason=') > 0
-        )
-        SELECT
-            a.id,
-            a.workspace_id,
-            t.account_id,
-            t.id_token,
-            t.access_token,
-            t.refresh_token,
-            t.api_key_access_token,
-            t.last_refresh,
-            a.sort,
-            a.updated_at
-         FROM accounts a
-         INNER JOIN tokens t ON t.account_id = a.id
-         LEFT JOIN latest_status ls
-           ON ls.account_id = a.id
-          AND ls.rn = 1
-         WHERE {condition}
-           AND TRIM(COALESCE(t.access_token, '')) <> ''
-           AND TRIM(COALESCE(t.refresh_token, '')) <> ''
-           AND (
-                ls.reason IS NULL
-                OR ls.reason NOT IN (
-                    'account_deactivated',
-                    'workspace_deactivated',
-                    'deactivated_workspace',
-                    'refresh_token_region_blocked'
-                )
-           )"
-    );
+    let sql = usage_refresh_token_targets_by_status_sql(&condition);
     let mut stmt = storage.conn.prepare(&sql)?;
     let rows = stmt.query_map(params_from_iter(params), |row| {
         let account_id: String = row.get(0)?;
@@ -1708,6 +1780,67 @@ fn list_account_usage_refresh_token_targets_by_statuses_chunk(
     rows.collect()
 }
 
+fn usage_refresh_token_targets_by_status_sql(status_condition: &str) -> String {
+    format!(
+        "WITH target_accounts AS (
+            SELECT
+                a.id,
+                a.workspace_id,
+                a.sort,
+                a.updated_at,
+                t.account_id AS token_account_id,
+                t.id_token,
+                t.access_token,
+                t.refresh_token,
+                t.api_key_access_token,
+                t.last_refresh
+            FROM accounts a
+            INNER JOIN tokens t ON t.account_id = a.id
+            WHERE {status_condition}
+              AND TRIM(COALESCE(t.access_token, '')) <> ''
+              AND TRIM(COALESCE(t.refresh_token, '')) <> ''
+        ),
+        latest_status AS (
+            SELECT
+                e.account_id,
+                LOWER(TRIM(SUBSTR(e.message, INSTR(e.message, ' reason=') + LENGTH(' reason=')))) AS reason,
+                ROW_NUMBER() OVER (
+                    PARTITION BY e.account_id
+                    ORDER BY e.created_at DESC, e.id DESC
+                ) AS rn
+            FROM events e
+            INNER JOIN target_accounts ta
+              ON ta.id = e.account_id
+            WHERE e.type = 'account_status_update'
+              AND INSTR(e.message, ' reason=') > 0
+        )
+        SELECT
+            ta.id,
+            ta.workspace_id,
+            ta.token_account_id,
+            ta.id_token,
+            ta.access_token,
+            ta.refresh_token,
+            ta.api_key_access_token,
+            ta.last_refresh,
+            ta.sort,
+            ta.updated_at
+         FROM target_accounts ta
+         LEFT JOIN latest_status ls
+           ON ls.account_id = ta.id
+          AND ls.rn = 1
+         WHERE (
+                ls.reason IS NULL
+                OR ls.reason NOT IN (
+                    'account_deactivated',
+                    'workspace_deactivated',
+                    'deactivated_workspace',
+                    'refresh_token_region_blocked'
+                )
+           )"
+    )
+}
+
 fn list_active_account_codex_profile_candidates_for_ids_chunk(
     storage: &Storage,
     account_ids: &[String],
@@ -1715,12 +1848,7 @@ fn list_active_account_codex_profile_candidates_for_ids_chunk(
     let Some((condition, params)) = text_id_in_clause("id", account_ids) else {
         return Ok(Vec::new());
     };
-    let sql = format!(
-        "SELECT id, label, issuer, chatgpt_account_id, workspace_id, group_name, status, sort, updated_at
-         FROM accounts
-         WHERE {condition}
-           AND LOWER(TRIM(COALESCE(status, ''))) = 'active'"
-    );
+    let sql = active_account_codex_profile_candidates_for_ids_chunk_sql(&condition);
     let mut stmt = storage.conn.prepare(&sql)?;
     let rows = stmt.query_map(params_from_iter(params), |row| {
         Ok((
@@ -1749,11 +1877,7 @@ fn list_account_cleanup_candidates_by_statuses_chunk(
     else {
         return Ok(Vec::new());
     };
-    let sql = format!(
-        "SELECT id, status, sort, updated_at
-         FROM accounts
-         WHERE {condition}"
-    );
+    let sql = account_cleanup_candidates_by_statuses_chunk_sql(&condition);
     let mut stmt = storage.conn.prepare(&sql)?;
     let rows = stmt.query_map(params_from_iter(params), |row| {
         Ok((
@@ -1801,12 +1925,7 @@ fn list_accounts_for_ids_chunk(storage: &Storage, account_ids: &[String]) -> Res
     let Some((condition, params)) = text_id_in_clause("a.id", account_ids) else {
         return Ok(Vec::new());
     };
-    let sql = format!(
-        "SELECT {}
-         FROM accounts a
-         WHERE {condition}",
-        account_select_columns("a"),
-    );
+    let sql = accounts_for_ids_chunk_sql(&condition);
     let mut stmt = storage.conn.prepare(&sql)?;
     let mut rows = stmt.query(params_from_iter(params))?;
     let mut out = Vec::new();
@@ -1823,11 +1942,7 @@ fn list_account_ids_for_ids_chunk(
     let Some((condition, params)) = text_id_in_clause("id", account_ids) else {
         return Ok(Vec::new());
     };
-    let sql = format!(
-        "SELECT id, sort, updated_at
-         FROM accounts
-         WHERE {condition}"
-    );
+    let sql = account_ids_for_ids_chunk_sql(&condition);
     let mut stmt = storage.conn.prepare(&sql)?;
     let rows = stmt.query_map(params_from_iter(params), |row| {
         Ok((row.get(0)?, row.get(1)?, row.get(2)?))
@@ -1842,11 +1957,7 @@ fn list_account_token_refresh_issuers_for_ids_chunk(
     let Some((condition, params)) = text_id_in_clause("id", account_ids) else {
         return Ok(Vec::new());
     };
-    let sql = format!(
-        "SELECT id, issuer
-         FROM accounts
-         WHERE {condition}"
-    );
+    let sql = account_token_refresh_issuers_for_ids_chunk_sql(&condition);
     let mut stmt = storage.conn.prepare(&sql)?;
     let rows = stmt.query_map(params_from_iter(params), |row| {
         Ok(AccountTokenRefreshIssuer {
@@ -1864,11 +1975,7 @@ fn list_account_dashboard_source_metadata_for_ids_chunk(
     let Some((condition, params)) = text_id_in_clause("id", account_ids) else {
         return Ok(Vec::new());
     };
-    let sql = format!(
-        "SELECT id, label, status, sort, updated_at
-         FROM accounts
-         WHERE {condition}"
-    );
+    let sql = account_dashboard_source_metadata_for_ids_chunk_sql(&condition);
     let mut stmt = storage.conn.prepare(&sql)?;
     let rows = stmt.query_map(params_from_iter(params), |row| {
         Ok((
@@ -1889,6 +1996,17 @@ fn list_gateway_candidates_filtered(
     account_ids: Option<&[String]>,
 ) -> Result<Vec<(Account, Token)>> {
     let availability_clause = gateway_account_usage_filter_clause("a", "lu");
+    let mut usage_cte_params = Vec::new();
+    let latest_usage_cte = if let Some(account_ids) = account_ids {
+        let Some((usage_condition, usage_params)) = text_id_in_clause("account_id", account_ids)
+        else {
+            return Ok(Vec::new());
+        };
+        usage_cte_params.extend(usage_params);
+        latest_usage_cte_sql_for_condition(&usage_condition)
+    } else {
+        latest_usage_cte_sql().to_string()
+    };
     let mut where_clauses = vec![availability_clause];
     let mut params = Vec::new();
     if let Some(account_ids) = account_ids {
@@ -1899,7 +2017,23 @@ fn list_gateway_candidates_filtered(
         params.extend(condition_params);
     }
     let where_clause = where_clauses.join(" AND ");
-    let sql = format!(
+    let sql = gateway_candidates_filtered_sql(&latest_usage_cte, &where_clause);
+    if !usage_cte_params.is_empty() {
+        usage_cte_params.extend(params);
+        params = usage_cte_params;
+    }
+
+    let mut stmt = storage.conn.prepare(&sql)?;
+    let mut rows = stmt.query(params_from_iter(params))?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next()? {
+        out.push(map_gateway_candidate_row(row)?);
+    }
+    Ok(out)
+}
+
+fn gateway_candidates_filtered_sql(latest_usage_cte: &str, where_clause: &str) -> String {
+    format!(
         "{latest_usage_cte}
          SELECT
            {account_select},
@@ -1912,18 +2046,9 @@ fn list_gateway_candidates_filtered(
           AND lu.rn = 1
          WHERE {where_clause}
          ORDER BY a.sort ASC, a.updated_at DESC",
-        latest_usage_cte = latest_usage_cte_sql(),
         account_select = account_select_columns("a"),
         token_select = token_select_columns("t"),
-    );
-
-    let mut stmt = storage.conn.prepare(&sql)?;
-    let mut rows = stmt.query(params_from_iter(params))?;
-    let mut out = Vec::new();
-    while let Some(row) = rows.next()? {
-        out.push(map_gateway_candidate_row(row)?);
-    }
-    Ok(out)
+    )
 }
 
 /// 函数 `latest_usage_cte_sql`
@@ -1952,6 +2077,26 @@ fn latest_usage_cte_sql() -> &'static str {
             ) AS rn
         FROM usage_snapshots
     )"
+}
+
+fn latest_usage_cte_sql_for_condition(where_condition: &str) -> String {
+    format!(
+        "WITH latest_usage AS (
+        SELECT
+            account_id,
+            used_percent,
+            window_minutes,
+            captured_at,
+            secondary_used_percent,
+            secondary_window_minutes,
+            ROW_NUMBER() OVER (
+                PARTITION BY account_id
+                ORDER BY captured_at DESC, id DESC
+            ) AS rn
+        FROM usage_snapshots
+        WHERE {where_condition}
+    )"
+    )
 }
 
 fn available_account_status_clause(account_alias: &str) -> String {
@@ -2200,6 +2345,23 @@ mod tests {
             .conn
             .query_row(&sql, [account_id], |row| row.get(0))
             .expect("count model source account rows")
+    }
+
+    fn collect_query_plan(storage: &Storage, sql: &str) -> String {
+        collect_query_plan_with_params(storage, sql, [])
+    }
+
+    fn collect_query_plan_with_params<P>(storage: &Storage, sql: &str, params: P) -> String
+    where
+        P: rusqlite::Params,
+    {
+        let mut stmt = storage.conn.prepare(sql).expect("prepare explain");
+        let rows = stmt
+            .query_map(params, |row| row.get::<_, String>(3))
+            .expect("query explain");
+        rows.collect::<Result<Vec<_>>>()
+            .expect("collect explain")
+            .join("\n")
     }
 
     #[test]
@@ -3160,15 +3322,10 @@ mod tests {
             1
         );
 
+        let sql = account_query_sql(" WHERE a.group_name = ?", false);
         let plan = storage
             .conn
-            .prepare(
-                "EXPLAIN QUERY PLAN
-                 SELECT id, label, issuer, chatgpt_account_id, workspace_id, group_name, sort, status, created_at, updated_at
-                 FROM accounts
-                 WHERE group_name = ?
-                 ORDER BY sort ASC, updated_at DESC",
-            )
+            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
             .expect("prepare explain")
             .query_map(["TEAM_A"], |row| row.get::<_, String>(3))
             .expect("query explain")
@@ -3186,31 +3343,43 @@ mod tests {
         let storage = Storage::open_in_memory().expect("open");
         storage.init().expect("init");
 
-        let plan = storage
-            .conn
-            .prepare(
-                "EXPLAIN QUERY PLAN
-                 SELECT id
-                 FROM accounts
-                 ORDER BY sort ASC, updated_at DESC, id ASC",
-            )
-            .expect("prepare explain")
-            .query_map([], |row| row.get::<_, String>(3))
-            .expect("query explain")
-            .collect::<Result<Vec<_>>>()
-            .expect("collect explain");
+        for (label, sql) in [
+            ("account id list", account_ids_list_sql()),
+            (
+                "account auth refresh target list",
+                account_auth_refresh_targets_list_sql(),
+            ),
+            (
+                "account quota source summary list",
+                account_quota_source_summaries_list_sql(),
+            ),
+            (
+                "account import snapshot list",
+                account_import_snapshots_list_sql(),
+            ),
+            ("account summary row list", account_summary_rows_list_sql()),
+        ] {
+            let plan = storage
+                .conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .expect("prepare explain")
+                .query_map([], |row| row.get::<_, String>(3))
+                .expect("query explain")
+                .collect::<Result<Vec<_>>>()
+                .expect("collect explain");
 
-        assert!(
-            plan.iter()
-                .any(|detail| detail.contains("idx_accounts_list_order")),
-            "expected account list-order index in plan, got {plan:?}"
-        );
-        assert!(
-            !plan
-                .iter()
-                .any(|detail| detail.contains("USE TEMP B-TREE FOR ORDER BY")),
-            "expected account list query to avoid a temp sort, got {plan:?}"
-        );
+            assert!(
+                plan.iter()
+                    .any(|detail| detail.contains("idx_accounts_list_order")),
+                "expected {label} to use account list-order index, got {plan:?}"
+            );
+            assert!(
+                !plan
+                    .iter()
+                    .any(|detail| detail.contains("USE TEMP B-TREE FOR ORDER BY")),
+                "expected {label} to avoid a temp sort, got {plan:?}"
+            );
+        }
     }
 
     #[test]
@@ -3249,14 +3418,44 @@ mod tests {
         let storage = Storage::open_in_memory().expect("open");
         storage.init().expect("init");
 
-        let plan = storage
+        let account_ids_sql =
+            account_ids_by_statuses_chunk_sql("LOWER(TRIM(COALESCE(status, ''))) IN (?1, ?2)");
+        let account_ids_plan = storage
             .conn
-            .prepare(
-                "EXPLAIN QUERY PLAN
-                 SELECT id, sort, updated_at
-                 FROM accounts
-                 WHERE LOWER(TRIM(COALESCE(status, ''))) IN (?1, ?2)",
-            )
+            .prepare(&format!("EXPLAIN QUERY PLAN {account_ids_sql}"))
+            .expect("prepare explain")
+            .query_map(["limited", "banned"], |row| row.get::<_, String>(3))
+            .expect("query explain")
+            .collect::<Result<Vec<_>>>()
+            .expect("collect explain");
+        let accounts_sql =
+            accounts_by_statuses_chunk_sql("LOWER(TRIM(COALESCE(a.status, ''))) IN (?1, ?2)");
+        let accounts_plan = storage
+            .conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {accounts_sql}"))
+            .expect("prepare explain")
+            .query_map(["limited", "banned"], |row| row.get::<_, String>(3))
+            .expect("query explain")
+            .collect::<Result<Vec<_>>>()
+            .expect("collect explain");
+        let refresh_targets_sql = account_usage_refresh_targets_by_statuses_chunk_sql(
+            "LOWER(TRIM(COALESCE(status, ''))) IN (?1, ?2)",
+        );
+        let refresh_targets_plan = storage
+            .conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {refresh_targets_sql}"))
+            .expect("prepare explain")
+            .query_map(["limited", "banned"], |row| row.get::<_, String>(3))
+            .expect("query explain")
+            .collect::<Result<Vec<_>>>()
+            .expect("collect explain");
+        let usable_refresh_targets_sql =
+            account_usage_refresh_targets_with_usable_tokens_by_statuses_chunk_sql(
+                "LOWER(TRIM(COALESCE(a.status, ''))) IN (?1, ?2)",
+            );
+        let usable_refresh_targets_plan = storage
+            .conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {usable_refresh_targets_sql}"))
             .expect("prepare explain")
             .query_map(["limited", "banned"], |row| row.get::<_, String>(3))
             .expect("query explain")
@@ -3264,11 +3463,44 @@ mod tests {
             .expect("collect explain");
 
         assert!(
-            !plan
+            !account_ids_plan
                 .iter()
                 .any(|detail| detail.contains("USE TEMP B-TREE FOR ORDER BY")),
-            "status chunk query should avoid per-chunk ORDER BY temp sorting, got {plan:?}"
+            "status id chunk query should avoid per-chunk ORDER BY temp sorting, got {account_ids_plan:?}"
         );
+        assert!(
+            !accounts_plan
+                .iter()
+                .any(|detail| detail.contains("USE TEMP B-TREE FOR ORDER BY")),
+            "status account chunk query should avoid per-chunk ORDER BY temp sorting, got {accounts_plan:?}"
+        );
+        assert!(
+            !refresh_targets_plan
+                .iter()
+                .any(|detail| detail.contains("USE TEMP B-TREE FOR ORDER BY")),
+            "usage refresh target chunk query should avoid per-chunk ORDER BY temp sorting, got {refresh_targets_plan:?}"
+        );
+        assert!(
+            !usable_refresh_targets_plan
+                .iter()
+                .any(|detail| detail.contains("USE TEMP B-TREE FOR ORDER BY")),
+            "usable-token usage refresh target chunk query should avoid per-chunk ORDER BY temp sorting, got {usable_refresh_targets_plan:?}"
+        );
+        for (label, plan) in [
+            ("status id", account_ids_plan),
+            ("status account", accounts_plan),
+            ("usage refresh target", refresh_targets_plan),
+            (
+                "usable-token usage refresh target",
+                usable_refresh_targets_plan,
+            ),
+        ] {
+            assert!(
+                plan.iter()
+                    .any(|detail| detail.contains("idx_accounts_cleanup_status_lookup")),
+                "expected {label} chunk query to use normalized status index, got {plan:?}"
+            );
+        }
     }
 
     #[test]
@@ -3276,14 +3508,12 @@ mod tests {
         let storage = Storage::open_in_memory().expect("open");
         storage.init().expect("init");
 
+        let sql = account_cleanup_candidates_by_statuses_chunk_sql(
+            "LOWER(TRIM(COALESCE(status, ''))) IN (?1, ?2)",
+        );
         let plan = storage
             .conn
-            .prepare(
-                "EXPLAIN QUERY PLAN
-                 SELECT id, status, sort, updated_at
-                 FROM accounts
-                 WHERE LOWER(TRIM(COALESCE(status, ''))) IN (?1, ?2)",
-            )
+            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
             .expect("prepare explain")
             .query_map(["limited", "banned"], |row| row.get::<_, String>(3))
             .expect("query explain")
@@ -3302,14 +3532,49 @@ mod tests {
         let storage = Storage::open_in_memory().expect("open");
         storage.init().expect("init");
 
-        let plan = storage
+        let account_ids_sql = account_ids_for_ids_chunk_sql("id IN (?1, ?2)");
+        let account_ids_plan = storage
             .conn
-            .prepare(
-                "EXPLAIN QUERY PLAN
-                 SELECT id, sort, updated_at
-                 FROM accounts
-                 WHERE id IN (?1, ?2)",
-            )
+            .prepare(&format!("EXPLAIN QUERY PLAN {account_ids_sql}"))
+            .expect("prepare explain")
+            .query_map(["acc-a", "acc-b"], |row| row.get::<_, String>(3))
+            .expect("query explain")
+            .collect::<Result<Vec<_>>>()
+            .expect("collect explain");
+        let accounts_sql = accounts_for_ids_chunk_sql("a.id IN (?1, ?2)");
+        let accounts_plan = storage
+            .conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {accounts_sql}"))
+            .expect("prepare explain")
+            .query_map(["acc-a", "acc-b"], |row| row.get::<_, String>(3))
+            .expect("query explain")
+            .collect::<Result<Vec<_>>>()
+            .expect("collect explain");
+        let token_refresh_issuers_sql =
+            account_token_refresh_issuers_for_ids_chunk_sql("id IN (?1, ?2)");
+        let token_refresh_issuers_plan = storage
+            .conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {token_refresh_issuers_sql}"))
+            .expect("prepare explain")
+            .query_map(["acc-a", "acc-b"], |row| row.get::<_, String>(3))
+            .expect("query explain")
+            .collect::<Result<Vec<_>>>()
+            .expect("collect explain");
+        let dashboard_metadata_sql =
+            account_dashboard_source_metadata_for_ids_chunk_sql("id IN (?1, ?2)");
+        let dashboard_metadata_plan = storage
+            .conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {dashboard_metadata_sql}"))
+            .expect("prepare explain")
+            .query_map(["acc-a", "acc-b"], |row| row.get::<_, String>(3))
+            .expect("query explain")
+            .collect::<Result<Vec<_>>>()
+            .expect("collect explain");
+        let codex_profile_sql =
+            active_account_codex_profile_candidates_for_ids_chunk_sql("id IN (?1, ?2)");
+        let codex_profile_plan = storage
+            .conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {codex_profile_sql}"))
             .expect("prepare explain")
             .query_map(["acc-a", "acc-b"], |row| row.get::<_, String>(3))
             .expect("query explain")
@@ -3317,11 +3582,46 @@ mod tests {
             .expect("collect explain");
 
         assert!(
-            !plan
+            !account_ids_plan
                 .iter()
                 .any(|detail| detail.contains("USE TEMP B-TREE FOR ORDER BY")),
-            "id chunk query should avoid per-chunk ORDER BY temp sorting, got {plan:?}"
+            "id chunk query should avoid per-chunk ORDER BY temp sorting, got {account_ids_plan:?}"
         );
+        assert!(
+            account_ids_plan
+                .iter()
+                .any(|detail| detail.contains("sqlite_autoindex_accounts_1")),
+            "expected id chunk query to use account primary-key lookup, got {account_ids_plan:?}"
+        );
+        assert!(
+            accounts_plan
+                .iter()
+                .any(|detail| detail.contains("sqlite_autoindex_accounts_1")),
+            "expected full account id chunk query to use account primary-key lookup, got {accounts_plan:?}"
+        );
+        assert!(
+            !accounts_plan
+                .iter()
+                .any(|detail| detail.contains("USE TEMP B-TREE FOR ORDER BY")),
+            "full account id chunk query should avoid per-chunk ORDER BY temp sorting, got {accounts_plan:?}"
+        );
+        for (label, plan) in [
+            ("token refresh issuer", token_refresh_issuers_plan),
+            ("dashboard metadata", dashboard_metadata_plan),
+            ("codex profile candidate", codex_profile_plan),
+        ] {
+            assert!(
+                plan.iter()
+                    .any(|detail| detail.contains("sqlite_autoindex_accounts_1")),
+                "expected {label} chunk query to use account primary-key lookup, got {plan:?}"
+            );
+            assert!(
+                !plan
+                    .iter()
+                    .any(|detail| detail.contains("USE TEMP B-TREE FOR ORDER BY")),
+                "{label} chunk query should avoid per-chunk ORDER BY temp sorting, got {plan:?}"
+            );
+        }
     }
 
     #[test]
@@ -3536,6 +3836,26 @@ mod tests {
         assert_eq!(targets[0].token.account_id, "acc-recovered-token-target");
         assert_eq!(targets[0].token.access_token, "access");
         assert_eq!(targets[1].workspace_id.as_deref(), Some("ws-ready"));
+    }
+
+    #[test]
+    fn usage_refresh_token_targets_scope_latest_status_to_target_accounts() {
+        let storage = Storage::open_in_memory().expect("open");
+        storage.init().expect("init");
+
+        let sql = usage_refresh_token_targets_by_status_sql(
+            "LOWER(TRIM(COALESCE(a.status, ''))) IN ('active', 'inactive')",
+        );
+        let plan = collect_query_plan(&storage, &format!("EXPLAIN QUERY PLAN {sql}"));
+
+        assert!(
+            sql.contains("INNER JOIN target_accounts ta"),
+            "expected latest status CTE to join target accounts before ranking, got {sql}"
+        );
+        assert!(
+            plan.contains("idx_events_account_status_lookup"),
+            "expected scoped latest status lookup to use event account status index, got {plan}"
+        );
     }
 
     #[test]
@@ -3756,14 +4076,7 @@ mod tests {
                 "ws-indexed",
             ),
         ] {
-            let sql = format!(
-                "EXPLAIN QUERY PLAN
-                 SELECT id, label, issuer, chatgpt_account_id, workspace_id, group_name, sort, status, created_at, updated_at
-                 FROM accounts
-                 WHERE {column} = ?
-                 ORDER BY updated_at DESC, id ASC
-                 LIMIT 1",
-            );
+            let sql = format!("EXPLAIN QUERY PLAN {}", account_identity_lookup_sql(column));
             let plan = storage
                 .conn
                 .prepare(&sql)
@@ -3986,6 +4299,26 @@ mod tests {
                 .map(|(account, _token)| account.id)
                 .collect::<Vec<_>>(),
             vec!["acc-second".to_string(), "acc-first".to_string()]
+        );
+    }
+
+    #[test]
+    fn gateway_candidates_for_accounts_scope_latest_usage_cte_to_requested_ids() {
+        let storage = Storage::open_in_memory().expect("open");
+        storage.init().expect("init");
+        let latest_usage_cte =
+            latest_usage_cte_sql_for_condition("account_id IN ('acc-first', 'acc-second')");
+        let availability_clause = gateway_account_usage_filter_clause("a", "lu");
+        let gateway_sql = gateway_candidates_filtered_sql(
+            &latest_usage_cte,
+            &format!("a.id IN ('acc-first', 'acc-second') AND {availability_clause}"),
+        );
+        let sql = format!("EXPLAIN QUERY PLAN {gateway_sql}");
+        let plan = collect_query_plan(&storage, &sql);
+
+        assert!(
+            plan.contains("idx_usage_snapshots_account_captured_id"),
+            "expected account-scoped latest usage CTE to use account lookup index, got {plan}"
         );
     }
 
@@ -4314,5 +4647,82 @@ mod tests {
             .clear_preferred_account_if("acc-b")
             .expect("clear preferred"));
         assert_eq!(storage.preferred_account_id().expect("no preferred"), None);
+    }
+    #[test]
+    fn account_write_helpers_use_primary_key_indexes() {
+        let storage = Storage::open_in_memory().expect("open");
+        storage.init().expect("init");
+
+        fn assert_account_pk<P: rusqlite::Params>(
+            storage: &Storage,
+            label: &str,
+            sql: &str,
+            params: P,
+        ) {
+            let plan = collect_query_plan_with_params(
+                storage,
+                &format!("EXPLAIN QUERY PLAN {sql}"),
+                params,
+            );
+            assert!(
+                plan.contains("sqlite_autoindex_accounts_1") || plan.contains("USING INDEX"),
+                "expected {label} to use account primary-key index, got {plan}"
+            );
+        }
+
+        assert_account_pk(
+            &storage,
+            "sort update",
+            update_account_sort_sql(),
+            rusqlite::params![1_i64, 2_i64, "acc-a"],
+        );
+        assert_account_pk(
+            &storage,
+            "label update",
+            update_account_label_sql(),
+            rusqlite::params!["label", 2_i64, "acc-a"],
+        );
+        assert_account_pk(
+            &storage,
+            "workspace identity update",
+            update_account_workspace_identity_sql(),
+            rusqlite::params!["cgpt", "workspace", 2_i64, "acc-a"],
+        );
+        assert_account_pk(
+            &storage,
+            "touch updated_at",
+            touch_account_updated_at_sql(),
+            rusqlite::params![2_i64, "acc-a"],
+        );
+        assert_account_pk(
+            &storage,
+            "status update",
+            update_account_status_sql(),
+            rusqlite::params!["active", 2_i64, "acc-a"],
+        );
+        assert_account_pk(
+            &storage,
+            "status changed update",
+            update_account_status_if_changed_sql(),
+            rusqlite::params!["active", 2_i64, "acc-a"],
+        );
+        assert_account_pk(
+            &storage,
+            "account delete",
+            delete_account_by_id_sql(),
+            rusqlite::params!["acc-a"],
+        );
+        assert_account_pk(
+            &storage,
+            "set preferred account",
+            set_preferred_account_sql(),
+            rusqlite::params![2_i64, "acc-a"],
+        );
+        assert_account_pk(
+            &storage,
+            "clear preferred account by id",
+            clear_preferred_account_by_id_sql(),
+            rusqlite::params![2_i64, "acc-a"],
+        );
     }
 }

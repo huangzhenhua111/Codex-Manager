@@ -11,6 +11,418 @@ use crate::storage::key_id_filters::{
     normalize_text_ids, text_id_in_clause, SQLITE_IN_CLAUSE_BATCH_SIZE,
 };
 
+fn app_user_select_columns() -> &'static str {
+    "id, username, display_name, password_hash, role, status,
+     created_at, updated_at, last_login_at"
+}
+
+fn app_user_lookup_sql(where_condition: &str) -> String {
+    format!(
+        "SELECT {columns}
+         FROM app_users
+         WHERE {where_condition}
+         LIMIT 1",
+        columns = app_user_select_columns(),
+    )
+}
+
+fn app_user_by_username_sql() -> String {
+    app_user_lookup_sql("lower(username) = lower(?1)")
+}
+
+fn app_user_by_id_sql() -> String {
+    app_user_lookup_sql("id = ?1")
+}
+
+fn app_user_list_sql() -> String {
+    format!(
+        "SELECT {columns}
+         FROM app_users
+         ORDER BY created_at ASC, username ASC",
+        columns = app_user_select_columns(),
+    )
+}
+fn app_user_count_sql() -> &'static str {
+    "SELECT COUNT(*) FROM app_users"
+}
+
+fn member_app_user_count_sql() -> &'static str {
+    "SELECT COUNT(*) FROM app_users WHERE role = 'member'"
+}
+
+fn active_admin_count_sql() -> &'static str {
+    "SELECT COUNT(*) FROM app_users WHERE role = 'admin' AND status = 'active'"
+}
+
+fn dashboard_app_user_summary_sql(where_condition: Option<&str>) -> String {
+    let mut sql = "SELECT
+            u.id,
+            u.username,
+            u.display_name,
+            u.role,
+            u.status,
+            w.balance_credit_micros - w.frozen_credit_micros
+         FROM app_users u
+         LEFT JOIN app_wallets w
+           ON w.owner_kind = 'user'
+          AND w.owner_id = u.id"
+        .to_string();
+    if let Some(condition) = where_condition {
+        sql.push_str(&format!("\n         WHERE {condition}"));
+    } else {
+        sql.push_str("\n         ORDER BY u.created_at ASC, u.username ASC");
+    }
+    sql
+}
+
+fn public_app_user_with_wallet_sql(where_condition: Option<&str>, include_order: bool) -> String {
+    let mut sql = "SELECT
+            u.id,
+            u.username,
+            u.display_name,
+            u.role,
+            u.status,
+            u.created_at,
+            u.updated_at,
+            u.last_login_at,
+            w.id,
+            w.owner_kind,
+            w.owner_id,
+            w.balance_credit_micros,
+            w.frozen_credit_micros,
+            w.status,
+            w.created_at,
+            w.updated_at
+         FROM app_users u
+         LEFT JOIN app_wallets w
+           ON u.role <> 'admin'
+          AND w.owner_kind = 'user'
+          AND w.owner_id = u.id"
+        .to_string();
+    if let Some(condition) = where_condition {
+        sql.push_str(&format!("\n         WHERE {condition}"));
+    }
+    if include_order {
+        sql.push_str("\n         ORDER BY u.created_at ASC, u.username ASC");
+    }
+    sql
+}
+
+fn app_user_access_summary_sql(where_condition: &str) -> String {
+    format!(
+        "SELECT id, username, role, status
+         FROM app_users
+         WHERE {where_condition}"
+    )
+}
+
+fn app_user_access_summary_by_id_sql() -> String {
+    format!(
+        "{}\n         LIMIT 1",
+        app_user_access_summary_sql("id = ?1")
+    )
+}
+
+fn app_session_select_columns() -> &'static str {
+    "id, user_id, token_hash, expires_at, created_at, last_seen_at, revoked_at"
+}
+
+fn active_app_session_by_token_hash_sql() -> String {
+    format!(
+        "SELECT {columns}
+         FROM app_user_sessions
+         WHERE token_hash = ?1 AND revoked_at IS NULL AND expires_at > ?2
+         LIMIT 1",
+        columns = app_session_select_columns(),
+    )
+}
+
+fn active_app_session_user_with_wallet_sql() -> &'static str {
+    "SELECT
+        s.id,
+        s.expires_at,
+        u.id,
+        u.username,
+        u.display_name,
+        u.role,
+        u.status,
+        u.created_at,
+        u.updated_at,
+        u.last_login_at,
+        w.id,
+        w.owner_kind,
+        w.owner_id,
+        w.balance_credit_micros,
+        w.frozen_credit_micros,
+        w.status,
+        w.created_at,
+        w.updated_at
+     FROM app_user_sessions s
+     INNER JOIN app_users u ON u.id = s.user_id
+     LEFT JOIN app_wallets w
+       ON u.role <> 'admin'
+      AND w.owner_kind = 'user'
+      AND w.owner_id = u.id
+     WHERE s.token_hash = ?1
+       AND s.revoked_at IS NULL
+       AND s.expires_at > ?2
+       AND u.status = 'active'
+     LIMIT 1"
+}
+
+fn touch_app_user_session_sql() -> &'static str {
+    "UPDATE app_user_sessions SET last_seen_at = ?1 WHERE id = ?2"
+}
+
+fn revoke_app_user_session_by_token_hash_sql() -> &'static str {
+    "UPDATE app_user_sessions
+     SET revoked_at = ?1
+     WHERE token_hash = ?2 AND revoked_at IS NULL"
+}
+
+fn app_wallet_select_columns() -> &'static str {
+    "id, owner_kind, owner_id, balance_credit_micros, frozen_credit_micros,
+     status, created_at, updated_at"
+}
+
+fn app_wallet_by_owner_sql() -> String {
+    format!(
+        "SELECT {columns}
+         FROM app_wallets
+         WHERE owner_kind = ?1 AND owner_id = ?2
+         LIMIT 1",
+        columns = app_wallet_select_columns(),
+    )
+}
+
+fn app_wallet_list_sql() -> String {
+    format!(
+        "SELECT {columns}
+         FROM app_wallets
+         ORDER BY created_at ASC",
+        columns = app_wallet_select_columns(),
+    )
+}
+
+fn api_key_owner_select_columns() -> &'static str {
+    "key_id, owner_kind, owner_user_id, project_id, updated_at"
+}
+
+fn api_key_owner_lookup_sql() -> String {
+    format!(
+        "SELECT {columns}
+         FROM api_key_owners
+         WHERE key_id = ?1
+         LIMIT 1",
+        columns = api_key_owner_select_columns(),
+    )
+}
+
+fn api_key_owner_chunk_sql(where_condition: &str) -> String {
+    format!(
+        "SELECT {columns}
+         FROM api_key_owners
+         WHERE {where_condition}",
+        columns = api_key_owner_select_columns(),
+    )
+}
+
+fn api_key_owner_list_sql() -> String {
+    format!(
+        "SELECT {columns}
+         FROM api_key_owners",
+        columns = api_key_owner_select_columns(),
+    )
+}
+
+fn api_key_owner_rows_sql() -> String {
+    format!(
+        "SELECT {columns}
+         FROM api_key_owners
+         ORDER BY key_id ASC",
+        columns = api_key_owner_select_columns(),
+    )
+}
+
+fn user_wallets_for_users_chunk_sql(owner_condition: &str) -> String {
+    format!(
+        "SELECT {columns}
+         FROM app_wallets
+         WHERE owner_kind = 'user'
+           AND {owner_condition}",
+        columns = app_wallet_select_columns(),
+    )
+}
+
+fn user_wallet_available_credit_sql() -> &'static str {
+    "SELECT owner_id, balance_credit_micros - frozen_credit_micros
+     FROM app_wallets
+     WHERE owner_kind = 'user'"
+}
+
+fn user_api_key_ids_for_user_sql() -> &'static str {
+    "SELECT key_id
+     FROM api_key_owners
+     WHERE owner_kind = 'user' AND owner_user_id = ?1
+     ORDER BY key_id ASC"
+}
+
+fn delete_api_key_owners_for_user_sql() -> &'static str {
+    "DELETE FROM api_key_owners
+     WHERE owner_kind = 'user' AND owner_user_id = ?1"
+}
+
+fn delete_app_user_sessions_for_user_sql() -> &'static str {
+    "DELETE FROM app_user_sessions WHERE user_id = ?1"
+}
+
+fn delete_user_model_groups_for_user_sql() -> &'static str {
+    "DELETE FROM user_model_groups WHERE user_id = ?1"
+}
+
+fn delete_app_wallet_ledger_entries_for_user_wallets_sql() -> &'static str {
+    "DELETE FROM app_wallet_ledger_entries
+     WHERE wallet_id IN (
+        SELECT id FROM app_wallets WHERE owner_kind = 'user' AND owner_id = ?1
+     )"
+}
+
+fn delete_app_wallets_for_user_sql() -> &'static str {
+    "DELETE FROM app_wallets WHERE owner_kind = 'user' AND owner_id = ?1"
+}
+
+fn delete_app_user_by_id_sql() -> &'static str {
+    "DELETE FROM app_users WHERE id = ?1"
+}
+
+fn app_user_exists_sql() -> &'static str {
+    "SELECT EXISTS(SELECT 1 FROM app_users WHERE id = ?1)"
+}
+
+fn app_username_exists_sql() -> &'static str {
+    "SELECT EXISTS(SELECT 1 FROM app_users WHERE lower(username) = lower(?1))"
+}
+
+fn update_app_user_last_login_sql() -> &'static str {
+    "UPDATE app_users SET last_login_at = ?1, updated_at = ?1 WHERE id = ?2"
+}
+
+fn update_app_user_status_sql() -> &'static str {
+    "UPDATE app_users SET status = ?1, updated_at = ?2 WHERE id = ?3"
+}
+
+fn update_app_user_role_sql() -> &'static str {
+    "UPDATE app_users SET role = ?1, updated_at = ?2 WHERE id = ?3"
+}
+
+fn update_app_user_display_name_sql() -> &'static str {
+    "UPDATE app_users SET display_name = ?1, updated_at = ?2 WHERE id = ?3"
+}
+
+fn update_app_user_password_hash_sql() -> &'static str {
+    "UPDATE app_users SET password_hash = ?1, updated_at = ?2 WHERE id = ?3"
+}
+
+fn billing_rule_select_columns() -> &'static str {
+    "id, name, status, priority, multiplier_millis, model_pattern, service_tier,
+     user_id, project_id, api_key_id, starts_at, ends_at, created_at, updated_at"
+}
+
+fn billing_rule_list_sql() -> String {
+    format!(
+        "SELECT
+            {columns}
+         FROM billing_rules
+         ORDER BY status ASC, priority DESC, updated_at DESC, name ASC",
+        columns = billing_rule_select_columns(),
+    )
+}
+
+fn active_billing_rule_where_sql() -> &'static str {
+    "status = 'active'
+     AND (starts_at IS NULL OR starts_at <= ?1)
+     AND (ends_at IS NULL OR ends_at > ?1)"
+}
+
+fn active_billing_rules_sql() -> String {
+    format!(
+        "SELECT
+            {columns}
+         FROM billing_rules
+         WHERE {where_clause}
+         ORDER BY priority DESC, updated_at DESC, name ASC",
+        columns = billing_rule_select_columns(),
+        where_clause = active_billing_rule_where_sql(),
+    )
+}
+
+fn delete_billing_rule_by_id_sql() -> &'static str {
+    "DELETE FROM billing_rules WHERE id = ?1"
+}
+
+fn active_billing_rules_for_context_sql() -> String {
+    format!(
+        "SELECT
+            {columns}
+         FROM billing_rules
+         WHERE {where_clause}
+           AND (api_key_id IS NULL OR TRIM(api_key_id) = '' OR api_key_id = ?2)
+           AND (user_id IS NULL OR TRIM(user_id) = '' OR user_id = ?3)
+           AND (project_id IS NULL OR TRIM(project_id) = '' OR project_id = ?4)
+           AND (
+                service_tier IS NULL
+                OR TRIM(service_tier) = ''
+                OR LOWER(TRIM(service_tier)) = LOWER(TRIM(?5))
+           )
+         ORDER BY priority DESC, updated_at DESC, name ASC",
+        columns = billing_rule_select_columns(),
+        where_clause = active_billing_rule_where_sql(),
+    )
+}
+
+fn active_billing_rules_for_request_candidate_sql() -> String {
+    format!(
+        "SELECT
+            {columns}
+         FROM billing_rules
+         WHERE {where_clause}
+           AND (api_key_id IS NULL OR TRIM(api_key_id) = '' OR api_key_id = ?2)
+           AND (user_id IS NULL OR TRIM(user_id) = '' OR user_id = ?3)
+           AND (project_id IS NULL OR TRIM(project_id) = '' OR project_id = ?4)
+           AND (
+                service_tier IS NULL
+                OR TRIM(service_tier) = ''
+                OR LOWER(TRIM(service_tier)) = LOWER(TRIM(?5))
+           )
+           AND (
+                model_pattern IS NULL
+                OR TRIM(model_pattern) = ''
+                OR TRIM(model_pattern) = '*'
+                OR (
+                    ?6 <> ''
+                    AND (
+                        INSTR(model_pattern, '*') > 0
+                        OR LOWER(TRIM(model_pattern)) = LOWER(TRIM(?6))
+                        OR LOWER(TRIM(?6)) LIKE LOWER(TRIM(model_pattern)) || '%'
+                    )
+                )
+           )
+         ORDER BY
+            priority DESC,
+            (
+                CASE WHEN api_key_id IS NOT NULL AND TRIM(api_key_id) <> '' THEN 1 ELSE 0 END
+              + CASE WHEN user_id IS NOT NULL AND TRIM(user_id) <> '' THEN 1 ELSE 0 END
+              + CASE WHEN project_id IS NOT NULL AND TRIM(project_id) <> '' THEN 1 ELSE 0 END
+              + CASE WHEN service_tier IS NOT NULL AND TRIM(service_tier) <> '' THEN 1 ELSE 0 END
+              + CASE WHEN model_pattern IS NOT NULL AND TRIM(model_pattern) <> '' THEN 1 ELSE 0 END
+            ) DESC,
+            LENGTH(IFNULL(model_pattern, '')) DESC,
+            updated_at DESC",
+        columns = billing_rule_select_columns(),
+        where_clause = active_billing_rule_where_sql(),
+    )
+}
+
 fn map_app_user(row: &Row<'_>) -> Result<AppUser> {
     Ok(AppUser {
         id: row.get(0)?,
@@ -155,23 +567,17 @@ fn map_billing_rule(row: &Row<'_>) -> Result<BillingRule> {
 impl Storage {
     pub fn app_user_count(&self) -> Result<i64> {
         self.conn
-            .query_row("SELECT COUNT(*) FROM app_users", [], |row| row.get(0))
+            .query_row(app_user_count_sql(), [], |row| row.get(0))
     }
 
     pub fn member_app_user_count(&self) -> Result<i64> {
-        self.conn.query_row(
-            "SELECT COUNT(*) FROM app_users WHERE role = 'member'",
-            [],
-            |row| row.get(0),
-        )
+        self.conn
+            .query_row(member_app_user_count_sql(), [], |row| row.get(0))
     }
 
     pub fn active_admin_count(&self) -> Result<i64> {
-        self.conn.query_row(
-            "SELECT COUNT(*) FROM app_users WHERE role = 'admin' AND status = 'active'",
-            [],
-            |row| row.get(0),
-        )
+        self.conn
+            .query_row(active_admin_count_sql(), [], |row| row.get(0))
     }
 
     pub fn insert_app_user(&self, user: &AppUser) -> Result<()> {
@@ -197,61 +603,27 @@ impl Storage {
 
     pub fn delete_app_user(&self, user_id: &str) -> Result<usize> {
         let tx = self.conn.unchecked_transaction()?;
+        tx.execute(delete_api_key_owners_for_user_sql(), [user_id])?;
+        tx.execute(delete_app_user_sessions_for_user_sql(), [user_id])?;
+        tx.execute(delete_user_model_groups_for_user_sql(), [user_id])?;
         tx.execute(
-            "DELETE FROM api_key_owners
-             WHERE owner_kind = 'user' AND owner_user_id = ?1",
+            delete_app_wallet_ledger_entries_for_user_wallets_sql(),
             [user_id],
         )?;
-        tx.execute(
-            "DELETE FROM app_user_sessions WHERE user_id = ?1",
-            [user_id],
-        )?;
-        tx.execute(
-            "DELETE FROM user_model_groups WHERE user_id = ?1",
-            [user_id],
-        )?;
-        tx.execute(
-            "DELETE FROM app_wallet_ledger_entries
-             WHERE wallet_id IN (
-                SELECT id FROM app_wallets WHERE owner_kind = 'user' AND owner_id = ?1
-             )",
-            [user_id],
-        )?;
-        tx.execute(
-            "DELETE FROM app_wallets WHERE owner_kind = 'user' AND owner_id = ?1",
-            [user_id],
-        )?;
-        let deleted = tx.execute("DELETE FROM app_users WHERE id = ?1", [user_id])?;
+        tx.execute(delete_app_wallets_for_user_sql(), [user_id])?;
+        let deleted = tx.execute(delete_app_user_by_id_sql(), [user_id])?;
         tx.commit()?;
         Ok(deleted)
     }
 
     pub fn list_app_users(&self) -> Result<Vec<AppUser>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, username, display_name, password_hash, role, status,
-                    created_at, updated_at, last_login_at
-             FROM app_users
-             ORDER BY created_at ASC, username ASC",
-        )?;
+        let mut stmt = self.conn.prepare(&app_user_list_sql())?;
         let rows = stmt.query_map([], map_app_user)?;
         rows.collect()
     }
 
     pub fn list_dashboard_app_user_summaries(&self) -> Result<Vec<DashboardAppUserSummary>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT
-                u.id,
-                u.username,
-                u.display_name,
-                u.role,
-                u.status,
-                w.balance_credit_micros - w.frozen_credit_micros
-             FROM app_users u
-             LEFT JOIN app_wallets w
-               ON w.owner_kind = 'user'
-              AND w.owner_id = u.id
-             ORDER BY u.created_at ASC, u.username ASC",
-        )?;
+        let mut stmt = self.conn.prepare(&dashboard_app_user_summary_sql(None))?;
         let rows = stmt.query_map([], map_dashboard_app_user_summary)?;
         rows.collect()
     }
@@ -270,20 +642,7 @@ impl Storage {
             let Some((condition, params)) = text_id_in_clause("u.id", chunk) else {
                 continue;
             };
-            let sql = format!(
-                "SELECT
-                    u.id,
-                    u.username,
-                    u.display_name,
-                    u.role,
-                    u.status,
-                    w.balance_credit_micros - w.frozen_credit_micros
-                 FROM app_users u
-                 LEFT JOIN app_wallets w
-                   ON w.owner_kind = 'user'
-                  AND w.owner_id = u.id
-                 WHERE {condition}"
-            );
+            let sql = dashboard_app_user_summary_sql(Some(&condition));
             let mut stmt = self.conn.prepare(&sql)?;
             let rows = stmt.query_map(params_from_iter(params), map_dashboard_app_user_summary)?;
             for row in rows {
@@ -295,31 +654,9 @@ impl Storage {
     }
 
     pub fn list_public_app_users_with_wallets(&self) -> Result<Vec<PublicAppUserWithWallet>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT
-                u.id,
-                u.username,
-                u.display_name,
-                u.role,
-                u.status,
-                u.created_at,
-                u.updated_at,
-                u.last_login_at,
-                w.id,
-                w.owner_kind,
-                w.owner_id,
-                w.balance_credit_micros,
-                w.frozen_credit_micros,
-                w.status,
-                w.created_at,
-                w.updated_at
-             FROM app_users u
-             LEFT JOIN app_wallets w
-               ON u.role <> 'admin'
-              AND w.owner_kind = 'user'
-              AND w.owner_id = u.id
-             ORDER BY u.created_at ASC, u.username ASC",
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare(&public_app_user_with_wallet_sql(None, true))?;
         let rows = stmt.query_map([], map_public_app_user_with_wallet)?;
         rows.collect()
     }
@@ -330,30 +667,10 @@ impl Storage {
     ) -> Result<Option<PublicAppUserWithWallet>> {
         self.conn
             .query_row(
-                "SELECT
-                    u.id,
-                    u.username,
-                    u.display_name,
-                    u.role,
-                    u.status,
-                    u.created_at,
-                    u.updated_at,
-                    u.last_login_at,
-                    w.id,
-                    w.owner_kind,
-                    w.owner_id,
-                    w.balance_credit_micros,
-                    w.frozen_credit_micros,
-                    w.status,
-                    w.created_at,
-                    w.updated_at
-                 FROM app_users u
-                 LEFT JOIN app_wallets w
-                   ON u.role <> 'admin'
-                  AND w.owner_kind = 'user'
-                  AND w.owner_id = u.id
-                 WHERE u.id = ?1
-                 LIMIT 1",
+                &format!(
+                    "{}\n         LIMIT 1",
+                    public_app_user_with_wallet_sql(Some("u.id = ?1"), false)
+                ),
                 [id],
                 map_public_app_user_with_wallet,
             )
@@ -362,29 +679,13 @@ impl Storage {
 
     pub fn find_app_user_by_username(&self, username: &str) -> Result<Option<AppUser>> {
         self.conn
-            .query_row(
-                "SELECT id, username, display_name, password_hash, role, status,
-                        created_at, updated_at, last_login_at
-                 FROM app_users
-                 WHERE lower(username) = lower(?1)
-                 LIMIT 1",
-                [username],
-                map_app_user,
-            )
+            .query_row(&app_user_by_username_sql(), [username], map_app_user)
             .optional()
     }
 
     pub fn find_app_user_by_id(&self, id: &str) -> Result<Option<AppUser>> {
         self.conn
-            .query_row(
-                "SELECT id, username, display_name, password_hash, role, status,
-                        created_at, updated_at, last_login_at
-                 FROM app_users
-                 WHERE id = ?1
-                 LIMIT 1",
-                [id],
-                map_app_user,
-            )
+            .query_row(&app_user_by_id_sql(), [id], map_app_user)
             .optional()
     }
 
@@ -402,11 +703,7 @@ impl Storage {
             let Some((condition, params)) = text_id_in_clause("id", chunk) else {
                 continue;
             };
-            let sql = format!(
-                "SELECT id, username, role, status
-                 FROM app_users
-                 WHERE {condition}"
-            );
+            let sql = app_user_access_summary_sql(&condition);
             let mut stmt = self.conn.prepare(&sql)?;
             let rows = stmt.query_map(params_from_iter(params), map_app_user_access_summary)?;
             for row in rows {
@@ -423,10 +720,7 @@ impl Storage {
     ) -> Result<Option<AppUserAccessSummary>> {
         self.conn
             .query_row(
-                "SELECT id, username, role, status
-                 FROM app_users
-                 WHERE id = ?1
-                 LIMIT 1",
+                &app_user_access_summary_by_id_sql(),
                 [id],
                 map_app_user_access_summary,
             )
@@ -434,42 +728,30 @@ impl Storage {
     }
 
     pub fn app_user_exists(&self, id: &str) -> Result<bool> {
-        self.conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM app_users WHERE id = ?1)",
-            [id],
-            |row| row.get(0),
-        )
+        self.conn
+            .query_row(app_user_exists_sql(), [id], |row| row.get(0))
     }
 
     pub fn app_username_exists(&self, username: &str) -> Result<bool> {
-        self.conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM app_users WHERE lower(username) = lower(?1))",
-            [username],
-            |row| row.get(0),
-        )
+        self.conn
+            .query_row(app_username_exists_sql(), [username], |row| row.get(0))
     }
 
     pub fn update_app_user_last_login(&self, id: &str, ts: i64) -> Result<()> {
-        self.conn.execute(
-            "UPDATE app_users SET last_login_at = ?1, updated_at = ?1 WHERE id = ?2",
-            (ts, id),
-        )?;
+        self.conn
+            .execute(update_app_user_last_login_sql(), (ts, id))?;
         Ok(())
     }
 
     pub fn update_app_user_status(&self, id: &str, status: &str) -> Result<()> {
-        self.conn.execute(
-            "UPDATE app_users SET status = ?1, updated_at = ?2 WHERE id = ?3",
-            (status, now_ts(), id),
-        )?;
+        self.conn
+            .execute(update_app_user_status_sql(), (status, now_ts(), id))?;
         Ok(())
     }
 
     pub fn update_app_user_role(&self, id: &str, role: &str) -> Result<()> {
-        self.conn.execute(
-            "UPDATE app_users SET role = ?1, updated_at = ?2 WHERE id = ?3",
-            (role, now_ts(), id),
-        )?;
+        self.conn
+            .execute(update_app_user_role_sql(), (role, now_ts(), id))?;
         Ok(())
     }
 
@@ -479,7 +761,7 @@ impl Storage {
         display_name: Option<String>,
     ) -> Result<()> {
         self.conn.execute(
-            "UPDATE app_users SET display_name = ?1, updated_at = ?2 WHERE id = ?3",
+            update_app_user_display_name_sql(),
             (display_name, now_ts(), id),
         )?;
         Ok(())
@@ -487,7 +769,7 @@ impl Storage {
 
     pub fn update_app_user_password_hash(&self, id: &str, password_hash: &str) -> Result<()> {
         self.conn.execute(
-            "UPDATE app_users SET password_hash = ?1, updated_at = ?2 WHERE id = ?3",
+            update_app_user_password_hash_sql(),
             (password_hash, now_ts(), id),
         )?;
         Ok(())
@@ -518,10 +800,7 @@ impl Storage {
     ) -> Result<Option<AppUserSession>> {
         self.conn
             .query_row(
-                "SELECT id, user_id, token_hash, expires_at, created_at, last_seen_at, revoked_at
-                 FROM app_user_sessions
-                 WHERE token_hash = ?1 AND revoked_at IS NULL AND expires_at > ?2
-                 LIMIT 1",
+                &active_app_session_by_token_hash_sql(),
                 (token_hash, now),
                 map_app_session,
             )
@@ -535,36 +814,7 @@ impl Storage {
     ) -> Result<Option<AppSessionUserWithWallet>> {
         self.conn
             .query_row(
-                "SELECT
-                    s.id,
-                    s.expires_at,
-                    u.id,
-                    u.username,
-                    u.display_name,
-                    u.role,
-                    u.status,
-                    u.created_at,
-                    u.updated_at,
-                    u.last_login_at,
-                    w.id,
-                    w.owner_kind,
-                    w.owner_id,
-                    w.balance_credit_micros,
-                    w.frozen_credit_micros,
-                    w.status,
-                    w.created_at,
-                    w.updated_at
-                 FROM app_user_sessions s
-                 INNER JOIN app_users u ON u.id = s.user_id
-                 LEFT JOIN app_wallets w
-                   ON u.role <> 'admin'
-                  AND w.owner_kind = 'user'
-                  AND w.owner_id = u.id
-                 WHERE s.token_hash = ?1
-                   AND s.revoked_at IS NULL
-                   AND s.expires_at > ?2
-                   AND u.status = 'active'
-                 LIMIT 1",
+                active_app_session_user_with_wallet_sql(),
                 (token_hash, now),
                 map_app_session_user_with_wallet,
             )
@@ -572,18 +822,14 @@ impl Storage {
     }
 
     pub fn touch_app_user_session(&self, session_id: &str, ts: i64) -> Result<()> {
-        self.conn.execute(
-            "UPDATE app_user_sessions SET last_seen_at = ?1 WHERE id = ?2",
-            (ts, session_id),
-        )?;
+        self.conn
+            .execute(touch_app_user_session_sql(), (ts, session_id))?;
         Ok(())
     }
 
     pub fn revoke_app_user_session_by_token_hash(&self, token_hash: &str, ts: i64) -> Result<()> {
         self.conn.execute(
-            "UPDATE app_user_sessions
-             SET revoked_at = ?1
-             WHERE token_hash = ?2 AND revoked_at IS NULL",
+            revoke_app_user_session_by_token_hash_sql(),
             (ts, token_hash),
         )?;
         Ok(())
@@ -634,11 +880,7 @@ impl Storage {
     ) -> Result<Option<AppWallet>> {
         self.conn
             .query_row(
-                "SELECT id, owner_kind, owner_id, balance_credit_micros, frozen_credit_micros,
-                        status, created_at, updated_at
-                 FROM app_wallets
-                 WHERE owner_kind = ?1 AND owner_id = ?2
-                 LIMIT 1",
+                &app_wallet_by_owner_sql(),
                 (owner_kind, owner_id),
                 map_app_wallet,
             )
@@ -656,13 +898,7 @@ impl Storage {
             let Some((condition, params)) = text_id_in_clause("owner_id", chunk) else {
                 continue;
             };
-            let sql = format!(
-                "SELECT id, owner_kind, owner_id, balance_credit_micros, frozen_credit_micros,
-                        status, created_at, updated_at
-                 FROM app_wallets
-                 WHERE owner_kind = 'user'
-                   AND {condition}"
-            );
+            let sql = user_wallets_for_users_chunk_sql(&condition);
             let mut stmt = self.conn.prepare(&sql)?;
             let rows = stmt.query_map(params_from_iter(params), map_app_wallet)?;
             for row in rows {
@@ -673,22 +909,13 @@ impl Storage {
     }
 
     pub fn list_wallets(&self) -> Result<Vec<AppWallet>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, owner_kind, owner_id, balance_credit_micros, frozen_credit_micros,
-                    status, created_at, updated_at
-             FROM app_wallets
-             ORDER BY created_at ASC",
-        )?;
+        let mut stmt = self.conn.prepare(&app_wallet_list_sql())?;
         let rows = stmt.query_map([], map_app_wallet)?;
         rows.collect()
     }
 
     pub fn user_wallet_available_credit_micros(&self) -> Result<Vec<(String, i64)>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT owner_id, balance_credit_micros - frozen_credit_micros
-             FROM app_wallets
-             WHERE owner_kind = 'user'",
-        )?;
+        let mut stmt = self.conn.prepare(user_wallet_available_credit_sql())?;
         let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
         rows.collect()
     }
@@ -791,14 +1018,7 @@ impl Storage {
 
     pub fn find_api_key_owner(&self, key_id: &str) -> Result<Option<ApiKeyOwner>> {
         self.conn
-            .query_row(
-                "SELECT key_id, owner_kind, owner_user_id, project_id, updated_at
-                 FROM api_key_owners
-                 WHERE key_id = ?1
-                 LIMIT 1",
-                [key_id],
-                map_api_key_owner,
-            )
+            .query_row(&api_key_owner_lookup_sql(), [key_id], map_api_key_owner)
             .optional()
     }
 
@@ -813,11 +1033,7 @@ impl Storage {
             let Some((condition, params)) = text_id_in_clause("key_id", chunk) else {
                 continue;
             };
-            let sql = format!(
-                "SELECT key_id, owner_kind, owner_user_id, project_id, updated_at
-                 FROM api_key_owners
-                 WHERE {condition}"
-            );
+            let sql = api_key_owner_chunk_sql(&condition);
             let mut stmt = self.conn.prepare(&sql)?;
             let rows = stmt.query_map(params_from_iter(params), map_api_key_owner)?;
             for row in rows {
@@ -829,10 +1045,7 @@ impl Storage {
     }
 
     pub fn list_api_key_owners(&self) -> Result<HashMap<String, ApiKeyOwner>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT key_id, owner_kind, owner_user_id, project_id, updated_at
-             FROM api_key_owners",
-        )?;
+        let mut stmt = self.conn.prepare(&api_key_owner_list_sql())?;
         let rows = stmt.query_map([], map_api_key_owner)?;
         let mut out = HashMap::new();
         for row in rows {
@@ -843,11 +1056,7 @@ impl Storage {
     }
 
     pub fn list_api_key_owner_rows(&self) -> Result<Vec<ApiKeyOwner>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT key_id, owner_kind, owner_user_id, project_id, updated_at
-             FROM api_key_owners
-             ORDER BY key_id ASC",
-        )?;
+        let mut stmt = self.conn.prepare(&api_key_owner_rows_sql())?;
         let rows = stmt.query_map([], map_api_key_owner)?;
         rows.collect()
     }
@@ -870,12 +1079,7 @@ impl Storage {
         }
 
         // 中文注释：这里直接按 owner_user_id 走索引取 key_id，避免把整张 api_key_owners 表拉回 Rust 再过滤。
-        let mut stmt = self.conn.prepare(
-            "SELECT key_id
-             FROM api_key_owners
-             WHERE owner_kind = 'user' AND owner_user_id = ?1
-             ORDER BY key_id ASC",
-        )?;
+        let mut stmt = self.conn.prepare(user_api_key_ids_for_user_sql())?;
         let rows = stmt.query_map([normalized_user_id], |row| row.get(0))?;
         rows.collect()
     }
@@ -886,28 +1090,13 @@ impl Storage {
     }
 
     pub fn list_billing_rules(&self) -> Result<Vec<BillingRule>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT
-                id, name, status, priority, multiplier_millis, model_pattern, service_tier,
-                user_id, project_id, api_key_id, starts_at, ends_at, created_at, updated_at
-             FROM billing_rules
-             ORDER BY status ASC, priority DESC, updated_at DESC, name ASC",
-        )?;
+        let mut stmt = self.conn.prepare(&billing_rule_list_sql())?;
         let rows = stmt.query_map([], map_billing_rule)?;
         rows.collect()
     }
 
     pub fn list_active_billing_rules(&self, now: i64) -> Result<Vec<BillingRule>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT
-                id, name, status, priority, multiplier_millis, model_pattern, service_tier,
-                user_id, project_id, api_key_id, starts_at, ends_at, created_at, updated_at
-             FROM billing_rules
-             WHERE status = 'active'
-               AND (starts_at IS NULL OR starts_at <= ?1)
-               AND (ends_at IS NULL OR ends_at > ?1)
-             ORDER BY priority DESC, updated_at DESC, name ASC",
-        )?;
+        let mut stmt = self.conn.prepare(&active_billing_rules_sql())?;
         let rows = stmt.query_map([now], map_billing_rule)?;
         rows.collect()
     }
@@ -927,24 +1116,7 @@ impl Storage {
         let normalized_user_id = normalize_optional_context_text(user_id);
         let normalized_project_id = normalize_optional_context_text(project_id);
         let normalized_service_tier = normalize_optional_context_text(service_tier);
-        let mut stmt = self.conn.prepare(
-            "SELECT
-                id, name, status, priority, multiplier_millis, model_pattern, service_tier,
-                user_id, project_id, api_key_id, starts_at, ends_at, created_at, updated_at
-             FROM billing_rules
-             WHERE status = 'active'
-               AND (starts_at IS NULL OR starts_at <= ?1)
-               AND (ends_at IS NULL OR ends_at > ?1)
-               AND (api_key_id IS NULL OR TRIM(api_key_id) = '' OR api_key_id = ?2)
-               AND (user_id IS NULL OR TRIM(user_id) = '' OR user_id = ?3)
-               AND (project_id IS NULL OR TRIM(project_id) = '' OR project_id = ?4)
-               AND (
-                    service_tier IS NULL
-                    OR TRIM(service_tier) = ''
-                    OR LOWER(TRIM(service_tier)) = LOWER(TRIM(?5))
-               )
-             ORDER BY priority DESC, updated_at DESC, name ASC",
-        )?;
+        let mut stmt = self.conn.prepare(&active_billing_rules_for_context_sql())?;
         let rows = stmt.query_map(
             (
                 now,
@@ -976,47 +1148,9 @@ impl Storage {
         let normalized_service_tier = normalize_optional_context_text(service_tier);
         let normalized_model = normalize_optional_context_text(model)
             .filter(|value| !value.eq_ignore_ascii_case("unknown"));
-        let mut stmt = self.conn.prepare(
-            "SELECT
-                id, name, status, priority, multiplier_millis, model_pattern, service_tier,
-                user_id, project_id, api_key_id, starts_at, ends_at, created_at, updated_at
-             FROM billing_rules
-             WHERE status = 'active'
-               AND (starts_at IS NULL OR starts_at <= ?1)
-               AND (ends_at IS NULL OR ends_at > ?1)
-               AND (api_key_id IS NULL OR TRIM(api_key_id) = '' OR api_key_id = ?2)
-               AND (user_id IS NULL OR TRIM(user_id) = '' OR user_id = ?3)
-               AND (project_id IS NULL OR TRIM(project_id) = '' OR project_id = ?4)
-               AND (
-                    service_tier IS NULL
-                    OR TRIM(service_tier) = ''
-                    OR LOWER(TRIM(service_tier)) = LOWER(TRIM(?5))
-               )
-               AND (
-                    model_pattern IS NULL
-                    OR TRIM(model_pattern) = ''
-                    OR TRIM(model_pattern) = '*'
-                    OR (
-                        ?6 <> ''
-                        AND (
-                            INSTR(model_pattern, '*') > 0
-                            OR LOWER(TRIM(model_pattern)) = LOWER(TRIM(?6))
-                            OR LOWER(TRIM(?6)) LIKE LOWER(TRIM(model_pattern)) || '%'
-                        )
-                    )
-               )
-             ORDER BY
-                priority DESC,
-                (
-                    CASE WHEN api_key_id IS NOT NULL AND TRIM(api_key_id) <> '' THEN 1 ELSE 0 END
-                  + CASE WHEN user_id IS NOT NULL AND TRIM(user_id) <> '' THEN 1 ELSE 0 END
-                  + CASE WHEN project_id IS NOT NULL AND TRIM(project_id) <> '' THEN 1 ELSE 0 END
-                  + CASE WHEN service_tier IS NOT NULL AND TRIM(service_tier) <> '' THEN 1 ELSE 0 END
-                  + CASE WHEN model_pattern IS NOT NULL AND TRIM(model_pattern) <> '' THEN 1 ELSE 0 END
-                ) DESC,
-                LENGTH(IFNULL(model_pattern, '')) DESC,
-                updated_at DESC",
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare(&active_billing_rules_for_request_candidate_sql())?;
         let rows = stmt.query_map(
             (
                 now,
@@ -1073,8 +1207,7 @@ impl Storage {
     }
 
     pub fn delete_billing_rule(&self, id: &str) -> Result<()> {
-        self.conn
-            .execute("DELETE FROM billing_rules WHERE id = ?1", [id])?;
+        self.conn.execute(delete_billing_rule_by_id_sql(), [id])?;
         Ok(())
     }
 
@@ -1111,6 +1244,24 @@ fn normalize_optional_context_text(value: Option<&str>) -> Option<String> {
 mod tests {
     use super::super::Storage;
     use super::super::{ApiKey, ApiKeyOwner, BillingRule};
+    use super::{
+        active_admin_count_sql, active_app_session_by_token_hash_sql,
+        active_app_session_user_with_wallet_sql, active_billing_rules_sql, api_key_owner_chunk_sql,
+        api_key_owner_rows_sql, app_user_access_summary_by_id_sql, app_user_access_summary_sql,
+        app_user_by_id_sql, app_user_by_username_sql, app_user_exists_sql, app_user_list_sql,
+        app_username_exists_sql, app_wallet_by_owner_sql, dashboard_app_user_summary_sql,
+        delete_api_key_owners_for_user_sql, delete_app_user_by_id_sql,
+        delete_app_user_sessions_for_user_sql,
+        delete_app_wallet_ledger_entries_for_user_wallets_sql, delete_app_wallets_for_user_sql,
+        delete_billing_rule_by_id_sql, delete_user_model_groups_for_user_sql,
+        member_app_user_count_sql, public_app_user_with_wallet_sql,
+        revoke_app_user_session_by_token_hash_sql, touch_app_user_session_sql,
+        update_app_user_display_name_sql, update_app_user_last_login_sql,
+        update_app_user_password_hash_sql, update_app_user_role_sql, update_app_user_status_sql,
+        user_api_key_ids_for_user_sql, user_wallet_available_credit_sql,
+        user_wallets_for_users_chunk_sql,
+    };
+    use rusqlite::{params_from_iter, types::Value};
 
     fn seed_api_key(storage: &Storage, key_id: &str) {
         storage
@@ -1163,8 +1314,12 @@ mod tests {
     }
 
     fn collect_query_plan(storage: &Storage, sql: &str) -> String {
+        collect_query_plan_with_params(storage, sql, Vec::new())
+    }
+
+    fn collect_query_plan_with_params(storage: &Storage, sql: &str, params: Vec<Value>) -> String {
         let mut stmt = storage.conn.prepare(sql).expect("prepare explain");
-        let mut rows = stmt.query([]).expect("query explain");
+        let mut rows = stmt.query(params_from_iter(params)).expect("query explain");
         let mut plan = String::new();
         while let Some(row) = rows.next().expect("read explain row") {
             let detail: String = row.get(3).expect("plan detail");
@@ -1181,15 +1336,10 @@ mod tests {
 
         let mut stmt = storage
             .conn
-            .prepare(
-                "EXPLAIN QUERY PLAN
-                 SELECT id
-                 FROM billing_rules
-                 WHERE status = 'active'
-                   AND (starts_at IS NULL OR starts_at <= ?1)
-                   AND (ends_at IS NULL OR ends_at > ?1)
-                 ORDER BY priority DESC, updated_at DESC, name ASC",
-            )
+            .prepare(&format!(
+                "EXPLAIN QUERY PLAN {}",
+                active_billing_rules_sql()
+            ))
             .expect("prepare explain");
         let mut rows = stmt.query([100_i64]).expect("query explain");
         let mut plan = String::new();
@@ -1280,6 +1430,183 @@ mod tests {
                 "expected created-by user delete path to use {expected_index}, got {plan}"
             );
         }
+    }
+
+    #[test]
+    fn app_session_token_paths_use_token_hash_index() {
+        let storage = Storage::open_in_memory().expect("open storage");
+        storage.init().expect("init storage");
+
+        let mut stmt = storage
+            .conn
+            .prepare(&format!(
+                "EXPLAIN QUERY PLAN {}",
+                active_app_session_by_token_hash_sql()
+            ))
+            .expect("prepare explain");
+        let mut rows = stmt.query(("token-hash", 100_i64)).expect("query explain");
+        let mut active_session_plan = String::new();
+        while let Some(row) = rows.next().expect("read explain row") {
+            let detail: String = row.get(3).expect("plan detail");
+            active_session_plan.push_str(&detail);
+            active_session_plan.push('\n');
+        }
+        assert!(
+            active_session_plan.contains("idx_app_user_sessions_token_hash")
+                || active_session_plan.contains("sqlite_autoindex_app_user_sessions_2"),
+            "expected active app session lookup to use token hash index, got {active_session_plan}"
+        );
+
+        let revoke_plan = collect_query_plan_with_params(
+            &storage,
+            &format!(
+                "EXPLAIN QUERY PLAN {}",
+                revoke_app_user_session_by_token_hash_sql()
+            ),
+            vec![Value::Integer(100), Value::Text("token-hash".to_string())],
+        );
+        assert!(
+            revoke_plan.contains("idx_app_user_sessions_token_hash")
+                || revoke_plan.contains("sqlite_autoindex_app_user_sessions_2"),
+            "expected app session token path to use token hash index, got {revoke_plan}"
+        );
+    }
+
+    #[test]
+    fn app_user_write_helpers_use_primary_key_indexes() {
+        let storage = Storage::open_in_memory().expect("open storage");
+        storage.init().expect("init storage");
+
+        for (label, sql, params, expected_index) in [
+            (
+                "app user exists",
+                app_user_exists_sql(),
+                vec![Value::Text("user-1".to_string())],
+                "sqlite_autoindex_app_users_1",
+            ),
+            (
+                "app user last login update",
+                update_app_user_last_login_sql(),
+                vec![Value::Integer(1), Value::Text("user-1".to_string())],
+                "sqlite_autoindex_app_users_1",
+            ),
+            (
+                "app user status update",
+                update_app_user_status_sql(),
+                vec![
+                    Value::Text("active".to_string()),
+                    Value::Integer(1),
+                    Value::Text("user-1".to_string()),
+                ],
+                "sqlite_autoindex_app_users_1",
+            ),
+            (
+                "app user role update",
+                update_app_user_role_sql(),
+                vec![
+                    Value::Text("member".to_string()),
+                    Value::Integer(1),
+                    Value::Text("user-1".to_string()),
+                ],
+                "sqlite_autoindex_app_users_1",
+            ),
+            (
+                "app user display name update",
+                update_app_user_display_name_sql(),
+                vec![
+                    Value::Text("User 1".to_string()),
+                    Value::Integer(1),
+                    Value::Text("user-1".to_string()),
+                ],
+                "sqlite_autoindex_app_users_1",
+            ),
+            (
+                "app user password hash update",
+                update_app_user_password_hash_sql(),
+                vec![
+                    Value::Text("hash".to_string()),
+                    Value::Integer(1),
+                    Value::Text("user-1".to_string()),
+                ],
+                "sqlite_autoindex_app_users_1",
+            ),
+            (
+                "app user session touch",
+                touch_app_user_session_sql(),
+                vec![Value::Integer(1), Value::Text("session-1".to_string())],
+                "sqlite_autoindex_app_user_sessions_1",
+            ),
+            (
+                "billing rule delete",
+                delete_billing_rule_by_id_sql(),
+                vec![Value::Text("rule-1".to_string())],
+                "sqlite_autoindex_billing_rules_1",
+            ),
+        ] {
+            let plan = collect_query_plan_with_params(
+                &storage,
+                &format!("EXPLAIN QUERY PLAN {sql}"),
+                params,
+            );
+            assert!(
+                plan.contains(expected_index),
+                "expected {label} to use {expected_index}, got {plan}"
+            );
+        }
+    }
+
+    #[test]
+    fn app_user_delete_dependent_paths_use_lookup_indexes() {
+        let storage = Storage::open_in_memory().expect("open storage");
+        storage.init().expect("init storage");
+
+        let user_id = Value::Text("user-1".to_string());
+        for (sql, expected_index) in [
+            (
+                delete_api_key_owners_for_user_sql(),
+                "idx_api_key_owners_user_key_lookup",
+            ),
+            (
+                delete_app_user_sessions_for_user_sql(),
+                "idx_app_user_sessions_user_id",
+            ),
+            (
+                delete_user_model_groups_for_user_sql(),
+                "idx_user_model_groups_user_status",
+            ),
+            (
+                delete_app_wallets_for_user_sql(),
+                "sqlite_autoindex_app_wallets_2",
+            ),
+            (delete_app_user_by_id_sql(), "sqlite_autoindex_app_users_1"),
+        ] {
+            let plan = collect_query_plan_with_params(
+                &storage,
+                &format!("EXPLAIN QUERY PLAN {sql}"),
+                vec![user_id.clone()],
+            );
+            assert!(
+                plan.contains(expected_index),
+                "expected app user dependent path to use {expected_index}, got {plan}"
+            );
+        }
+
+        let ledger_plan = collect_query_plan_with_params(
+            &storage,
+            &format!(
+                "EXPLAIN QUERY PLAN {}",
+                delete_app_wallet_ledger_entries_for_user_wallets_sql()
+            ),
+            vec![user_id],
+        );
+        assert!(
+            ledger_plan.contains("idx_app_wallet_ledger_wallet_created"),
+            "expected app wallet ledger cleanup to use wallet lookup index, got {ledger_plan}"
+        );
+        assert!(
+            ledger_plan.contains("sqlite_autoindex_app_wallets_2"),
+            "expected app wallet ledger cleanup to use owner lookup subquery, got {ledger_plan}"
+        );
     }
 
     fn billing_rule(id: &str) -> BillingRule {
@@ -1444,11 +1771,7 @@ mod tests {
         let plan = storage
             .conn
             .query_row(
-                "EXPLAIN QUERY PLAN
-                 SELECT id
-                 FROM app_users
-                 WHERE lower(username) = lower(?1)
-                 LIMIT 1",
+                &format!("EXPLAIN QUERY PLAN {}", app_user_by_username_sql()),
                 ["member@example.com"],
                 |row| row.get::<_, String>(3),
             )
@@ -1457,6 +1780,37 @@ mod tests {
         assert!(
             plan.contains("idx_app_users_lower_username"),
             "expected lower username index in plan, got {plan}"
+        );
+
+        let exists_plan = collect_query_plan_with_params(
+            &storage,
+            &format!("EXPLAIN QUERY PLAN {}", app_username_exists_sql()),
+            vec![Value::Text("member@example.com".to_string())],
+        );
+
+        assert!(
+            exists_plan.contains("idx_app_users_lower_username"),
+            "expected username exists helper to use lower username index, got {exists_plan}"
+        );
+    }
+
+    #[test]
+    fn app_user_id_lookup_uses_primary_key_index() {
+        let storage = Storage::open_in_memory().expect("open storage");
+        storage.init().expect("init storage");
+
+        let plan = storage
+            .conn
+            .query_row(
+                &format!("EXPLAIN QUERY PLAN {}", app_user_by_id_sql()),
+                ["user-1"],
+                |row| row.get::<_, String>(3),
+            )
+            .expect("explain plan");
+
+        assert!(
+            plan.contains("sqlite_autoindex_app_users"),
+            "expected app user id lookup to use primary key index, got {plan}"
         );
     }
 
@@ -1468,11 +1822,7 @@ mod tests {
         let plan = storage
             .conn
             .query_row(
-                "EXPLAIN QUERY PLAN
-                 SELECT key_id
-                 FROM api_key_owners
-                 WHERE owner_kind = 'user' AND owner_user_id = ?1
-                 ORDER BY key_id ASC",
+                &format!("EXPLAIN QUERY PLAN {}", user_api_key_ids_for_user_sql()),
                 ["user-1"],
                 |row| row.get::<_, String>(3),
             )
@@ -1491,11 +1841,7 @@ mod tests {
 
         let plan = collect_query_plan(
             &storage,
-            "EXPLAIN QUERY PLAN
-             SELECT id, username, display_name, password_hash, role, status,
-                    created_at, updated_at, last_login_at
-             FROM app_users
-             ORDER BY created_at ASC, username ASC",
+            &format!("EXPLAIN QUERY PLAN {}", app_user_list_sql()),
         );
 
         assert!(
@@ -1506,6 +1852,22 @@ mod tests {
             !plan.contains("USE TEMP B-TREE FOR ORDER BY"),
             "app user list query should avoid temp sorting, got {plan}"
         );
+    }
+    #[test]
+    fn app_user_role_count_queries_use_role_status_index() {
+        let storage = Storage::open_in_memory().expect("open storage");
+        storage.init().expect("init storage");
+
+        for (label, sql) in [
+            ("member app user count", member_app_user_count_sql()),
+            ("active admin count", active_admin_count_sql()),
+        ] {
+            let plan = collect_query_plan(&storage, &format!("EXPLAIN QUERY PLAN {sql}"));
+            assert!(
+                plan.contains("idx_app_users_role_status"),
+                "{label} should use role/status index, got {plan}"
+            );
+        }
     }
 
     #[test]
@@ -1550,42 +1912,64 @@ mod tests {
 
         let dashboard_users_plan = collect_query_plan(
             &storage,
-            "EXPLAIN QUERY PLAN
-             SELECT
-                u.id,
-                u.username,
-                u.display_name,
-                u.role,
-                u.status
-             FROM app_users u
-             WHERE u.id IN ('user-a', 'user-b')",
+            &format!(
+                "EXPLAIN QUERY PLAN {}",
+                dashboard_app_user_summary_sql(Some("u.id IN ('user-a', 'user-b')"))
+            ),
         );
         let access_users_plan = collect_query_plan(
             &storage,
-            "EXPLAIN QUERY PLAN
-             SELECT id, username, role, status
-             FROM app_users
-             WHERE id IN ('user-a', 'user-b')",
+            &format!(
+                "EXPLAIN QUERY PLAN {}",
+                app_user_access_summary_sql("id IN ('user-a', 'user-b')")
+            ),
         );
         let api_key_owners_plan = collect_query_plan(
             &storage,
-            "EXPLAIN QUERY PLAN
-             SELECT key_id, owner_kind, owner_user_id, project_id, updated_at
-             FROM api_key_owners
-             WHERE key_id IN ('key-a', 'key-b')",
+            &format!(
+                "EXPLAIN QUERY PLAN {}",
+                api_key_owner_chunk_sql("key_id IN ('key-a', 'key-b')")
+            ),
+        );
+        let user_wallets_plan = collect_query_plan(
+            &storage,
+            &format!(
+                "EXPLAIN QUERY PLAN {}",
+                user_wallets_for_users_chunk_sql("owner_id IN ('user-a', 'user-b')")
+            ),
         );
 
         assert!(
+            dashboard_users_plan.contains("sqlite_autoindex_app_users"),
+            "expected dashboard user chunk query to use app user id lookup index, got {dashboard_users_plan}"
+        );
+        assert!(
             !dashboard_users_plan.contains("USE TEMP B-TREE FOR ORDER BY"),
             "dashboard user chunk query should avoid per-chunk ORDER BY temp sorting, got {dashboard_users_plan}"
+        );
+        assert!(
+            access_users_plan.contains("sqlite_autoindex_app_users"),
+            "expected access user chunk query to use app user id lookup index, got {access_users_plan}"
         );
         assert!(
             !access_users_plan.contains("USE TEMP B-TREE FOR ORDER BY"),
             "access user chunk query should avoid per-chunk ORDER BY temp sorting, got {access_users_plan}"
         );
         assert!(
+            api_key_owners_plan.contains("sqlite_autoindex_api_key_owners"),
+            "expected API key owner chunk query to use key owner lookup index, got {api_key_owners_plan}"
+        );
+        assert!(
             !api_key_owners_plan.contains("USE TEMP B-TREE FOR ORDER BY"),
             "API key owner chunk query should avoid per-chunk ORDER BY temp sorting, got {api_key_owners_plan}"
+        );
+        assert!(
+            user_wallets_plan.contains("sqlite_autoindex_app_wallets"),
+            "expected user wallet chunk query to use wallet owner lookup index, got {user_wallets_plan}"
+        );
+        assert!(
+            !user_wallets_plan.contains("USE TEMP B-TREE FOR ORDER BY"),
+            "user wallet chunk query should avoid per-chunk ORDER BY temp sorting, got {user_wallets_plan}"
         );
     }
 
@@ -1643,6 +2027,19 @@ mod tests {
         assert_eq!(owners[1].key_id, "key-b");
         assert_eq!(owners[1].owner_kind, "user");
         assert_eq!(owners[1].owner_user_id.as_deref(), Some("user-b"));
+
+        let plan = collect_query_plan(
+            &storage,
+            &format!("EXPLAIN QUERY PLAN {}", api_key_owner_rows_sql()),
+        );
+        assert!(
+            plan.contains("sqlite_autoindex_api_key_owners"),
+            "expected ordered API key owner rows to scan key owner primary key, got {plan}"
+        );
+        assert!(
+            !plan.contains("USE TEMP B-TREE FOR ORDER BY"),
+            "ordered API key owner rows should avoid temp sorting, got {plan}"
+        );
     }
 
     #[test]
@@ -1952,6 +2349,19 @@ mod tests {
             .find_app_user_access_summary_by_id("missing")
             .expect("read missing access user")
             .is_none());
+
+        let plan = storage
+            .conn
+            .query_row(
+                &format!("EXPLAIN QUERY PLAN {}", app_user_access_summary_by_id_sql()),
+                ["user-1"],
+                |row| row.get::<_, String>(3),
+            )
+            .expect("explain plan");
+        assert!(
+            plan.contains("sqlite_autoindex_app_users"),
+            "expected app user access summary lookup to use primary key index, got {plan}"
+        );
     }
 
     #[test]
@@ -2001,6 +2411,22 @@ mod tests {
         assert_eq!(users[0].wallet_frozen_credit_micros, Some(125));
         assert_eq!(users[1].id, "user-2");
         assert_eq!(users[1].wallet_id, None);
+
+        let plan = collect_query_plan(
+            &storage,
+            &format!(
+                "EXPLAIN QUERY PLAN {}",
+                public_app_user_with_wallet_sql(None, true)
+            ),
+        );
+        assert!(
+            plan.contains("idx_app_users_list_order"),
+            "expected public app user list to use app user list-order index, got {plan}"
+        );
+        assert!(
+            !plan.contains("USE TEMP B-TREE FOR ORDER BY"),
+            "public app user list should avoid temp sorting, got {plan}"
+        );
     }
 
     #[test]
@@ -2053,6 +2479,16 @@ mod tests {
             .find_public_app_user_with_wallet_by_id("missing")
             .expect("read missing public user")
             .is_none());
+
+        let sql = format!(
+            "{}\n         LIMIT 1",
+            public_app_user_with_wallet_sql(Some("u.id = 'user-1'"), false)
+        );
+        let plan = collect_query_plan(&storage, &format!("EXPLAIN QUERY PLAN {sql}"));
+        assert!(
+            plan.contains("sqlite_autoindex_app_users"),
+            "expected public app user lookup to use app user primary-key index, got {plan}"
+        );
     }
 
     #[test]
@@ -2132,6 +2568,30 @@ mod tests {
                 .expect("find inactive session")
                 .is_none());
         }
+
+        let mut stmt = storage
+            .conn
+            .prepare(&format!(
+                "EXPLAIN QUERY PLAN {}",
+                active_app_session_user_with_wallet_sql()
+            ))
+            .expect("prepare explain");
+        let mut rows = stmt.query(("hash-active", 50_i64)).expect("query explain");
+        let mut plan = String::new();
+        while let Some(row) = rows.next().expect("read explain row") {
+            let detail: String = row.get(3).expect("plan detail");
+            plan.push_str(&detail);
+            plan.push('\n');
+        }
+        assert!(
+            plan.contains("idx_app_user_sessions_token_hash")
+                || plan.contains("sqlite_autoindex_app_user_sessions_2"),
+            "expected active session user lookup to use token hash index, got {plan}"
+        );
+        assert!(
+            plan.contains("sqlite_autoindex_app_users"),
+            "expected active session user lookup to join app users by primary key, got {plan}"
+        );
     }
 
     #[test]
@@ -2209,10 +2669,7 @@ mod tests {
         let plan = storage
             .conn
             .query_row(
-                "EXPLAIN QUERY PLAN
-                 SELECT owner_id, balance_credit_micros - frozen_credit_micros
-                 FROM app_wallets
-                 WHERE owner_kind = 'user'",
+                &format!("EXPLAIN QUERY PLAN {}", user_wallet_available_credit_sql()),
                 [],
                 |row| row.get::<_, String>(3),
             )
@@ -2221,6 +2678,26 @@ mod tests {
         assert!(
             plan.contains("sqlite_autoindex_app_wallets_2"),
             "expected wallet unique owner index in plan, got {plan}"
+        );
+    }
+
+    #[test]
+    fn wallet_owner_lookup_uses_unique_owner_index() {
+        let storage = Storage::open_in_memory().expect("open storage");
+        storage.init().expect("init storage");
+
+        let plan = storage
+            .conn
+            .query_row(
+                &format!("EXPLAIN QUERY PLAN {}", app_wallet_by_owner_sql()),
+                ("user", "user-1"),
+                |row| row.get::<_, String>(3),
+            )
+            .expect("explain plan");
+
+        assert!(
+            plan.contains("sqlite_autoindex_app_wallets_2"),
+            "expected wallet owner lookup to use unique owner index, got {plan}"
         );
     }
 }

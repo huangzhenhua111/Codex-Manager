@@ -2,6 +2,10 @@ use rusqlite::{params, params_from_iter, types::Value, Result, Row};
 use std::collections::HashMap;
 
 use super::key_id_filters::{normalize_text_ids, text_id_in_clause, SQLITE_IN_CLAUSE_BATCH_SIZE};
+use super::model_sources::{
+    delete_model_source_mapping_preferences_for_source_sql,
+    delete_model_source_mappings_for_source_sql, delete_model_source_models_for_source_sql,
+};
 use super::{
     now_ts, AggregateApi, AggregateApiDashboardSourceMetadata, AggregateApiListSnapshot,
     AggregateApiListSummary, AggregateApiOverviewStats, AggregateApiQuotaSourceSummary,
@@ -36,6 +40,193 @@ const AGGREGATE_API_SELECT_SQL: &str = "SELECT
     last_balance_json
  FROM aggregate_apis";
 const AGGREGATE_API_MODEL_SOURCE_KIND: &str = "aggregate_api";
+const AGGREGATE_API_ACTIVE_STATUS_CONDITION: &str = "LOWER(TRIM(COALESCE(status, ''))) = 'active'";
+const AGGREGATE_API_NORMALIZED_PROVIDER_SQL: &str =
+    "REPLACE(LOWER(TRIM(COALESCE(provider_type, ''))), '-', '_')";
+
+fn aggregate_api_by_id_sql() -> String {
+    format!(
+        "{AGGREGATE_API_SELECT_SQL}
+         WHERE id = ?1
+         LIMIT 1"
+    )
+}
+
+fn aggregate_api_with_secrets_by_id_sql() -> &'static str {
+    "SELECT
+        a.id,
+        a.provider_type,
+        a.supplier_name,
+        a.sort,
+        a.url,
+        a.auth_type,
+        a.auth_params_json,
+        a.action,
+        a.model_override,
+        a.status,
+        a.created_at,
+        a.updated_at,
+        a.last_test_at,
+        a.last_test_status,
+        a.last_test_error,
+        a.balance_query_enabled,
+        a.balance_query_template,
+        a.balance_query_base_url,
+        a.balance_query_user_id,
+        a.balance_query_config_json,
+        a.last_balance_at,
+        a.last_balance_status,
+        a.last_balance_error,
+        a.last_balance_json,
+        s.secret_value,
+        bs.access_token
+     FROM aggregate_apis a
+     LEFT JOIN aggregate_api_secrets s ON s.aggregate_api_id = a.id
+     LEFT JOIN aggregate_api_balance_secrets bs ON bs.aggregate_api_id = a.id
+     WHERE a.id = ?1
+     LIMIT 1"
+}
+
+fn aggregate_api_status_by_id_sql() -> &'static str {
+    "SELECT status
+     FROM aggregate_apis
+     WHERE id = ?1
+     LIMIT 1"
+}
+
+fn aggregate_api_auth_type_by_id_sql() -> &'static str {
+    "SELECT auth_type
+     FROM aggregate_apis
+     WHERE id = ?1
+     LIMIT 1"
+}
+
+fn aggregate_api_secret_config_by_id_sql() -> &'static str {
+    "SELECT a.auth_type, s.secret_value
+     FROM aggregate_apis a
+     LEFT JOIN aggregate_api_secrets s ON s.aggregate_api_id = a.id
+     WHERE a.id = ?1
+     LIMIT 1"
+}
+
+fn aggregate_api_update_config_by_id_sql() -> &'static str {
+    "SELECT
+        auth_type,
+        balance_query_enabled,
+        balance_query_template,
+        balance_query_base_url,
+        balance_query_user_id,
+        balance_query_config_json
+     FROM aggregate_apis
+     WHERE id = ?1
+     LIMIT 1"
+}
+
+fn update_aggregate_api_url_sql() -> &'static str {
+    "UPDATE aggregate_apis SET url = ?1, updated_at = ?2 WHERE id = ?3"
+}
+
+fn update_aggregate_api_supplier_name_sql() -> &'static str {
+    "UPDATE aggregate_apis SET supplier_name = ?1, updated_at = ?2 WHERE id = ?3"
+}
+
+fn update_aggregate_api_sort_sql() -> &'static str {
+    "UPDATE aggregate_apis SET sort = ?1, updated_at = ?2 WHERE id = ?3"
+}
+
+fn update_aggregate_api_status_sql() -> &'static str {
+    "UPDATE aggregate_apis SET status = ?1, updated_at = ?2 WHERE id = ?3"
+}
+
+fn update_aggregate_api_provider_type_sql() -> &'static str {
+    "UPDATE aggregate_apis SET provider_type = ?1, updated_at = ?2 WHERE id = ?3"
+}
+
+fn update_aggregate_api_auth_type_sql() -> &'static str {
+    "UPDATE aggregate_apis SET auth_type = ?1, updated_at = ?2 WHERE id = ?3"
+}
+
+fn update_aggregate_api_auth_params_json_sql() -> &'static str {
+    "UPDATE aggregate_apis SET auth_params_json = ?1, updated_at = ?2 WHERE id = ?3"
+}
+
+fn update_aggregate_api_action_sql() -> &'static str {
+    "UPDATE aggregate_apis SET action = ?1, updated_at = ?2 WHERE id = ?3"
+}
+
+fn update_aggregate_api_model_override_sql() -> &'static str {
+    "UPDATE aggregate_apis SET model_override = ?1, updated_at = ?2 WHERE id = ?3"
+}
+
+fn update_aggregate_api_balance_query_sql() -> &'static str {
+    "UPDATE aggregate_apis
+     SET balance_query_enabled = ?1,
+         balance_query_template = ?2,
+         balance_query_base_url = ?3,
+         balance_query_user_id = ?4,
+         balance_query_config_json = ?5,
+         updated_at = ?6
+     WHERE id = ?7"
+}
+
+fn update_aggregate_api_balance_result_sql() -> &'static str {
+    "UPDATE aggregate_apis
+     SET last_balance_at = ?1,
+         last_balance_status = ?2,
+         last_balance_error = ?3,
+         last_balance_json = ?4,
+         updated_at = ?1
+     WHERE id = ?5"
+}
+
+fn update_aggregate_api_test_result_sql() -> &'static str {
+    "UPDATE aggregate_apis
+     SET last_test_at = ?1,
+         last_test_status = ?2,
+         last_test_error = ?3,
+         updated_at = ?1
+     WHERE id = ?4"
+}
+
+fn update_aggregate_api_last_test_error_sql() -> &'static str {
+    "UPDATE aggregate_apis SET last_test_error = ?1 WHERE id = ?2"
+}
+
+fn delete_aggregate_api_by_id_sql() -> &'static str {
+    "DELETE FROM aggregate_apis WHERE id = ?1"
+}
+
+fn delete_aggregate_api_secret_by_id_sql() -> &'static str {
+    "DELETE FROM aggregate_api_secrets WHERE aggregate_api_id = ?1"
+}
+
+fn delete_aggregate_api_balance_secret_by_id_sql() -> &'static str {
+    "DELETE FROM aggregate_api_balance_secrets WHERE aggregate_api_id = ?1"
+}
+
+fn delete_aggregate_api_supplier_model_sql() -> &'static str {
+    "DELETE FROM aggregate_api_supplier_models
+     WHERE supplier_key = ?1 AND provider_type = ?2 AND upstream_model = ?3"
+}
+
+fn aggregate_api_exists_sql() -> &'static str {
+    "SELECT EXISTS(SELECT 1 FROM aggregate_apis WHERE id = ?1)"
+}
+
+fn aggregate_api_supplier_identity_by_id_sql() -> &'static str {
+    "SELECT id, provider_type, supplier_name, url
+     FROM aggregate_apis
+     WHERE id = ?1
+     LIMIT 1"
+}
+
+fn aggregate_api_secret_by_id_sql() -> &'static str {
+    "SELECT secret_value FROM aggregate_api_secrets WHERE aggregate_api_id = ?1 LIMIT 1"
+}
+
+fn aggregate_api_balance_secret_by_id_sql() -> &'static str {
+    "SELECT access_token FROM aggregate_api_balance_secrets WHERE aggregate_api_id = ?1 LIMIT 1"
+}
 
 impl Storage {
     /// 函数 `insert_aggregate_api`
@@ -120,9 +311,8 @@ impl Storage {
     /// # 返回
     /// 返回函数执行结果
     pub fn list_aggregate_apis(&self) -> Result<Vec<AggregateApi>> {
-        let mut stmt = self.conn.prepare(&format!(
-            "{AGGREGATE_API_SELECT_SQL} ORDER BY sort ASC, updated_at DESC"
-        ))?;
+        let sql = aggregate_api_list_sql();
+        let mut stmt = self.conn.prepare(&sql)?;
         let mut rows = stmt.query([])?;
         let mut out = Vec::new();
         while let Some(row) = rows.next()? {
@@ -132,35 +322,8 @@ impl Storage {
     }
 
     pub fn list_aggregate_api_summaries(&self) -> Result<Vec<AggregateApiListSummary>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT
-                id,
-                provider_type,
-                supplier_name,
-                sort,
-                url,
-                auth_type,
-                auth_params_json,
-                action,
-                model_override,
-                status,
-                created_at,
-                updated_at,
-                last_test_at,
-                last_test_status,
-                last_test_error,
-                balance_query_enabled,
-                balance_query_template,
-                balance_query_base_url,
-                balance_query_user_id,
-                balance_query_config_json,
-                last_balance_at,
-                last_balance_status,
-                last_balance_error,
-                last_balance_json
-             FROM aggregate_apis
-             ORDER BY sort ASC, updated_at DESC",
-        )?;
+        let sql = aggregate_api_list_sql();
+        let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map([], map_aggregate_api_list_summary_row)?;
         rows.collect()
     }
@@ -191,11 +354,8 @@ impl Storage {
     /// # 返回
     /// 返回函数执行结果
     pub fn find_aggregate_api_by_id(&self, api_id: &str) -> Result<Option<AggregateApi>> {
-        let mut stmt = self.conn.prepare(&format!(
-            "{AGGREGATE_API_SELECT_SQL}
-             WHERE id = ?1
-             LIMIT 1"
-        ))?;
+        let sql = aggregate_api_by_id_sql();
+        let mut stmt = self.conn.prepare(&sql)?;
         let mut rows = stmt.query([api_id])?;
         if let Some(row) = rows.next()? {
             Ok(Some(map_aggregate_api_row(row)?))
@@ -208,40 +368,7 @@ impl Storage {
         &self,
         api_id: &str,
     ) -> Result<Option<AggregateApiWithSecrets>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT
-                a.id,
-                a.provider_type,
-                a.supplier_name,
-                a.sort,
-                a.url,
-                a.auth_type,
-                a.auth_params_json,
-                a.action,
-                a.model_override,
-                a.status,
-                a.created_at,
-                a.updated_at,
-                a.last_test_at,
-                a.last_test_status,
-                a.last_test_error,
-                a.balance_query_enabled,
-                a.balance_query_template,
-                a.balance_query_base_url,
-                a.balance_query_user_id,
-                a.balance_query_config_json,
-                a.last_balance_at,
-                a.last_balance_status,
-                a.last_balance_error,
-                a.last_balance_json,
-                s.secret_value,
-                bs.access_token
-             FROM aggregate_apis a
-             LEFT JOIN aggregate_api_secrets s ON s.aggregate_api_id = a.id
-             LEFT JOIN aggregate_api_balance_secrets bs ON bs.aggregate_api_id = a.id
-             WHERE a.id = ?1
-             LIMIT 1",
-        )?;
+        let mut stmt = self.conn.prepare(aggregate_api_with_secrets_by_id_sql())?;
         let mut rows = stmt.query([api_id])?;
         if let Some(row) = rows.next()? {
             Ok(Some(map_aggregate_api_with_secrets_row(row)?))
@@ -251,12 +378,7 @@ impl Storage {
     }
 
     pub fn find_aggregate_api_status_by_id(&self, api_id: &str) -> Result<Option<String>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT status
-             FROM aggregate_apis
-             WHERE id = ?1
-             LIMIT 1",
-        )?;
+        let mut stmt = self.conn.prepare(aggregate_api_status_by_id_sql())?;
         let mut rows = stmt.query([api_id])?;
         if let Some(row) = rows.next()? {
             Ok(Some(row.get(0)?))
@@ -266,12 +388,7 @@ impl Storage {
     }
 
     pub fn find_aggregate_api_auth_type_by_id(&self, api_id: &str) -> Result<Option<String>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT auth_type
-             FROM aggregate_apis
-             WHERE id = ?1
-             LIMIT 1",
-        )?;
+        let mut stmt = self.conn.prepare(aggregate_api_auth_type_by_id_sql())?;
         let mut rows = stmt.query([api_id])?;
         if let Some(row) = rows.next()? {
             Ok(Some(row.get(0)?))
@@ -284,13 +401,7 @@ impl Storage {
         &self,
         api_id: &str,
     ) -> Result<Option<AggregateApiSecretConfig>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT a.auth_type, s.secret_value
-             FROM aggregate_apis a
-             LEFT JOIN aggregate_api_secrets s ON s.aggregate_api_id = a.id
-             WHERE a.id = ?1
-             LIMIT 1",
-        )?;
+        let mut stmt = self.conn.prepare(aggregate_api_secret_config_by_id_sql())?;
         let mut rows = stmt.query([api_id])?;
         if let Some(row) = rows.next()? {
             Ok(Some(AggregateApiSecretConfig {
@@ -306,18 +417,7 @@ impl Storage {
         &self,
         api_id: &str,
     ) -> Result<Option<AggregateApiUpdateConfig>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT
-                auth_type,
-                balance_query_enabled,
-                balance_query_template,
-                balance_query_base_url,
-                balance_query_user_id,
-                balance_query_config_json
-             FROM aggregate_apis
-             WHERE id = ?1
-             LIMIT 1",
-        )?;
+        let mut stmt = self.conn.prepare(aggregate_api_update_config_by_id_sql())?;
         let mut rows = stmt.query([api_id])?;
         if let Some(row) = rows.next()? {
             Ok(Some(AggregateApiUpdateConfig {
@@ -334,23 +434,17 @@ impl Storage {
     }
 
     pub fn aggregate_api_exists(&self, api_id: &str) -> Result<bool> {
-        self.conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM aggregate_apis WHERE id = ?1)",
-            [api_id],
-            |row| row.get(0),
-        )
+        self.conn
+            .query_row(aggregate_api_exists_sql(), [api_id], |row| row.get(0))
     }
 
     pub fn find_aggregate_api_supplier_identity_by_id(
         &self,
         api_id: &str,
     ) -> Result<Option<AggregateApiSupplierIdentity>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, provider_type, supplier_name, url
-             FROM aggregate_apis
-             WHERE id = ?1
-             LIMIT 1",
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare(aggregate_api_supplier_identity_by_id_sql())?;
         let mut rows = stmt.query([api_id])?;
         if let Some(row) = rows.next()? {
             Ok(Some(AggregateApiSupplierIdentity {
@@ -408,9 +502,7 @@ impl Storage {
     }
 
     pub fn list_aggregate_api_ids(&self) -> Result<Vec<String>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT id FROM aggregate_apis ORDER BY sort ASC, updated_at DESC, id ASC")?;
+        let mut stmt = self.conn.prepare(aggregate_api_list_ids_sql())?;
         let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
         rows.collect()
     }
@@ -418,44 +510,23 @@ impl Storage {
     pub fn list_aggregate_api_quota_source_summaries(
         &self,
     ) -> Result<Vec<AggregateApiQuotaSourceSummary>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT
-                id,
-                provider_type,
-                supplier_name,
-                url,
-                status,
-                balance_query_enabled,
-                last_balance_at,
-                last_balance_status,
-                last_balance_error,
-                last_balance_json
-             FROM aggregate_apis
-             ORDER BY sort ASC, updated_at DESC, id ASC",
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare(aggregate_api_quota_source_summaries_list_sql())?;
         let rows = stmt.query_map([], map_aggregate_api_quota_source_summary_row)?;
         rows.collect()
     }
 
     pub fn list_active_balance_query_aggregate_api_ids(&self) -> Result<Vec<String>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id
-             FROM aggregate_apis
-             WHERE balance_query_enabled = 1
-               AND LOWER(TRIM(COALESCE(status, ''))) = 'active'
-             ORDER BY sort ASC, updated_at DESC, id ASC",
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare(active_balance_query_aggregate_api_ids_sql())?;
         let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
         rows.collect()
     }
 
     pub fn list_balance_query_aggregate_api_ids(&self) -> Result<Vec<String>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id
-             FROM aggregate_apis
-             WHERE balance_query_enabled = 1
-             ORDER BY sort ASC, updated_at DESC, id ASC",
-        )?;
+        let mut stmt = self.conn.prepare(balance_query_aggregate_api_ids_sql())?;
         let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
         rows.collect()
     }
@@ -485,22 +556,13 @@ impl Storage {
     }
 
     pub fn list_active_aggregate_api_ids(&self) -> Result<Vec<String>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id
-             FROM aggregate_apis
-             WHERE LOWER(TRIM(COALESCE(status, ''))) = 'active'
-             ORDER BY sort ASC, created_at DESC, id ASC",
-        )?;
+        let mut stmt = self.conn.prepare(active_aggregate_api_ids_sql())?;
         let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
         rows.collect()
     }
 
     pub fn list_active_aggregate_apis(&self) -> Result<Vec<AggregateApi>> {
-        let mut stmt = self.conn.prepare(&format!(
-            "{AGGREGATE_API_SELECT_SQL}
-             WHERE LOWER(TRIM(COALESCE(status, ''))) = 'active'
-             ORDER BY sort ASC, created_at DESC, id ASC"
-        ))?;
+        let mut stmt = self.conn.prepare(&active_aggregate_api_select_sql(None))?;
         let mut rows = stmt.query([])?;
         let mut out = Vec::new();
         while let Some(row) = rows.next()? {
@@ -519,12 +581,7 @@ impl Storage {
             return Ok(Vec::new());
         };
 
-        let sql = format!(
-            "{AGGREGATE_API_SELECT_SQL}
-             WHERE LOWER(TRIM(COALESCE(status, ''))) = 'active'
-               AND {provider_condition}
-             ORDER BY sort ASC, created_at DESC, id ASC"
-        );
+        let sql = active_aggregate_api_select_sql(Some(&provider_condition));
         let mut stmt = self.conn.prepare(&sql)?;
         let mut rows = stmt.query(params_from_iter(params))?;
         let mut out = Vec::new();
@@ -560,13 +617,7 @@ impl Storage {
     }
 
     pub fn list_aggregate_api_balance_jsons(&self) -> Result<Vec<String>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT last_balance_json
-             FROM aggregate_apis
-             WHERE last_balance_json IS NOT NULL
-               AND TRIM(last_balance_json) <> ''
-             ORDER BY sort ASC, updated_at DESC, id ASC",
-        )?;
+        let mut stmt = self.conn.prepare(aggregate_api_balance_jsons_list_sql())?;
         let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
         rows.collect()
     }
@@ -585,10 +636,8 @@ impl Storage {
     /// # 返回
     /// 返回函数执行结果
     pub fn update_aggregate_api(&self, api_id: &str, url: &str) -> Result<()> {
-        self.conn.execute(
-            "UPDATE aggregate_apis SET url = ?1, updated_at = ?2 WHERE id = ?3",
-            (url, now_ts(), api_id),
-        )?;
+        self.conn
+            .execute(update_aggregate_api_url_sql(), (url, now_ts(), api_id))?;
         Ok(())
     }
 
@@ -611,7 +660,7 @@ impl Storage {
         supplier_name: Option<&str>,
     ) -> Result<()> {
         self.conn.execute(
-            "UPDATE aggregate_apis SET supplier_name = ?1, updated_at = ?2 WHERE id = ?3",
+            update_aggregate_api_supplier_name_sql(),
             (supplier_name, now_ts(), api_id),
         )?;
         Ok(())
@@ -631,16 +680,14 @@ impl Storage {
     /// # 返回
     /// 返回函数执行结果
     pub fn update_aggregate_api_sort(&self, api_id: &str, sort: i64) -> Result<()> {
-        self.conn.execute(
-            "UPDATE aggregate_apis SET sort = ?1, updated_at = ?2 WHERE id = ?3",
-            (sort, now_ts(), api_id),
-        )?;
+        self.conn
+            .execute(update_aggregate_api_sort_sql(), (sort, now_ts(), api_id))?;
         Ok(())
     }
 
     pub fn update_aggregate_api_status(&self, api_id: &str, status: &str) -> Result<()> {
         self.conn.execute(
-            "UPDATE aggregate_apis SET status = ?1, updated_at = ?2 WHERE id = ?3",
+            update_aggregate_api_status_sql(),
             (status, now_ts(), api_id),
         )?;
         Ok(())
@@ -661,7 +708,7 @@ impl Storage {
     /// 返回函数执行结果
     pub fn update_aggregate_api_type(&self, api_id: &str, provider_type: &str) -> Result<()> {
         self.conn.execute(
-            "UPDATE aggregate_apis SET provider_type = ?1, updated_at = ?2 WHERE id = ?3",
+            update_aggregate_api_provider_type_sql(),
             (provider_type, now_ts(), api_id),
         )?;
         Ok(())
@@ -669,7 +716,7 @@ impl Storage {
 
     pub fn update_aggregate_api_auth_type(&self, api_id: &str, auth_type: &str) -> Result<()> {
         self.conn.execute(
-            "UPDATE aggregate_apis SET auth_type = ?1, updated_at = ?2 WHERE id = ?3",
+            update_aggregate_api_auth_type_sql(),
             (auth_type, now_ts(), api_id),
         )?;
         Ok(())
@@ -681,7 +728,7 @@ impl Storage {
         auth_params_json: Option<&str>,
     ) -> Result<()> {
         self.conn.execute(
-            "UPDATE aggregate_apis SET auth_params_json = ?1, updated_at = ?2 WHERE id = ?3",
+            update_aggregate_api_auth_params_json_sql(),
             (auth_params_json, now_ts(), api_id),
         )?;
         Ok(())
@@ -689,7 +736,7 @@ impl Storage {
 
     pub fn update_aggregate_api_action(&self, api_id: &str, action: Option<&str>) -> Result<()> {
         self.conn.execute(
-            "UPDATE aggregate_apis SET action = ?1, updated_at = ?2 WHERE id = ?3",
+            update_aggregate_api_action_sql(),
             (action, now_ts(), api_id),
         )?;
         Ok(())
@@ -701,7 +748,7 @@ impl Storage {
         model_override: Option<&str>,
     ) -> Result<()> {
         self.conn.execute(
-            "UPDATE aggregate_apis SET model_override = ?1, updated_at = ?2 WHERE id = ?3",
+            update_aggregate_api_model_override_sql(),
             (model_override, now_ts(), api_id),
         )?;
         Ok(())
@@ -717,14 +764,7 @@ impl Storage {
         config_json: Option<&str>,
     ) -> Result<()> {
         self.conn.execute(
-            "UPDATE aggregate_apis
-             SET balance_query_enabled = ?1,
-                 balance_query_template = ?2,
-                 balance_query_base_url = ?3,
-                 balance_query_user_id = ?4,
-                 balance_query_config_json = ?5,
-                 updated_at = ?6
-             WHERE id = ?7",
+            update_aggregate_api_balance_query_sql(),
             (
                 enabled,
                 template,
@@ -748,13 +788,7 @@ impl Storage {
         let now = now_ts();
         let status = if ok { Some("success") } else { Some("failed") };
         self.conn.execute(
-            "UPDATE aggregate_apis
-             SET last_balance_at = ?1,
-                 last_balance_status = ?2,
-                 last_balance_error = ?3,
-                 last_balance_json = ?4,
-                 updated_at = ?1
-             WHERE id = ?5",
+            update_aggregate_api_balance_result_sql(),
             (now, status, error, balance_json, api_id),
         )?;
         Ok(())
@@ -774,30 +808,21 @@ impl Storage {
     /// 返回函数执行结果
     pub fn delete_aggregate_api(&self, api_id: &str) -> Result<()> {
         let tx = self.conn.unchecked_transaction()?;
+        tx.execute(delete_aggregate_api_balance_secret_by_id_sql(), [api_id])?;
+        tx.execute(delete_aggregate_api_secret_by_id_sql(), [api_id])?;
         tx.execute(
-            "DELETE FROM aggregate_api_balance_secrets WHERE aggregate_api_id = ?1",
-            [api_id],
+            delete_model_source_mapping_preferences_for_source_sql(),
+            (AGGREGATE_API_MODEL_SOURCE_KIND, api_id),
         )?;
         tx.execute(
-            "DELETE FROM aggregate_api_secrets WHERE aggregate_api_id = ?1",
-            [api_id],
+            delete_model_source_mappings_for_source_sql(),
+            (AGGREGATE_API_MODEL_SOURCE_KIND, api_id),
         )?;
         tx.execute(
-            "DELETE FROM model_source_mapping_preferences
-             WHERE source_kind = 'aggregate_api' AND source_id = ?1",
-            [api_id],
+            delete_model_source_models_for_source_sql(),
+            (AGGREGATE_API_MODEL_SOURCE_KIND, api_id),
         )?;
-        tx.execute(
-            "DELETE FROM model_source_mappings
-             WHERE source_kind = 'aggregate_api' AND source_id = ?1",
-            [api_id],
-        )?;
-        tx.execute(
-            "DELETE FROM model_source_models
-             WHERE source_kind = 'aggregate_api' AND source_id = ?1",
-            [api_id],
-        )?;
-        tx.execute("DELETE FROM aggregate_apis WHERE id = ?1", [api_id])?;
+        tx.execute(delete_aggregate_api_by_id_sql(), [api_id])?;
         tx.commit()?;
         Ok(())
     }
@@ -841,9 +866,7 @@ impl Storage {
     /// # 返回
     /// 返回函数执行结果
     pub fn find_aggregate_api_secret_by_id(&self, api_id: &str) -> Result<Option<String>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT secret_value FROM aggregate_api_secrets WHERE aggregate_api_id = ?1 LIMIT 1",
-        )?;
+        let mut stmt = self.conn.prepare(aggregate_api_secret_by_id_sql())?;
         let mut rows = stmt.query([api_id])?;
         if let Some(row) = rows.next()? {
             Ok(Some(row.get(0)?))
@@ -888,17 +911,15 @@ impl Storage {
     }
 
     pub fn delete_aggregate_api_balance_secret(&self, api_id: &str) -> Result<()> {
-        self.conn.execute(
-            "DELETE FROM aggregate_api_balance_secrets WHERE aggregate_api_id = ?1",
-            [api_id],
-        )?;
+        self.conn
+            .execute(delete_aggregate_api_balance_secret_by_id_sql(), [api_id])?;
         Ok(())
     }
 
     pub fn find_aggregate_api_balance_secret_by_id(&self, api_id: &str) -> Result<Option<String>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT access_token FROM aggregate_api_balance_secrets WHERE aggregate_api_id = ?1 LIMIT 1",
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare(aggregate_api_balance_secret_by_id_sql())?;
         let mut rows = stmt.query([api_id])?;
         if let Some(row) = rows.next()? {
             Ok(Some(row.get(0)?))
@@ -932,19 +953,14 @@ impl Storage {
         let now = now_ts();
         let last_test_status = if ok { Some("success") } else { Some("failed") };
         self.conn.execute(
-            "UPDATE aggregate_apis
-             SET last_test_at = ?1,
-                 last_test_status = ?2,
-                 last_test_error = ?3,
-                 updated_at = ?1
-             WHERE id = ?4",
+            update_aggregate_api_test_result_sql(),
             (now, last_test_status, error, api_id),
         )?;
         if let Some(code) = status_code {
             if !ok {
                 let message = format!("http_status={code}");
                 self.conn.execute(
-                    "UPDATE aggregate_apis SET last_test_error = ?1 WHERE id = ?2",
+                    update_aggregate_api_last_test_error_sql(),
                     (message, api_id),
                 )?;
             }
@@ -1224,8 +1240,7 @@ impl Storage {
         upstream_model: &str,
     ) -> Result<()> {
         self.conn.execute(
-            "DELETE FROM aggregate_api_supplier_models
-             WHERE supplier_key = ?1 AND provider_type = ?2 AND upstream_model = ?3",
+            delete_aggregate_api_supplier_model_sql(),
             params![
                 normalize_supplier_model_text(supplier_key),
                 normalize_supplier_model_text(provider_type),
@@ -1361,7 +1376,7 @@ fn list_aggregate_apis_for_ids_chunk(
     let Some((condition, params)) = text_id_in_clause("id", api_ids) else {
         return Ok(Vec::new());
     };
-    let sql = format!("{AGGREGATE_API_SELECT_SQL} WHERE {condition}");
+    let sql = aggregate_apis_for_ids_chunk_sql(&condition);
     let mut stmt = storage.conn.prepare(&sql)?;
     let mut rows = stmt.query(params_from_iter(params))?;
     let mut out = Vec::new();
@@ -1371,6 +1386,10 @@ fn list_aggregate_apis_for_ids_chunk(
     Ok(out)
 }
 
+fn aggregate_apis_for_ids_chunk_sql(api_condition: &str) -> String {
+    format!("{AGGREGATE_API_SELECT_SQL} WHERE {api_condition}")
+}
+
 fn list_aggregate_api_dashboard_source_metadata_for_ids_chunk(
     storage: &Storage,
     api_ids: &[String],
@@ -1378,11 +1397,7 @@ fn list_aggregate_api_dashboard_source_metadata_for_ids_chunk(
     let Some((condition, params)) = text_id_in_clause("id", api_ids) else {
         return Ok(Vec::new());
     };
-    let sql = format!(
-        "SELECT id, provider_type, supplier_name, url, status, sort, updated_at
-         FROM aggregate_apis
-         WHERE {condition}"
-    );
+    let sql = aggregate_api_dashboard_source_metadata_for_ids_chunk_sql(&condition);
     let mut stmt = storage.conn.prepare(&sql)?;
     let rows = stmt.query_map(params_from_iter(params), |row| {
         Ok((
@@ -1394,6 +1409,14 @@ fn list_aggregate_api_dashboard_source_metadata_for_ids_chunk(
     rows.collect()
 }
 
+fn aggregate_api_dashboard_source_metadata_for_ids_chunk_sql(api_condition: &str) -> String {
+    format!(
+        "SELECT id, provider_type, supplier_name, url, status, sort, updated_at
+         FROM aggregate_apis
+         WHERE {api_condition}"
+    )
+}
+
 fn list_balance_query_aggregate_api_ids_for_ids_chunk(
     storage: &Storage,
     api_ids: &[String],
@@ -1401,17 +1424,23 @@ fn list_balance_query_aggregate_api_ids_for_ids_chunk(
     let Some((condition, params)) = text_id_in_clause("id", api_ids) else {
         return Ok(Vec::new());
     };
-    let sql = format!(
-        "SELECT id, sort, updated_at
-         FROM aggregate_apis
-         WHERE balance_query_enabled = 1
-           AND {condition}"
-    );
+    let sql = balance_query_aggregate_api_ids_for_ids_chunk_sql(&condition);
     let mut stmt = storage.conn.prepare(&sql)?;
     let rows = stmt.query_map(params_from_iter(params), |row| {
         Ok((row.get(0)?, row.get(1)?, row.get(2)?))
     })?;
     rows.collect()
+}
+
+fn balance_query_aggregate_api_ids_for_ids_chunk_sql(api_condition: &str) -> String {
+    // 中文注释：一元 + 让 SQLite 不把 balance_query_enabled 当首选索引列，
+    // 小批量 id 查询应优先走主键条件，再在命中行里判断余额查询开关。
+    format!(
+        "SELECT id, sort, updated_at
+         FROM aggregate_apis
+         WHERE +balance_query_enabled = 1
+           AND {api_condition}"
+    )
 }
 
 fn list_aggregate_api_secrets_for_ids_chunk(
@@ -1421,16 +1450,103 @@ fn list_aggregate_api_secrets_for_ids_chunk(
     let Some((condition, params)) = text_id_in_clause("aggregate_api_id", api_ids) else {
         return Ok(Vec::new());
     };
-    let sql = format!(
-        "SELECT aggregate_api_id, secret_value
-         FROM aggregate_api_secrets
-         WHERE {condition}"
-    );
+    let sql = aggregate_api_secrets_for_ids_chunk_sql(&condition);
     let mut stmt = storage.conn.prepare(&sql)?;
     let rows = stmt.query_map(params_from_iter(params), |row| {
         Ok((row.get(0)?, row.get(1)?))
     })?;
     rows.collect()
+}
+
+fn aggregate_api_secrets_for_ids_chunk_sql(secret_condition: &str) -> String {
+    format!(
+        "SELECT aggregate_api_id, secret_value
+         FROM aggregate_api_secrets
+         WHERE {secret_condition}"
+    )
+}
+
+fn aggregate_api_list_ids_sql() -> &'static str {
+    "SELECT id
+     FROM aggregate_apis
+     ORDER BY sort ASC, updated_at DESC, id ASC"
+}
+
+fn aggregate_api_list_sql() -> String {
+    format!("{AGGREGATE_API_SELECT_SQL} ORDER BY sort ASC, updated_at DESC")
+}
+
+fn aggregate_api_quota_source_summaries_list_sql() -> &'static str {
+    "SELECT
+        id,
+        provider_type,
+        supplier_name,
+        url,
+        status,
+        balance_query_enabled,
+        last_balance_at,
+        last_balance_status,
+        last_balance_error,
+        last_balance_json
+     FROM aggregate_apis
+     ORDER BY sort ASC, updated_at DESC, id ASC"
+}
+
+fn aggregate_api_balance_jsons_list_sql() -> &'static str {
+    "SELECT last_balance_json
+     FROM aggregate_apis
+     WHERE last_balance_json IS NOT NULL
+       AND TRIM(last_balance_json) <> ''
+     ORDER BY sort ASC, updated_at DESC, id ASC"
+}
+
+fn active_balance_query_aggregate_api_ids_sql() -> &'static str {
+    "SELECT id
+     FROM aggregate_apis
+     WHERE balance_query_enabled = 1
+       AND LOWER(TRIM(COALESCE(status, ''))) = 'active'
+     ORDER BY sort ASC, updated_at DESC, id ASC"
+}
+
+fn balance_query_aggregate_api_ids_sql() -> &'static str {
+    "SELECT id
+     FROM aggregate_apis
+     WHERE balance_query_enabled = 1
+     ORDER BY sort ASC, updated_at DESC, id ASC"
+}
+
+fn active_aggregate_api_ids_sql() -> &'static str {
+    "SELECT id
+     FROM aggregate_apis
+     WHERE LOWER(TRIM(COALESCE(status, ''))) = 'active'
+     ORDER BY sort ASC, created_at DESC, id ASC"
+}
+
+#[cfg(test)]
+fn active_aggregate_api_ids_sql_with_provider(provider_condition: &str) -> String {
+    format!(
+        "SELECT id
+         FROM aggregate_apis
+         WHERE {AGGREGATE_API_ACTIVE_STATUS_CONDITION}
+           AND {provider_condition}
+         ORDER BY sort ASC, created_at DESC, id ASC"
+    )
+}
+
+fn active_aggregate_api_select_sql(provider_condition: Option<&str>) -> String {
+    match provider_condition {
+        Some(provider_condition) => format!(
+            "{AGGREGATE_API_SELECT_SQL}
+             WHERE {AGGREGATE_API_ACTIVE_STATUS_CONDITION}
+               AND {provider_condition}
+             ORDER BY sort ASC, created_at DESC, id ASC"
+        ),
+        None => format!(
+            "{AGGREGATE_API_SELECT_SQL}
+             WHERE {AGGREGATE_API_ACTIVE_STATUS_CONDITION}
+             ORDER BY sort ASC, created_at DESC, id ASC"
+        ),
+    }
 }
 
 fn aggregate_api_provider_type_condition(provider_type: &str) -> Option<(String, Vec<Value>)> {
@@ -1447,14 +1563,12 @@ fn aggregate_api_provider_type_condition(provider_type: &str) -> Option<(String,
         "google_ai",
         "google_gemini",
     ];
-    const NORMALIZED_PROVIDER_SQL: &str =
-        "REPLACE(LOWER(TRIM(COALESCE(provider_type, ''))), '-', '_')";
 
     match provider_type.as_str() {
         "claude" | "anthropic" | "anthropic_native" | "claude_code" => {
             let placeholders = vec!["?"; CLAUDE_ALIASES.len()].join(", ");
             Some((
-                format!("{NORMALIZED_PROVIDER_SQL} IN ({placeholders})"),
+                format!("{AGGREGATE_API_NORMALIZED_PROVIDER_SQL} IN ({placeholders})"),
                 CLAUDE_ALIASES
                     .iter()
                     .map(|value| Value::Text((*value).to_string()))
@@ -1464,7 +1578,7 @@ fn aggregate_api_provider_type_condition(provider_type: &str) -> Option<(String,
         "gemini" | "gemini_native" | "google" | "google_ai" | "google_gemini" => {
             let placeholders = vec!["?"; GEMINI_ALIASES.len()].join(", ");
             Some((
-                format!("{NORMALIZED_PROVIDER_SQL} IN ({placeholders})"),
+                format!("{AGGREGATE_API_NORMALIZED_PROVIDER_SQL} IN ({placeholders})"),
                 GEMINI_ALIASES
                     .iter()
                     .map(|value| Value::Text((*value).to_string()))
@@ -1479,7 +1593,7 @@ fn aggregate_api_provider_type_condition(provider_type: &str) -> Option<(String,
                 .collect::<Vec<_>>();
             let placeholders = vec!["?"; aliases.len()].join(", ");
             Some((
-                format!("{NORMALIZED_PROVIDER_SQL} NOT IN ({placeholders})"),
+                format!("{AGGREGATE_API_NORMALIZED_PROVIDER_SQL} NOT IN ({placeholders})"),
                 aliases,
             ))
         }
@@ -1528,8 +1642,16 @@ mod supplier_model_tests {
     }
 
     fn collect_query_plan_details(storage: &Storage, sql: &str) -> Vec<String> {
+        collect_query_plan_details_with_params(storage, sql, Vec::new())
+    }
+
+    fn collect_query_plan_details_with_params(
+        storage: &Storage,
+        sql: &str,
+        params: Vec<Value>,
+    ) -> Vec<String> {
         let mut stmt = storage.conn.prepare(sql).expect("prepare explain");
-        let mut rows = stmt.query([]).expect("query explain");
+        let mut rows = stmt.query(params_from_iter(params)).expect("query explain");
         let mut details = Vec::new();
         while let Some(row) = rows.next().expect("next explain row") {
             let detail: String = row.get(3).expect("detail");
@@ -1578,20 +1700,47 @@ mod supplier_model_tests {
         let storage = Storage::open_in_memory().expect("open storage");
         storage.init().expect("init storage");
 
-        let details = collect_query_plan_details(
-            &storage,
-            "EXPLAIN QUERY PLAN
-             SELECT id, sort, updated_at
-             FROM aggregate_apis
-             WHERE id IN ('api-a', 'api-b')",
-        );
+        let chunk_queries = [
+            (
+                "aggregate API row chunk",
+                aggregate_apis_for_ids_chunk_sql("id IN ('api-a', 'api-b')"),
+                "sqlite_autoindex_aggregate_apis_1",
+            ),
+            (
+                "aggregate API dashboard metadata chunk",
+                aggregate_api_dashboard_source_metadata_for_ids_chunk_sql(
+                    "id IN ('api-a', 'api-b')",
+                ),
+                "sqlite_autoindex_aggregate_apis_1",
+            ),
+            (
+                "balance query aggregate API id chunk",
+                balance_query_aggregate_api_ids_for_ids_chunk_sql("id IN ('api-a', 'api-b')"),
+                "sqlite_autoindex_aggregate_apis_1",
+            ),
+            (
+                "aggregate API secret chunk",
+                aggregate_api_secrets_for_ids_chunk_sql("aggregate_api_id IN ('api-a', 'api-b')"),
+                "sqlite_autoindex_aggregate_api_secrets_1",
+            ),
+        ];
 
-        assert!(
-            !details
-                .iter()
-                .any(|detail| detail.contains("use temp b-tree for order by")),
-            "aggregate API id chunk query should avoid per-chunk ORDER BY temp sorting, got {details:?}"
-        );
+        for (label, sql, expected_index) in chunk_queries {
+            let details =
+                collect_query_plan_details(&storage, &format!("EXPLAIN QUERY PLAN {sql}"));
+
+            assert!(
+                details.iter().any(|detail| detail.contains(expected_index)
+                    || detail.contains("using index")),
+                "{label} should use an id lookup index, got {details:?}"
+            );
+            assert!(
+                !details
+                    .iter()
+                    .any(|detail| detail.contains("use temp b-tree for order by")),
+                "{label} should avoid per-chunk ORDER BY temp sorting, got {details:?}"
+            );
+        }
     }
 
     #[test]
@@ -1808,6 +1957,117 @@ mod supplier_model_tests {
     }
 
     #[test]
+    fn aggregate_api_direct_lookup_helpers_use_primary_key_indexes() {
+        let storage = Storage::open_in_memory().expect("open storage");
+        storage.init().expect("init storage");
+
+        let api_by_id_sql = aggregate_api_by_id_sql();
+        let lookup_queries = [
+            (
+                "aggregate api by id",
+                api_by_id_sql.as_str(),
+                vec![Value::Text("api-index".to_string())],
+                "sqlite_autoindex_aggregate_apis_1",
+            ),
+            (
+                "aggregate api status by id",
+                aggregate_api_status_by_id_sql(),
+                vec![Value::Text("api-index".to_string())],
+                "sqlite_autoindex_aggregate_apis_1",
+            ),
+            (
+                "aggregate api auth type by id",
+                aggregate_api_auth_type_by_id_sql(),
+                vec![Value::Text("api-index".to_string())],
+                "sqlite_autoindex_aggregate_apis_1",
+            ),
+            (
+                "aggregate api exists by id",
+                aggregate_api_exists_sql(),
+                vec![Value::Text("api-index".to_string())],
+                "sqlite_autoindex_aggregate_apis_1",
+            ),
+            (
+                "aggregate api update config by id",
+                aggregate_api_update_config_by_id_sql(),
+                vec![Value::Text("api-index".to_string())],
+                "sqlite_autoindex_aggregate_apis_1",
+            ),
+            (
+                "aggregate api supplier identity by id",
+                aggregate_api_supplier_identity_by_id_sql(),
+                vec![Value::Text("api-index".to_string())],
+                "sqlite_autoindex_aggregate_apis_1",
+            ),
+            (
+                "aggregate api secret by id",
+                aggregate_api_secret_by_id_sql(),
+                vec![Value::Text("api-index".to_string())],
+                "sqlite_autoindex_aggregate_api_secrets_1",
+            ),
+            (
+                "aggregate api balance secret by id",
+                aggregate_api_balance_secret_by_id_sql(),
+                vec![Value::Text("api-index".to_string())],
+                "sqlite_autoindex_aggregate_api_balance_secrets_1",
+            ),
+        ];
+
+        for (label, sql, params, expected_index) in lookup_queries {
+            let details = collect_query_plan_details_with_params(
+                &storage,
+                &format!("EXPLAIN QUERY PLAN {sql}"),
+                params,
+            );
+            assert!(
+                details.iter().any(|detail| detail.contains(expected_index)),
+                "{label} should use {expected_index}, got {details:?}"
+            );
+        }
+
+        let secret_config_details = collect_query_plan_details_with_params(
+            &storage,
+            &format!(
+                "EXPLAIN QUERY PLAN {}",
+                aggregate_api_secret_config_by_id_sql()
+            ),
+            vec![Value::Text("api-index".to_string())],
+        );
+        assert!(
+            secret_config_details
+                .iter()
+                .any(|detail| detail.contains("sqlite_autoindex_aggregate_apis_1")),
+            "secret config should use aggregate api primary key, got {secret_config_details:?}"
+        );
+        assert!(
+            secret_config_details
+                .iter()
+                .any(|detail| detail.contains("sqlite_autoindex_aggregate_api_secrets_1")),
+            "secret config should use aggregate secret primary key, got {secret_config_details:?}"
+        );
+
+        let with_secrets_details = collect_query_plan_details_with_params(
+            &storage,
+            &format!(
+                "EXPLAIN QUERY PLAN {}",
+                aggregate_api_with_secrets_by_id_sql()
+            ),
+            vec![Value::Text("api-index".to_string())],
+        );
+        for expected_index in [
+            "sqlite_autoindex_aggregate_apis_1",
+            "sqlite_autoindex_aggregate_api_secrets_1",
+            "sqlite_autoindex_aggregate_api_balance_secrets_1",
+        ] {
+            assert!(
+                with_secrets_details
+                    .iter()
+                    .any(|detail| detail.contains(expected_index)),
+                "with-secrets lookup should use {expected_index}, got {with_secrets_details:?}"
+            );
+        }
+    }
+    #[test]
     fn find_aggregate_api_secret_config_by_id_reads_auth_type_and_joined_secret() {
         let storage = Storage::open_in_memory().expect("open storage");
         storage.init().expect("init storage");
@@ -2015,24 +2275,43 @@ mod supplier_model_tests {
     }
 
     #[test]
-    fn list_aggregate_api_ids_uses_list_order_index() {
+    fn aggregate_api_list_queries_use_list_order_index_without_temp_sort() {
         let storage = Storage::open_in_memory().expect("open storage");
         storage.init().expect("init storage");
 
-        let details = collect_query_plan_details(
-            &storage,
-            "EXPLAIN QUERY PLAN
-             SELECT id
-             FROM aggregate_apis
-             ORDER BY sort ASC, updated_at DESC, id ASC",
-        );
+        let list_queries = [
+            (
+                "aggregate API ids",
+                aggregate_api_list_ids_sql().to_string(),
+            ),
+            ("aggregate API rows", aggregate_api_list_sql()),
+            (
+                "quota source summaries",
+                aggregate_api_quota_source_summaries_list_sql().to_string(),
+            ),
+            (
+                "balance jsons",
+                aggregate_api_balance_jsons_list_sql().to_string(),
+            ),
+        ];
 
-        assert!(
-            details
-                .iter()
-                .any(|detail| detail.contains("idx_aggregate_apis_list_order")),
-            "expected aggregate API list order to use idx_aggregate_apis_list_order, got {details:?}"
-        );
+        for (label, sql) in list_queries {
+            let details =
+                collect_query_plan_details(&storage, &format!("EXPLAIN QUERY PLAN {sql}"));
+
+            assert!(
+                details
+                    .iter()
+                    .any(|detail| detail.contains("idx_aggregate_apis_list_order")),
+                "expected {label} to use idx_aggregate_apis_list_order, got {details:?}"
+            );
+            assert!(
+                !details
+                    .iter()
+                    .any(|detail| detail.contains("use temp b-tree for order by")),
+                "expected {label} to avoid temp ORDER BY sorting, got {details:?}"
+            );
+        }
     }
 
     #[test]
@@ -2364,12 +2643,10 @@ mod supplier_model_tests {
 
         let details = collect_query_plan_details(
             &storage,
-            "EXPLAIN QUERY PLAN
-             SELECT id
-             FROM aggregate_apis
-             WHERE balance_query_enabled = 1
-               AND LOWER(TRIM(COALESCE(status, ''))) = 'active'
-             ORDER BY sort ASC, updated_at DESC, id ASC",
+            &format!(
+                "EXPLAIN QUERY PLAN {}",
+                active_balance_query_aggregate_api_ids_sql()
+            ),
         );
 
         assert!(
@@ -2387,11 +2664,7 @@ mod supplier_model_tests {
 
         let details = collect_query_plan_details(
             &storage,
-            "EXPLAIN QUERY PLAN
-             SELECT id
-             FROM aggregate_apis
-             WHERE LOWER(TRIM(COALESCE(status, ''))) = 'active'
-             ORDER BY sort ASC, created_at DESC, id ASC",
+            &format!("EXPLAIN QUERY PLAN {}", active_aggregate_api_ids_sql()),
         );
 
         assert!(
@@ -2409,12 +2682,12 @@ mod supplier_model_tests {
 
         let details = collect_query_plan_details(
             &storage,
-            "EXPLAIN QUERY PLAN
-             SELECT id
-             FROM aggregate_apis
-             WHERE LOWER(TRIM(COALESCE(status, ''))) = 'active'
-               AND REPLACE(LOWER(TRIM(COALESCE(provider_type, ''))), '-', '_') = 'codex'
-             ORDER BY sort ASC, created_at DESC, id ASC",
+            &format!(
+                "EXPLAIN QUERY PLAN {}",
+                active_aggregate_api_ids_sql_with_provider(&format!(
+                    "{AGGREGATE_API_NORMALIZED_PROVIDER_SQL} = 'codex'"
+                ))
+            ),
         );
 
         assert!(
@@ -2432,11 +2705,10 @@ mod supplier_model_tests {
 
         let details = collect_query_plan_details(
             &storage,
-            "EXPLAIN QUERY PLAN
-             SELECT id
-             FROM aggregate_apis
-             WHERE balance_query_enabled = 1
-             ORDER BY sort ASC, updated_at DESC, id ASC",
+            &format!(
+                "EXPLAIN QUERY PLAN {}",
+                balance_query_aggregate_api_ids_sql()
+            ),
         );
 
         assert!(
@@ -2521,5 +2793,203 @@ mod supplier_model_tests {
         assert!(details.iter().any(|detail| {
             detail.contains("search aggregate_api_supplier_models") && detail.contains("index")
         }));
+    }
+    #[test]
+    fn aggregate_api_write_helpers_use_primary_key_indexes() {
+        let storage = Storage::open_in_memory().expect("open storage");
+        storage.init().expect("init storage");
+
+        fn assert_aggregate_api_pk(storage: &Storage, label: &str, sql: &str, params: Vec<Value>) {
+            let details = collect_query_plan_details_with_params(
+                storage,
+                &format!("EXPLAIN QUERY PLAN {sql}"),
+                params,
+            );
+            assert!(
+                details.iter().any(
+                    |detail| detail.contains("sqlite_autoindex_aggregate_apis_1")
+                        || detail.contains("using index")
+                ),
+                "expected {label} to use aggregate API primary-key index, got {details:?}"
+            );
+        }
+
+        assert_aggregate_api_pk(
+            &storage,
+            "url update",
+            update_aggregate_api_url_sql(),
+            vec![
+                Value::Text("url".to_string()),
+                Value::Integer(1),
+                Value::Text("api-a".to_string()),
+            ],
+        );
+        assert_aggregate_api_pk(
+            &storage,
+            "supplier update",
+            update_aggregate_api_supplier_name_sql(),
+            vec![
+                Value::Text("supplier".to_string()),
+                Value::Integer(1),
+                Value::Text("api-a".to_string()),
+            ],
+        );
+        assert_aggregate_api_pk(
+            &storage,
+            "sort update",
+            update_aggregate_api_sort_sql(),
+            vec![
+                Value::Integer(1),
+                Value::Integer(2),
+                Value::Text("api-a".to_string()),
+            ],
+        );
+        assert_aggregate_api_pk(
+            &storage,
+            "status update",
+            update_aggregate_api_status_sql(),
+            vec![
+                Value::Text("active".to_string()),
+                Value::Integer(1),
+                Value::Text("api-a".to_string()),
+            ],
+        );
+        assert_aggregate_api_pk(
+            &storage,
+            "provider type update",
+            update_aggregate_api_provider_type_sql(),
+            vec![
+                Value::Text("openai".to_string()),
+                Value::Integer(1),
+                Value::Text("api-a".to_string()),
+            ],
+        );
+        assert_aggregate_api_pk(
+            &storage,
+            "auth type update",
+            update_aggregate_api_auth_type_sql(),
+            vec![
+                Value::Text("bearer".to_string()),
+                Value::Integer(1),
+                Value::Text("api-a".to_string()),
+            ],
+        );
+        assert_aggregate_api_pk(
+            &storage,
+            "auth params update",
+            update_aggregate_api_auth_params_json_sql(),
+            vec![
+                Value::Text("{}".to_string()),
+                Value::Integer(1),
+                Value::Text("api-a".to_string()),
+            ],
+        );
+        assert_aggregate_api_pk(
+            &storage,
+            "action update",
+            update_aggregate_api_action_sql(),
+            vec![
+                Value::Text("proxy".to_string()),
+                Value::Integer(1),
+                Value::Text("api-a".to_string()),
+            ],
+        );
+        assert_aggregate_api_pk(
+            &storage,
+            "model override update",
+            update_aggregate_api_model_override_sql(),
+            vec![
+                Value::Text("gpt-5".to_string()),
+                Value::Integer(1),
+                Value::Text("api-a".to_string()),
+            ],
+        );
+        assert_aggregate_api_pk(
+            &storage,
+            "balance query update",
+            update_aggregate_api_balance_query_sql(),
+            vec![
+                Value::Integer(1),
+                Value::Text("template".to_string()),
+                Value::Text("base".to_string()),
+                Value::Text("user".to_string()),
+                Value::Text("{}".to_string()),
+                Value::Integer(1),
+                Value::Text("api-a".to_string()),
+            ],
+        );
+        assert_aggregate_api_pk(
+            &storage,
+            "balance result update",
+            update_aggregate_api_balance_result_sql(),
+            vec![
+                Value::Integer(1),
+                Value::Text("success".to_string()),
+                Value::Null,
+                Value::Text("{}".to_string()),
+                Value::Text("api-a".to_string()),
+            ],
+        );
+        assert_aggregate_api_pk(
+            &storage,
+            "test result update",
+            update_aggregate_api_test_result_sql(),
+            vec![
+                Value::Integer(1),
+                Value::Text("success".to_string()),
+                Value::Null,
+                Value::Text("api-a".to_string()),
+            ],
+        );
+        assert_aggregate_api_pk(
+            &storage,
+            "last test error update",
+            update_aggregate_api_last_test_error_sql(),
+            vec![
+                Value::Text("http_status=500".to_string()),
+                Value::Text("api-a".to_string()),
+            ],
+        );
+        assert_aggregate_api_pk(
+            &storage,
+            "delete aggregate api",
+            delete_aggregate_api_by_id_sql(),
+            vec![Value::Text("api-a".to_string())],
+        );
+
+        for (label, sql, expected_index, params) in [
+            (
+                "delete aggregate api secret",
+                delete_aggregate_api_secret_by_id_sql(),
+                "sqlite_autoindex_aggregate_api_secrets_1",
+                vec![Value::Text("api-a".to_string())],
+            ),
+            (
+                "delete aggregate api balance secret",
+                delete_aggregate_api_balance_secret_by_id_sql(),
+                "sqlite_autoindex_aggregate_api_balance_secrets_1",
+                vec![Value::Text("api-a".to_string())],
+            ),
+            (
+                "delete aggregate api supplier model",
+                delete_aggregate_api_supplier_model_sql(),
+                "sqlite_autoindex_aggregate_api_supplier_models_1",
+                vec![
+                    Value::Text("supplier".to_string()),
+                    Value::Text("codex".to_string()),
+                    Value::Text("gpt-5".to_string()),
+                ],
+            ),
+        ] {
+            let details = collect_query_plan_details_with_params(
+                &storage,
+                &format!("EXPLAIN QUERY PLAN {sql}"),
+                params,
+            );
+            assert!(
+                details.iter().any(|detail| detail.contains(expected_index)),
+                "expected {label} to use {expected_index}, got {details:?}"
+            );
+        }
     }
 }

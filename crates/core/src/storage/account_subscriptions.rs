@@ -3,6 +3,33 @@ use rusqlite::{params_from_iter, Result, Row};
 use super::key_id_filters::{normalize_text_ids, text_id_in_clause, SQLITE_IN_CLAUSE_BATCH_SIZE};
 use super::{now_ts, AccountSubscription, Storage};
 
+fn account_subscription_select_columns() -> &'static str {
+    "account_id, has_subscription, account_plan_type, plan_type, expires_at, renews_at, updated_at"
+}
+
+fn account_subscription_by_account_sql() -> String {
+    format!(
+        "SELECT {columns}
+         FROM account_subscriptions
+         WHERE account_id = ?1
+         LIMIT 1",
+        columns = account_subscription_select_columns(),
+    )
+}
+
+fn account_subscription_list_sql() -> String {
+    format!(
+        "SELECT {columns}
+         FROM account_subscriptions
+         ORDER BY updated_at DESC, account_id ASC",
+        columns = account_subscription_select_columns(),
+    )
+}
+
+pub(super) fn delete_account_subscription_for_account_sql() -> &'static str {
+    "DELETE FROM account_subscriptions WHERE account_id = ?1"
+}
+
 impl Storage {
     /// 函数 `upsert_account_subscription`
     ///
@@ -81,10 +108,8 @@ impl Storage {
     /// # 返回
     /// 返回函数执行结果
     pub fn delete_account_subscription(&self, account_id: &str) -> Result<()> {
-        self.conn.execute(
-            "DELETE FROM account_subscriptions WHERE account_id = ?1",
-            [account_id],
-        )?;
+        self.conn
+            .execute(delete_account_subscription_for_account_sql(), [account_id])?;
         Ok(())
     }
 
@@ -104,12 +129,7 @@ impl Storage {
         &self,
         account_id: &str,
     ) -> Result<Option<AccountSubscription>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT account_id, has_subscription, account_plan_type, plan_type, expires_at, renews_at, updated_at
-             FROM account_subscriptions
-             WHERE account_id = ?1
-             LIMIT 1",
-        )?;
+        let mut stmt = self.conn.prepare(&account_subscription_by_account_sql())?;
         let mut rows = stmt.query([account_id])?;
         if let Some(row) = rows.next()? {
             Ok(Some(map_account_subscription_row(row)?))
@@ -130,11 +150,7 @@ impl Storage {
     /// # 返回
     /// 返回函数执行结果
     pub fn list_account_subscriptions(&self) -> Result<Vec<AccountSubscription>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT account_id, has_subscription, account_plan_type, plan_type, expires_at, renews_at, updated_at
-             FROM account_subscriptions
-             ORDER BY updated_at DESC, account_id ASC",
-        )?;
+        let mut stmt = self.conn.prepare(&account_subscription_list_sql())?;
         let mut rows = stmt.query([])?;
         let mut out = Vec::new();
         while let Some(row) = rows.next()? {
@@ -216,11 +232,7 @@ fn list_account_subscriptions_for_accounts_chunk(
     let Some((condition, params)) = text_id_in_clause("account_id", account_ids) else {
         return Ok(Vec::new());
     };
-    let sql = format!(
-        "SELECT account_id, has_subscription, account_plan_type, plan_type, expires_at, renews_at, updated_at
-         FROM account_subscriptions
-         WHERE {condition}"
-    );
+    let sql = account_subscriptions_for_accounts_chunk_sql(&condition);
     let mut stmt = storage.conn.prepare(&sql)?;
     let mut rows = stmt.query(params_from_iter(params))?;
     let mut out = Vec::new();
@@ -228,6 +240,15 @@ fn list_account_subscriptions_for_accounts_chunk(
         out.push(map_account_subscription_row(row)?);
     }
     Ok(out)
+}
+
+fn account_subscriptions_for_accounts_chunk_sql(account_condition: &str) -> String {
+    format!(
+        "SELECT {columns}
+         FROM account_subscriptions
+         WHERE {account_condition}",
+        columns = account_subscription_select_columns(),
+    )
 }
 
 #[cfg(test)]
@@ -306,14 +327,10 @@ mod tests {
         let storage = Storage::open_in_memory().expect("open");
         storage.init().expect("init");
 
+        let sql = account_subscriptions_for_accounts_chunk_sql("account_id IN ('acc-a', 'acc-b')");
         let mut stmt = storage
             .conn
-            .prepare(
-                "EXPLAIN QUERY PLAN
-                 SELECT account_id, has_subscription, account_plan_type, plan_type, expires_at, renews_at, updated_at
-                 FROM account_subscriptions
-                 WHERE account_id IN ('acc-a', 'acc-b')",
-            )
+            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
             .expect("prepare explain");
         let mut rows = stmt.query([]).expect("query explain");
         let mut plan = String::new();
@@ -324,8 +341,96 @@ mod tests {
         }
 
         assert!(
+            plan.contains("sqlite_autoindex_account_subscriptions_1")
+                || plan.contains("USING INDEX"),
+            "subscription chunk query should use account_id lookup index, got {plan}"
+        );
+        assert!(
             !plan.contains("USE TEMP B-TREE FOR ORDER BY"),
             "subscription chunk query should avoid per-chunk ORDER BY temp sorting, got {plan}"
+        );
+    }
+
+    #[test]
+    fn account_subscription_lookup_uses_primary_key_index() {
+        let storage = Storage::open_in_memory().expect("open");
+        storage.init().expect("init");
+
+        let mut stmt = storage
+            .conn
+            .prepare(&format!(
+                "EXPLAIN QUERY PLAN {}",
+                account_subscription_by_account_sql()
+            ))
+            .expect("prepare explain");
+        let mut rows = stmt.query(["acc-a"]).expect("query explain");
+        let mut plan = String::new();
+        while let Some(row) = rows.next().expect("read explain row") {
+            let detail: String = row.get(3).expect("plan detail");
+            plan.push_str(&detail);
+            plan.push('\n');
+        }
+
+        assert!(
+            plan.contains("sqlite_autoindex_account_subscriptions_1")
+                || plan.contains("USING INDEX"),
+            "subscription lookup should use account_id primary-key index, got {plan}"
+        );
+    }
+
+    #[test]
+    fn account_subscription_list_uses_updated_at_order_index() {
+        let storage = Storage::open_in_memory().expect("open");
+        storage.init().expect("init");
+
+        let mut stmt = storage
+            .conn
+            .prepare(&format!(
+                "EXPLAIN QUERY PLAN {}",
+                account_subscription_list_sql()
+            ))
+            .expect("prepare explain");
+        let mut rows = stmt.query([]).expect("query explain");
+        let mut plan = String::new();
+        while let Some(row) = rows.next().expect("read explain row") {
+            let detail: String = row.get(3).expect("plan detail");
+            plan.push_str(&detail);
+            plan.push('\n');
+        }
+
+        assert!(
+            plan.contains("idx_account_subscriptions_updated_at"),
+            "subscription list should use updated-at order index, got {plan}"
+        );
+        assert!(
+            !plan.contains("USE TEMP B-TREE FOR ORDER BY"),
+            "subscription list should avoid temp ORDER BY sorting, got {plan}"
+        );
+    }
+    #[test]
+    fn account_subscription_delete_uses_primary_key_index() {
+        let storage = Storage::open_in_memory().expect("open");
+        storage.init().expect("init");
+
+        let mut stmt = storage
+            .conn
+            .prepare(&format!(
+                "EXPLAIN QUERY PLAN {}",
+                delete_account_subscription_for_account_sql()
+            ))
+            .expect("prepare explain");
+        let mut rows = stmt.query(["acc-a"]).expect("query explain");
+        let mut plan = String::new();
+        while let Some(row) = rows.next().expect("read explain row") {
+            let detail: String = row.get(3).expect("plan detail");
+            plan.push_str(&detail);
+            plan.push('\n');
+        }
+
+        assert!(
+            plan.contains("sqlite_autoindex_account_subscriptions_1")
+                || plan.contains("USING INDEX"),
+            "subscription delete should use account_id primary-key index, got {plan}"
         );
     }
 }

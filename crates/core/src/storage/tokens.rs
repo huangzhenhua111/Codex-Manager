@@ -3,6 +3,10 @@ use rusqlite::{params_from_iter, Result, Row};
 use super::key_id_filters::{normalize_text_ids, text_id_in_clause, SQLITE_IN_CLAUSE_BATCH_SIZE};
 use super::{AccountImportTokenSubject, AccountTokenCandidate, AccountTokenPlan, Storage, Token};
 
+pub(super) fn delete_token_for_account_sql() -> &'static str {
+    "DELETE FROM tokens WHERE account_id = ?1"
+}
+
 impl Storage {
     /// 函数 `insert_token`
     ///
@@ -62,43 +66,8 @@ impl Storage {
             return Ok(Vec::new());
         }
 
-        let mut stmt = self.conn.prepare(
-            "WITH latest_status AS (
-                SELECT
-                    account_id,
-                    message,
-                    ROW_NUMBER() OVER (
-                        PARTITION BY account_id
-                        ORDER BY created_at DESC, id DESC
-                    ) AS rn
-                FROM events
-                WHERE type = 'account_status_update'
-             )
-             SELECT tokens.account_id, tokens.id_token, tokens.access_token, tokens.refresh_token, tokens.api_key_access_token, tokens.last_refresh
-             FROM tokens
-             LEFT JOIN latest_status
-               ON latest_status.account_id = tokens.account_id
-              AND latest_status.rn = 1
-             WHERE TRIM(COALESCE(refresh_token, '')) <> ''
-               AND (
-                    latest_status.message IS NULL
-                    OR (
-                        latest_status.message NOT LIKE '% reason=account_deactivated'
-                        AND latest_status.message NOT LIKE '% reason=workspace_deactivated'
-                        AND latest_status.message NOT LIKE '% reason=refresh_token_region_blocked'
-                    )
-               )
-               AND (
-                    next_refresh_at IS NULL
-                    OR next_refresh_at <= ?1
-                    OR (
-                        access_token_exp IS NOT NULL
-                        AND access_token_exp <= ?2
-                    )
-               )
-             ORDER BY COALESCE(tokens.next_refresh_at, 0) ASC, tokens.account_id ASC
-             LIMIT ?3",
-        )?;
+        let sql = tokens_due_for_refresh_sql();
+        let mut stmt = self.conn.prepare(sql)?;
         let mut rows = stmt.query((refresh_due_cutoff_ts, access_exp_cutoff_ts, limit as i64))?;
         let mut out = Vec::new();
         while let Some(row) = rows.next()? {
@@ -172,15 +141,12 @@ impl Storage {
     /// # 返回
     /// 返回函数执行结果
     pub fn token_count(&self) -> Result<i64> {
-        self.conn
-            .query_row("SELECT COUNT(1) FROM tokens", [], |row| row.get(0))
+        self.conn.query_row(token_count_sql(), [], |row| row.get(0))
     }
 
     pub fn token_account_count(&self) -> Result<i64> {
         self.conn
-            .query_row("SELECT COUNT(DISTINCT account_id) FROM tokens", [], |row| {
-                row.get(0)
-            })
+            .query_row(token_account_count_sql(), [], |row| row.get(0))
     }
 
     /// 函数 `list_tokens`
@@ -195,9 +161,7 @@ impl Storage {
     /// # 返回
     /// 返回函数执行结果
     pub fn list_tokens(&self) -> Result<Vec<Token>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT account_id, id_token, access_token, refresh_token, api_key_access_token, last_refresh FROM tokens",
-        )?;
+        let mut stmt = self.conn.prepare(token_list_sql())?;
         let mut rows = stmt.query([])?;
         let mut out = Vec::new();
         while let Some(row) = rows.next()? {
@@ -207,15 +171,7 @@ impl Storage {
     }
 
     pub fn list_account_token_candidates(&self) -> Result<Vec<AccountTokenCandidate>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT
-                account_id,
-                TRIM(COALESCE(access_token, '')) <> '',
-                TRIM(COALESCE(refresh_token, '')) <> '',
-                last_refresh
-             FROM tokens
-             ORDER BY account_id ASC",
-        )?;
+        let mut stmt = self.conn.prepare(account_token_candidates_sql())?;
         let mut rows = stmt.query([])?;
         let mut out = Vec::new();
         while let Some(row) = rows.next()? {
@@ -225,17 +181,7 @@ impl Storage {
     }
 
     pub fn list_usable_account_token_candidates(&self) -> Result<Vec<AccountTokenCandidate>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT
-                account_id,
-                1,
-                1,
-                last_refresh
-             FROM tokens
-             WHERE TRIM(COALESCE(access_token, '')) <> ''
-               AND TRIM(COALESCE(refresh_token, '')) <> ''
-             ORDER BY account_id ASC",
-        )?;
+        let mut stmt = self.conn.prepare(usable_account_token_candidates_sql())?;
         let mut rows = stmt.query([])?;
         let mut out = Vec::new();
         while let Some(row) = rows.next()? {
@@ -283,11 +229,7 @@ impl Storage {
     }
 
     pub fn list_account_import_token_subjects(&self) -> Result<Vec<AccountImportTokenSubject>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT account_id, id_token, access_token, refresh_token
-             FROM tokens
-             ORDER BY account_id ASC",
-        )?;
+        let mut stmt = self.conn.prepare(account_import_token_subjects_sql())?;
         let mut rows = stmt.query([])?;
         let mut out = Vec::new();
         while let Some(row) = rows.next()? {
@@ -345,12 +287,7 @@ impl Storage {
     /// # 返回
     /// 返回函数执行结果
     pub fn find_token_by_account_id(&self, account_id: &str) -> Result<Option<Token>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT account_id, id_token, access_token, refresh_token, api_key_access_token, last_refresh
-             FROM tokens
-             WHERE account_id = ?1
-             LIMIT 1",
-        )?;
+        let mut stmt = self.conn.prepare(token_by_account_sql())?;
         let mut rows = stmt.query([account_id])?;
         if let Some(row) = rows.next()? {
             Ok(Some(map_token_row(row)?))
@@ -409,6 +346,103 @@ impl Storage {
     }
 }
 
+fn token_count_sql() -> &'static str {
+    "SELECT COUNT(1) FROM tokens"
+}
+
+fn token_account_count_sql() -> &'static str {
+    "SELECT COUNT(DISTINCT account_id) FROM tokens"
+}
+
+fn token_list_sql() -> &'static str {
+    "SELECT account_id, id_token, access_token, refresh_token, api_key_access_token, last_refresh
+     FROM tokens"
+}
+
+fn account_token_candidates_sql() -> &'static str {
+    "SELECT
+        account_id,
+        TRIM(COALESCE(access_token, '')) <> '',
+        TRIM(COALESCE(refresh_token, '')) <> '',
+        last_refresh
+     FROM tokens
+     ORDER BY account_id ASC"
+}
+
+fn usable_account_token_candidates_sql() -> &'static str {
+    "SELECT
+        account_id,
+        1,
+        1,
+        last_refresh
+     FROM tokens
+     WHERE TRIM(COALESCE(access_token, '')) <> ''
+       AND TRIM(COALESCE(refresh_token, '')) <> ''
+     ORDER BY account_id ASC"
+}
+
+fn account_import_token_subjects_sql() -> &'static str {
+    "SELECT account_id, id_token, access_token, refresh_token
+     FROM tokens
+     ORDER BY account_id ASC"
+}
+
+fn token_by_account_sql() -> &'static str {
+    "SELECT account_id, id_token, access_token, refresh_token, api_key_access_token, last_refresh
+     FROM tokens
+     WHERE account_id = ?1
+     LIMIT 1"
+}
+
+fn tokens_due_for_refresh_sql() -> &'static str {
+    "WITH latest_status AS (
+        SELECT
+            e.account_id,
+            e.message,
+            ROW_NUMBER() OVER (
+                PARTITION BY e.account_id
+                ORDER BY e.created_at DESC, e.id DESC
+            ) AS rn
+        FROM tokens target_tokens
+        INNER JOIN events e
+          ON e.account_id = target_tokens.account_id
+        WHERE e.type = 'account_status_update'
+          AND TRIM(COALESCE(target_tokens.refresh_token, '')) <> ''
+          AND (
+                target_tokens.next_refresh_at IS NULL
+                OR target_tokens.next_refresh_at <= ?1
+                OR (
+                    target_tokens.access_token_exp IS NOT NULL
+                    AND target_tokens.access_token_exp <= ?2
+                )
+          )
+     )
+     SELECT tokens.account_id, tokens.id_token, tokens.access_token, tokens.refresh_token, tokens.api_key_access_token, tokens.last_refresh
+     FROM tokens
+     LEFT JOIN latest_status
+       ON latest_status.account_id = tokens.account_id
+      AND latest_status.rn = 1
+     WHERE TRIM(COALESCE(refresh_token, '')) <> ''
+       AND (
+            latest_status.message IS NULL
+            OR (
+                latest_status.message NOT LIKE '% reason=account_deactivated'
+                AND latest_status.message NOT LIKE '% reason=workspace_deactivated'
+                AND latest_status.message NOT LIKE '% reason=refresh_token_region_blocked'
+            )
+       )
+       AND (
+            next_refresh_at IS NULL
+            OR next_refresh_at <= ?1
+            OR (
+                access_token_exp IS NOT NULL
+                AND access_token_exp <= ?2
+            )
+       )
+     ORDER BY COALESCE(tokens.next_refresh_at, 0) ASC, tokens.account_id ASC
+     LIMIT ?3"
+}
+
 /// 函数 `map_token_row`
 ///
 /// 作者: gaohongshun
@@ -452,11 +486,7 @@ fn list_tokens_for_accounts_chunk(storage: &Storage, account_ids: &[String]) -> 
     let Some((condition, params)) = text_id_in_clause("account_id", account_ids) else {
         return Ok(Vec::new());
     };
-    let sql = format!(
-        "SELECT account_id, id_token, access_token, refresh_token, api_key_access_token, last_refresh
-         FROM tokens
-         WHERE {condition}"
-    );
+    let sql = tokens_for_accounts_chunk_sql(&condition);
     let mut stmt = storage.conn.prepare(&sql)?;
     let mut rows = stmt.query(params_from_iter(params))?;
     let mut out = Vec::new();
@@ -466,6 +496,14 @@ fn list_tokens_for_accounts_chunk(storage: &Storage, account_ids: &[String]) -> 
     Ok(out)
 }
 
+fn tokens_for_accounts_chunk_sql(account_condition: &str) -> String {
+    format!(
+        "SELECT account_id, id_token, access_token, refresh_token, api_key_access_token, last_refresh
+         FROM tokens
+         WHERE {account_condition}"
+    )
+}
+
 fn list_account_token_candidates_for_accounts_chunk(
     storage: &Storage,
     account_ids: &[String],
@@ -473,15 +511,7 @@ fn list_account_token_candidates_for_accounts_chunk(
     let Some((condition, params)) = text_id_in_clause("account_id", account_ids) else {
         return Ok(Vec::new());
     };
-    let sql = format!(
-        "SELECT
-            account_id,
-            TRIM(COALESCE(access_token, '')) <> '',
-            TRIM(COALESCE(refresh_token, '')) <> '',
-            last_refresh
-         FROM tokens
-         WHERE {condition}"
-    );
+    let sql = account_token_candidates_for_accounts_chunk_sql(&condition);
     let mut stmt = storage.conn.prepare(&sql)?;
     let mut rows = stmt.query(params_from_iter(params))?;
     let mut out = Vec::new();
@@ -489,6 +519,18 @@ fn list_account_token_candidates_for_accounts_chunk(
         out.push(map_account_token_candidate_row(row)?);
     }
     Ok(out)
+}
+
+fn account_token_candidates_for_accounts_chunk_sql(account_condition: &str) -> String {
+    format!(
+        "SELECT
+            account_id,
+            TRIM(COALESCE(access_token, '')) <> '',
+            TRIM(COALESCE(refresh_token, '')) <> '',
+            last_refresh
+         FROM tokens
+         WHERE {account_condition}"
+    )
 }
 
 fn list_usable_account_token_candidates_for_accounts_chunk(
@@ -498,17 +540,7 @@ fn list_usable_account_token_candidates_for_accounts_chunk(
     let Some((condition, params)) = text_id_in_clause("account_id", account_ids) else {
         return Ok(Vec::new());
     };
-    let sql = format!(
-        "SELECT
-            account_id,
-            1,
-            1,
-            last_refresh
-         FROM tokens
-         WHERE {condition}
-           AND TRIM(COALESCE(access_token, '')) <> ''
-           AND TRIM(COALESCE(refresh_token, '')) <> ''"
-    );
+    let sql = usable_account_token_candidates_for_accounts_chunk_sql(&condition);
     let mut stmt = storage.conn.prepare(&sql)?;
     let mut rows = stmt.query(params_from_iter(params))?;
     let mut out = Vec::new();
@@ -518,6 +550,20 @@ fn list_usable_account_token_candidates_for_accounts_chunk(
     Ok(out)
 }
 
+fn usable_account_token_candidates_for_accounts_chunk_sql(account_condition: &str) -> String {
+    format!(
+        "SELECT
+            account_id,
+            1,
+            1,
+            last_refresh
+         FROM tokens
+         WHERE {account_condition}
+           AND TRIM(COALESCE(access_token, '')) <> ''
+           AND TRIM(COALESCE(refresh_token, '')) <> ''"
+    )
+}
+
 fn list_account_token_plans_for_accounts_chunk(
     storage: &Storage,
     account_ids: &[String],
@@ -525,11 +571,7 @@ fn list_account_token_plans_for_accounts_chunk(
     let Some((condition, params)) = text_id_in_clause("account_id", account_ids) else {
         return Ok(Vec::new());
     };
-    let sql = format!(
-        "SELECT account_id, id_token, access_token
-         FROM tokens
-         WHERE {condition}"
-    );
+    let sql = account_token_plans_for_accounts_chunk_sql(&condition);
     let mut stmt = storage.conn.prepare(&sql)?;
     let mut rows = stmt.query(params_from_iter(params))?;
     let mut out = Vec::new();
@@ -537,6 +579,14 @@ fn list_account_token_plans_for_accounts_chunk(
         out.push(map_account_token_plan_row(row)?);
     }
     Ok(out)
+}
+
+fn account_token_plans_for_accounts_chunk_sql(account_condition: &str) -> String {
+    format!(
+        "SELECT account_id, id_token, access_token
+         FROM tokens
+         WHERE {account_condition}"
+    )
 }
 
 #[cfg(test)]
@@ -570,6 +620,32 @@ mod tests {
         }
     }
 
+    fn collect_query_plan(storage: &Storage, sql: &str) -> String {
+        let mut stmt = storage.conn.prepare(sql).expect("prepare explain");
+        let mut rows = stmt.query([]).expect("query explain");
+        let mut plan = String::new();
+        while let Some(row) = rows.next().expect("read explain row") {
+            let detail: String = row.get(3).expect("plan detail");
+            plan.push_str(&detail);
+            plan.push('\n');
+        }
+        plan
+    }
+
+    fn collect_query_plan_with_params<P>(storage: &Storage, sql: &str, params: P) -> String
+    where
+        P: rusqlite::Params,
+    {
+        let mut stmt = storage.conn.prepare(sql).expect("prepare explain");
+        let mut rows = stmt.query(params).expect("query explain");
+        let mut plan = String::new();
+        while let Some(row) = rows.next().expect("read explain row") {
+            let detail: String = row.get(3).expect("plan detail");
+            plan.push_str(&detail);
+            plan.push('\n');
+        }
+        plan
+    }
     #[test]
     fn list_account_token_plans_for_accounts_reads_only_requested_plan_fields() {
         let storage = Storage::open_in_memory().expect("open");
@@ -804,30 +880,59 @@ mod tests {
     }
 
     #[test]
+    fn account_token_full_list_helpers_use_primary_key_ordering() {
+        let storage = Storage::open_in_memory().expect("open");
+        storage.init().expect("init");
+
+        for sql in [
+            account_token_candidates_sql(),
+            usable_account_token_candidates_sql(),
+            account_import_token_subjects_sql(),
+        ] {
+            let plan = collect_query_plan(&storage, &format!("EXPLAIN QUERY PLAN {sql}"));
+            assert!(
+                plan.contains("sqlite_autoindex_tokens_1") || plan.contains("USING INDEX"),
+                "expected full token list query to scan token primary-key order, got {plan}"
+            );
+            assert!(
+                !plan.contains("USE TEMP B-TREE FOR ORDER BY"),
+                "full token list query should avoid ORDER BY temp sorting, got {plan}"
+            );
+        }
+    }
+
+    #[test]
+    fn token_lookup_helpers_use_primary_key_indexes() {
+        let storage = Storage::open_in_memory().expect("open");
+        storage.init().expect("init");
+
+        let token_plan = collect_query_plan_with_params(
+            &storage,
+            &format!("EXPLAIN QUERY PLAN {}", token_by_account_sql()),
+            ["acc-a"],
+        );
+        assert!(
+            token_plan.contains("sqlite_autoindex_tokens_1") || token_plan.contains("USING INDEX"),
+            "expected token lookup by account primary key, got {token_plan}"
+        );
+
+        let account_count_plan = collect_query_plan(
+            &storage,
+            &format!("EXPLAIN QUERY PLAN {}", token_account_count_sql()),
+        );
+        assert!(
+            account_count_plan.contains("sqlite_autoindex_tokens_1")
+                || account_count_plan.contains("USING COVERING INDEX"),
+            "expected token account count to use account primary key, got {account_count_plan}"
+        );
+    }
+    #[test]
     fn list_account_token_candidates_for_accounts_uses_account_lookup_index() {
         let storage = Storage::open_in_memory().expect("open");
         storage.init().expect("init");
 
-        let mut stmt = storage
-            .conn
-            .prepare(
-                "EXPLAIN QUERY PLAN
-                 SELECT
-                    account_id,
-                    TRIM(COALESCE(access_token, '')) <> '',
-                    TRIM(COALESCE(refresh_token, '')) <> '',
-                    last_refresh
-                 FROM tokens
-                 WHERE account_id IN (?1)",
-            )
-            .expect("prepare explain");
-        let mut rows = stmt.query(["acc-a"]).expect("query explain");
-        let mut plan = String::new();
-        while let Some(row) = rows.next().expect("read explain row") {
-            let detail: String = row.get(3).expect("plan detail");
-            plan.push_str(&detail);
-            plan.push('\n');
-        }
+        let sql = account_token_candidates_for_accounts_chunk_sql("account_id IN ('acc-a')");
+        let plan = collect_query_plan(&storage, &format!("EXPLAIN QUERY PLAN {sql}"));
 
         assert!(
             plan.contains("sqlite_autoindex_tokens_1") || plan.contains("USING INDEX"),
@@ -840,32 +945,48 @@ mod tests {
     }
 
     #[test]
+    fn list_tokens_for_accounts_uses_account_lookup_index() {
+        let storage = Storage::open_in_memory().expect("open");
+        storage.init().expect("init");
+
+        let sql = tokens_for_accounts_chunk_sql("account_id IN ('acc-a')");
+        let plan = collect_query_plan(&storage, &format!("EXPLAIN QUERY PLAN {sql}"));
+
+        assert!(
+            plan.contains("sqlite_autoindex_tokens_1") || plan.contains("USING INDEX"),
+            "expected token row lookup by account index in plan, got {plan}"
+        );
+        assert!(
+            !plan.contains("USE TEMP B-TREE FOR ORDER BY"),
+            "token row chunk query should avoid per-chunk ORDER BY temp sorting, got {plan}"
+        );
+    }
+
+    #[test]
+    fn list_account_token_plans_for_accounts_uses_account_lookup_index() {
+        let storage = Storage::open_in_memory().expect("open");
+        storage.init().expect("init");
+
+        let sql = account_token_plans_for_accounts_chunk_sql("account_id IN ('acc-a')");
+        let plan = collect_query_plan(&storage, &format!("EXPLAIN QUERY PLAN {sql}"));
+
+        assert!(
+            plan.contains("sqlite_autoindex_tokens_1") || plan.contains("USING INDEX"),
+            "expected token plan lookup by account index in plan, got {plan}"
+        );
+        assert!(
+            !plan.contains("USE TEMP B-TREE FOR ORDER BY"),
+            "token plan chunk query should avoid per-chunk ORDER BY temp sorting, got {plan}"
+        );
+    }
+
+    #[test]
     fn list_usable_account_token_candidates_for_accounts_uses_account_lookup_index() {
         let storage = Storage::open_in_memory().expect("open");
         storage.init().expect("init");
 
-        let mut stmt = storage
-            .conn
-            .prepare(
-                "EXPLAIN QUERY PLAN
-                 SELECT
-                    account_id,
-                    1,
-                    1,
-                    last_refresh
-                 FROM tokens
-                 WHERE account_id IN (?1)
-                   AND TRIM(COALESCE(access_token, '')) <> ''
-                   AND TRIM(COALESCE(refresh_token, '')) <> ''",
-            )
-            .expect("prepare explain");
-        let mut rows = stmt.query(["acc-a"]).expect("query explain");
-        let mut plan = String::new();
-        while let Some(row) = rows.next().expect("read explain row") {
-            let detail: String = row.get(3).expect("plan detail");
-            plan.push_str(&detail);
-            plan.push('\n');
-        }
+        let sql = usable_account_token_candidates_for_accounts_chunk_sql("account_id IN ('acc-a')");
+        let plan = collect_query_plan(&storage, &format!("EXPLAIN QUERY PLAN {sql}"));
 
         assert!(
             plan.contains("sqlite_autoindex_tokens_1") || plan.contains("USING INDEX"),
@@ -882,46 +1003,10 @@ mod tests {
         let storage = Storage::open_in_memory().expect("open");
         storage.init().expect("init");
 
+        let sql = tokens_due_for_refresh_sql();
         let mut stmt = storage
             .conn
-            .prepare(
-                "EXPLAIN QUERY PLAN
-                 WITH latest_status AS (
-                    SELECT
-                        account_id,
-                        message,
-                        ROW_NUMBER() OVER (
-                            PARTITION BY account_id
-                            ORDER BY created_at DESC, id DESC
-                        ) AS rn
-                    FROM events
-                    WHERE type = 'account_status_update'
-                 )
-                 SELECT tokens.account_id
-                 FROM tokens
-                 LEFT JOIN latest_status
-                   ON latest_status.account_id = tokens.account_id
-                  AND latest_status.rn = 1
-                 WHERE TRIM(COALESCE(refresh_token, '')) <> ''
-                   AND (
-                        latest_status.message IS NULL
-                        OR (
-                            latest_status.message NOT LIKE '% reason=account_deactivated'
-                            AND latest_status.message NOT LIKE '% reason=workspace_deactivated'
-                            AND latest_status.message NOT LIKE '% reason=refresh_token_region_blocked'
-                        )
-                   )
-                   AND (
-                        next_refresh_at IS NULL
-                        OR next_refresh_at <= ?1
-                        OR (
-                            access_token_exp IS NOT NULL
-                            AND access_token_exp <= ?2
-                        )
-                   )
-                 ORDER BY COALESCE(tokens.next_refresh_at, 0) ASC, tokens.account_id ASC
-                 LIMIT ?3",
-            )
+            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
             .expect("prepare explain");
         let mut rows = stmt
             .query((100_i64, 100_i64, 10_i64))
@@ -933,6 +1018,10 @@ mod tests {
             plan.push('\n');
         }
 
+        assert!(
+            sql.contains("FROM tokens target_tokens"),
+            "expected latest status CTE to scope events through due tokens, got {sql}"
+        );
         assert!(
             plan.contains("idx_tokens_refresh_due_order"),
             "expected token refresh due order index in plan, got {plan}"
@@ -1031,5 +1120,21 @@ mod tests {
         assert_eq!(plans[0].account_id, target);
         assert_eq!(plans[0].id_token, "acc-0949.id");
         assert_eq!(plans[0].access_token, "acc-0949.access");
+    }
+    #[test]
+    fn token_delete_uses_primary_key_index() {
+        let storage = Storage::open_in_memory().expect("open");
+        storage.init().expect("init");
+
+        let plan = collect_query_plan_with_params(
+            &storage,
+            &format!("EXPLAIN QUERY PLAN {}", delete_token_for_account_sql()),
+            ["acc-a"],
+        );
+
+        assert!(
+            plan.contains("sqlite_autoindex_tokens_1") || plan.contains("USING INDEX"),
+            "token delete should use account_id primary-key index, got {plan}"
+        );
     }
 }

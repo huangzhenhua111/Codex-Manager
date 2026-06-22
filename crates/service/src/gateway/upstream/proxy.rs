@@ -314,11 +314,47 @@ fn resolve_aggregate_candidates_for_route(
     aggregate_api_id: Option<&str>,
     model_for_log: Option<&str>,
 ) -> Result<Vec<codexmanager_core::storage::AggregateApi>, String> {
-    let mut candidates = super::protocol::aggregate_api::resolve_aggregate_api_rotation_candidates(
-        storage,
-        protocol_type,
-        aggregate_api_id,
-    )?;
+    let explicit_candidate =
+        resolve_active_explicit_aggregate_candidate(storage, aggregate_api_id)?;
+    let mut candidates =
+        match super::protocol::aggregate_api::resolve_aggregate_api_rotation_candidates(
+            storage,
+            protocol_type,
+            aggregate_api_id,
+        ) {
+            Ok(candidates) => candidates,
+            Err(_) if explicit_candidate.is_some() => Vec::new(),
+            Err(err) => return Err(err),
+        };
+    if let Some(explicit_candidate) = explicit_candidate {
+        candidates.retain(|candidate| candidate.id != explicit_candidate.id);
+        candidates.insert(0, explicit_candidate);
+    }
+    apply_aggregate_model_mapping(storage, candidates, model_for_log)
+}
+
+fn resolve_active_explicit_aggregate_candidate(
+    storage: &codexmanager_core::storage::Storage,
+    aggregate_api_id: Option<&str>,
+) -> Result<Option<codexmanager_core::storage::AggregateApi>, String> {
+    let Some(api_id) = aggregate_api_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+
+    let candidate = storage
+        .find_aggregate_api_by_id(api_id)
+        .map_err(|err| format!("find explicit aggregate api failed: {err}"))?;
+    Ok(candidate.filter(|api| api.status.trim().eq_ignore_ascii_case("active")))
+}
+
+fn apply_aggregate_model_mapping(
+    storage: &codexmanager_core::storage::Storage,
+    mut candidates: Vec<codexmanager_core::storage::AggregateApi>,
+    model_for_log: Option<&str>,
+) -> Result<Vec<codexmanager_core::storage::AggregateApi>, String> {
     let Some(model) = model_for_log
         .map(str::trim)
         .filter(|value| !value.is_empty())
@@ -1057,11 +1093,15 @@ mod tests {
     }
 
     fn insert_test_aggregate_api(storage: &Storage, id: &str) {
+        insert_test_aggregate_api_with_provider(storage, id, "codex");
+    }
+
+    fn insert_test_aggregate_api_with_provider(storage: &Storage, id: &str, provider_type: &str) {
         let now = now_ts();
         storage
             .insert_aggregate_api(&AggregateApi {
                 id: id.to_string(),
-                provider_type: "codex".to_string(),
+                provider_type: provider_type.to_string(),
                 supplier_name: Some(id.to_string()),
                 sort: 0,
                 url: format!("https://{id}.example/v1"),
@@ -1370,6 +1410,79 @@ mod tests {
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].id, "agg-with-model");
         assert_eq!(candidates[0].model_override.as_deref(), Some("vendor-top"));
+    }
+
+    #[test]
+    fn explicit_aggregate_route_candidate_precedes_provider_candidates() {
+        let storage = Storage::open_in_memory().expect("open storage");
+        storage.init().expect("init storage");
+        insert_test_aggregate_api_with_provider(&storage, "agg-codex-explicit", "codex");
+        insert_test_aggregate_api_with_provider(&storage, "agg-claude-explicit", "claude");
+        let now = now_ts();
+        for (id, source_id, upstream_model) in [
+            ("map-codex-explicit", "agg-codex-explicit", "vendor-codex"),
+            (
+                "map-claude-explicit",
+                "agg-claude-explicit",
+                "vendor-claude",
+            ),
+        ] {
+            storage
+                .upsert_model_source_mapping(&ModelSourceMapping {
+                    id: id.to_string(),
+                    platform_model_slug: "vendor-cross-provider".to_string(),
+                    source_kind: "aggregate_api".to_string(),
+                    source_id: source_id.to_string(),
+                    upstream_model: upstream_model.to_string(),
+                    enabled: true,
+                    priority: 0,
+                    weight: 1,
+                    billing_model_slug: None,
+                    created_at: now,
+                    updated_at: now,
+                })
+                .expect("seed aggregate mapping");
+        }
+
+        let openai_candidates = resolve_aggregate_candidates_for_route(
+            &storage,
+            "openai_responses",
+            Some("agg-claude-explicit"),
+            Some("vendor-cross-provider"),
+        )
+        .expect("resolve openai candidates with explicit claude aggregate");
+        let openai_candidate_ids = openai_candidates
+            .iter()
+            .map(|candidate| candidate.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            openai_candidate_ids,
+            vec!["agg-claude-explicit", "agg-codex-explicit"]
+        );
+        assert_eq!(
+            openai_candidates[0].model_override.as_deref(),
+            Some("vendor-claude")
+        );
+
+        let anthropic_candidates = resolve_aggregate_candidates_for_route(
+            &storage,
+            "anthropic_native",
+            Some("agg-codex-explicit"),
+            Some("vendor-cross-provider"),
+        )
+        .expect("resolve anthropic candidates with explicit codex aggregate");
+        let anthropic_candidate_ids = anthropic_candidates
+            .iter()
+            .map(|candidate| candidate.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            anthropic_candidate_ids,
+            vec!["agg-codex-explicit", "agg-claude-explicit"]
+        );
+        assert_eq!(
+            anthropic_candidates[0].model_override.as_deref(),
+            Some("vendor-codex")
+        );
     }
 
     #[test]

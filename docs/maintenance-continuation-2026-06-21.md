@@ -1,0 +1,4962 @@
+# CodexManager continuation notes - 2026-06-21
+
+## Confirmed context
+
+- Runtime environment verified: Windows PowerShell Core 7.6.2.
+- Repository root: `D:\MyComputer\own\GPTTeam\CodexManager\CodexManager`.
+- Branch state at start: `main...origin/main`, clean worktree.
+- Root `AGENTS.md` and `apps/AGENTS.md` were read before edits.
+- Local `./skills/skill-router/SKILL.md` is absent; global `skill-router` was read and routing stayed single-agent.
+
+## Current goal
+
+- Continue system-wide maintainability and modularity cleanup.
+- Remove unnecessary functionality only when the code evidence shows it is safe.
+- Keep SQLite performance as a secondary priority.
+- Improve upstream request performance by reusing HTTP clients instead of rebuilding a client per request where safe.
+
+## SQLite scan findings
+
+- `crates/core` already has substantial SQLite work through migration `108_accounts_cleanup_status_lookup_index`.
+- Request logs have ordered composite indexes and query-plan tests for exact filters, pagination-before-token join, and redundant index removal.
+- Accounts, aggregate APIs, plugins, model groups, model price rules, quota pools, events, tokens, usage, and API keys already contain query-plan tests around common list/filter paths.
+- No new SQLite index was added in this continuation pass because the scanned hot paths already had targeted indexes and tests.
+
+## Upstream client reuse finding
+
+- Blocking upstream clients already use cached `reqwest::blocking::Client` instances via `UPSTREAM_CLIENT` and `UPSTREAM_CLIENT_POOL`.
+- Async upstream requests used `async_upstream_client_for_account()`, but that function rebuilt a `reqwest::Client` every call through `build_async_upstream_client_with_proxy(...)`.
+- This matched the updated goal's concern that upstream requests may create a new client each time.
+
+## Current edit
+
+- Updated `crates/service/src/gateway/core/runtime_config.rs`.
+- Added a cached default async client `ASYNC_UPSTREAM_CLIENT`.
+- Added async clients to `UpstreamClientPool`.
+- Changed `async_upstream_client_for_account()` to return a cloned cached async client, using account-stable proxy pool selection when configured.
+- Kept `fresh_async_upstream_client_for_account()` building a new client for retry-after-fresh-client behavior.
+- Updated `crates/service/src/gateway/model_picker/request.rs`.
+- Added a cached model-picker HTTP client keyed by current Codex `User-Agent` and upstream proxy URL.
+- Changed normal model-list requests to reuse the cached model-picker client.
+- Kept the retry-after-fresh-client behavior for model-list request send failures.
+
+## Validation completed
+
+- `cargo fmt --check` passed after formatting.
+- `cargo test -p codexmanager-service async_upstream_client_for_account_reuses_cached` passed: 2 tests.
+- `cargo test -p codexmanager-service upstream_client_pool_builds_matching_blocking_and_async_clients` passed: 1 test.
+- `cargo test -p codexmanager-service model_picker_client_reuses_cached_client_until_config_changes` passed: 1 test.
+- `cargo test -p codexmanager-service model_picker` passed: 17 tests.
+- `cargo test -p codexmanager-service attempt_flow` passed: 43 unit tests plus 1 `gateway_logs` integration test.
+- `cargo test -p codexmanager-service upstream_transport` passed: 1 matching test.
+
+## Follow-up scan notes
+
+- `crates/service/src/http/proxy_runtime.rs` builds its local backend client once when `run_front_proxy()` starts and stores it in `ProxyState`; this is already request-reuse friendly.
+- `crates/service/src/account/account_warmup.rs` builds one warmup client per warmup batch and reuses it across selected accounts.
+- `crates/service/src/auth/auth_tokens.rs` already uses a cached default auth client and only builds a no-proxy loopback client for loopback issuers.
+- `crates/service/src/usage/usage_http.rs` already has cached usage/subscription HTTP clients and explicit reload hooks.
+- Remaining `reqwest::Client::new()` call sites found in `gateway/upstream/attempt_flow/postprocess.rs`, `gateway/upstream/protocol/aggregate_api.rs`, and tests are test/local helper paths, not the hot request client path changed in this pass.
+- SQLite follow-up scan found `conversation_bindings` already had suitable indexes from migration `034_conversation_bindings`, but storage tests did not prove those indexes remain in the query plan.
+- Added query-plan regression coverage in `crates/core/src/storage/tests/conversation_bindings_tests.rs` for primary-key lookup, account cleanup, and stale binding cleanup.
+- No new SQLite migration was added in this step because the existing indexes are sufficient and the missing piece was regression evidence.
+
+## Additional validation completed
+
+- `cargo test -p codexmanager-core conversation_binding_lookup_and_cleanup_queries_use_indexes` passed: 1 test.
+- `cargo test -p codexmanager-core conversation_binding` passed: 5 tests.
+- `cargo fmt --check` passed after the conversation binding test addition.
+- `git diff --check` passed; only line-ending warnings were reported by Git.
+- `cargo test -p codexmanager-service model_picker` passed again: 17 tests.
+- `cargo test -p codexmanager-service attempt_flow` passed again: 43 unit tests plus 1 `gateway_logs` integration test.
+
+## Next validation
+
+- Re-check `git status --short --branch`.
+
+## New session continuation
+
+- New window resumed the same active goal.
+- Re-verified runtime: Windows PowerShell Core 7.6.2 in `D:\MyComputer\own\GPTTeam\CodexManager\CodexManager`.
+- Re-read root `AGENTS.md`; local `./skills/skill-router/SKILL.md` is still absent, so routing used the global `skill-router` only.
+- Memory lookup only found prior CodexManager import/PR context; no direct dependency for this maintenance pass.
+- Worktree at resume matched the prior handoff: runtime config, model picker, conversation binding test edits, plus this document.
+
+## Plugin HTTP client reuse
+
+- Scanned plugin runtime/catalog/store call paths.
+- `crates/service/src/plugin/runtime.rs` had two per-call blocking client builders:
+  - `fetch_text()` used by plugin catalog/script fetching.
+  - `fetch_http_value()` used by Rhai plugin `http_get`/`http_post` when the plugin has `network` permission.
+- Added module-level `PLUGIN_HTTP_CLIENT` using `OnceLock<reqwest::blocking::Client>`.
+- Kept the existing 20 second timeout and existing error wording.
+- `fetch_text()` and `fetch_http_value()` now clone the cached client instead of building a new one per call.
+- Added `plugin_http_client_reuses_cached_client` to prove repeated access does not repeatedly build clients.
+
+## Plugin validation completed
+
+- `cargo fmt --check` passed after the plugin runtime edit.
+- `cargo test -p codexmanager-service plugin_http_client_reuses_cached_client` printed `1 passed`.
+- The single-test cargo PTY did not exit after printing success; only two cargo wrapper processes remained, no test binary was running. They were stopped to release the session.
+- `cargo test -p codexmanager-service plugin` passed: 10 tests.
+- A later parallel `cargo test -p codexmanager-service plugin` exposed a race in the initial `OnceLock::set` plugin client cache: concurrent tests could build two clients before one won the cache set.
+- Fixed plugin HTTP cache to use `OnceLock<Mutex<Option<reqwest::blocking::Client>>>` and build inside the lock, so concurrent first callers do not duplicate client construction.
+- Re-ran `cargo test -p codexmanager-service plugin`; it passed: 10 tests.
+
+## Follow-up scan in progress
+
+- Next scan target is `crates/service/src/aggregate_api.rs` `reqwest::blocking::Client::builder()` occurrences.
+- Need distinguish production connection-test/discovery/balance paths from test helpers before changing anything.
+
+## Aggregate API upstream client reuse
+
+- Scanned `crates/service/src/aggregate_api.rs` builder hits.
+- The four direct `reqwest::blocking::Client::builder()` hits in that file are inside unit tests only.
+- Production aggregate API management paths use `gateway::fresh_upstream_client()` for connection test, model discovery, and balance refresh. These are background/manual or scheduled operations; no change made yet.
+- Found a hotter production path in `crates/service/src/gateway/upstream/protocol/aggregate_api.rs`: `proxy_aggregate_request()` created a fresh blocking upstream client for every aggregate API gateway request.
+- Changed aggregate gateway forwarding to use cached `upstream_client()` instead of `fresh_upstream_client()`.
+- Changed aggregate API management/background paths in `crates/service/src/aggregate_api.rs` to use cached `gateway::upstream_client()` for connection test, model discovery, and balance refresh.
+- Kept `fresh_upstream_client_for_account()` and `fresh_async_upstream_client_for_account()` untouched because those are used by retry-after-fresh-client behavior in the regular account upstream path.
+- Re-exported `upstream_client` through `crates/service/src/gateway/mod.rs` for the aggregate protocol module.
+- Added blocking upstream client build counter helpers and `upstream_client_reuses_cached_default_client` in `crates/service/src/gateway/core/tests/runtime_config_tests.rs`.
+
+## Aggregate API validation completed
+
+- `cargo test -p codexmanager-service upstream_client_reuses_cached_default_client` passed: 1 test.
+- `cargo test -p codexmanager-service aggregate_api` passed: 42 tests.
+- `cargo fmt` was run after `cargo fmt --check` reported only import ordering.
+- After moving aggregate API management/background paths to cached clients, `cargo test -p codexmanager-service aggregate_api` passed again: 42 tests.
+- `cargo test -p codexmanager-service usage_refresh_status` completed with 0 matching tests; this only verified compile/test filtering, not a named usage refresh test.
+
+## Current closeout state
+
+- `cargo fmt --check` passed.
+- `git diff --check` passed; Git only warned that LF files will be converted to CRLF when touched.
+- `cargo test -p codexmanager-service model_picker` passed: 17 tests.
+- `cargo test -p codexmanager-service plugin` passed after the cache race fix: 10 tests.
+- `cargo test -p codexmanager-service attempt_flow` passed: 43 unit tests plus 1 `gateway_logs` integration test.
+- `cargo test -p codexmanager-core conversation_binding` passed: 5 tests.
+- Remaining `fresh_upstream_client()` use:
+  - `app_settings/gateway.rs` Codex latest version check.
+  - `fresh_*_for_account` retry/fresh-client paths in account upstream handling.
+  - runtime config builders/tests.
+- No feature removal was performed in this pass; no code evidence was strong enough to safely remove user-facing functionality.
+- Worktree remains uncommitted on `main...origin/main`.
+
+## SQLite follow-up scan - account manager paths
+
+- Re-scanned `crates/core/src/storage` for hot query paths with existing index coverage gaps.
+- Considered adding an `api_key_quota_limits(quota_limit_tokens, key_id)` partial index for `quota_limit_tokens > 0`, but did not add it: the table only stores positive limits through the normal write path, so that index would mostly duplicate the primary key while adding write cost.
+- `account_subscriptions` already has chunking tests and query-plan coverage for avoiding per-chunk temp sorting.
+- `usage` already has query-plan tests for account chunk queries and latest usage lookups.
+- Added query-plan regression tests in `crates/core/src/storage/account_manager.rs`:
+  - `app_session_token_paths_use_token_hash_index` covers active session lookup and revoke-by-token using the token hash index / unique autoindex.
+  - `app_user_delete_dependent_paths_use_lookup_indexes` covers user deletion dependent cleanup paths for sessions and user wallets.
+- No new migration was added in this step because existing indexes are sufficient; the missing piece was regression protection.
+
+## SQLite follow-up validation
+
+- `cargo fmt --check` passed after the account manager test addition.
+- `cargo test -p codexmanager-core app_session_token_paths_use_token_hash_index` passed: 1 test.
+- `cargo test -p codexmanager-core app_user_delete_dependent_paths_use_lookup_indexes` passed: 1 test.
+- `cargo test -p codexmanager-core account_manager` passed: 28 tests.
+- `git diff --check` passed again; Git only reported LF-to-CRLF warnings for touched files.
+
+## Web shell probe client reuse
+
+- Re-read root `AGENTS.md` and `apps/AGENTS.md` before touching web/Tauri-adjacent code.
+- Scanned remaining production `reqwest::Client::builder()` / `Client::new()` call sites after the service client reuse pass.
+- `crates/web/src/main.rs` already builds one no-proxy client into `AppState` and reuses it for RPC, SSE, and gateway proxy requests.
+- `crates/web/src/service_gateway.rs` still built a short-timeout no-proxy probe client inside every `service_rpc_probe()` call.
+- Added `build_service_probe_client()` and changed `ensure_service_running()` to build one probe client per startup check, then pass it through all handshake probes.
+- This keeps startup behavior and error text intact while avoiding repeated client construction during the spawn/probe retry loop.
+- Validation:
+  - `cargo fmt --check` passed.
+  - `cargo test -p codexmanager-web service_probe_client_builds_with_dedicated_config` passed: 1 test.
+
+## Tauri updater HTTP client reuse
+
+- `apps/src-tauri/src/commands/updater/runtime.rs` had `http_client()` building a new blocking client every call.
+- Callers are update check/release metadata fetch and update preparation/asset download in `prepare.rs`.
+- Added `UPDATE_HTTP_CLIENT` with `OnceLock<Mutex<Option<Client>>>` so the updater keeps one blocking HTTP client and returns clones through the existing `http_client() -> Result<Client, String>` interface.
+- Kept the existing 30 second timeout and Chinese error wording.
+- Validation:
+  - `cargo fmt --check` passed.
+  - `cargo test -p CodexManager http_client_can_be_reused` was attempted but failed because `apps/src-tauri` is explicitly excluded from the root workspace.
+  - Correct validation command `cargo test --manifest-path apps/src-tauri/Cargo.toml http_client_can_be_reused` passed: 1 lib test; app binary had 0 matching tests.
+
+## SQLite connection-level performance cleanup
+
+- Scanned `crates/core/src/storage/mod.rs` connection initialization and existing SQLite pragmas.
+- Existing file DB behavior already used `busy_timeout(3000ms)`, `journal_mode=WAL`, and `synchronous=NORMAL`.
+- `open()` and `open_in_memory()` duplicated connection setup in place, and temporary query structures used SQLite defaults.
+- Added `Storage::configure_connection()` and `Storage::configure_file_connection()` to centralize connection-level setup.
+- Added `PRAGMA temp_store=MEMORY` for both file and in-memory storage connections to reduce disk-backed temporary structures for complex report/filter/group queries.
+- Did not add a schema migration because this is a per-connection runtime setting, not persistent schema state.
+- Validation:
+  - `cargo fmt --check` passed.
+  - `cargo test -p codexmanager-core open_in_memory_configures_temp_store_for_query_workloads` passed: 1 test.
+  - `cargo test -p codexmanager-core open_file_configures_wal_and_temp_store` passed: 1 test.
+  - `cargo test -p codexmanager-core migration_tests` passed: 17 tests.
+
+## Gateway maintainability documentation
+
+- Scanned `allow(dead_code)` and `legacy` references for safe feature-removal candidates.
+- `usage_scheduler` has dead-code allowances but is referenced through `usage::refresh::mod.rs`; no safe removal was made.
+- `apps/src-tauri/src/commands/mod.rs` has a crate-level dead-code allowance for command registration surfaces; no safe removal was made.
+- Checked `crates/service/src/gateway/README.md` against the current gateway directory layout.
+- Updated stale maintenance pointers:
+  - `observability/http_bridge.rs` now points at `observability/http_bridge/delivery.rs` and stream reader modules.
+  - request rewrite glob now points at the actual `request/request_rewrite*.rs` files.
+  - retry/deadline/transport guidance now points at `upstream/support/*`, `upstream/attempt_flow/transport.rs`, and `upstream/proxy_pipeline/`.
+- This was documentation-only and did not remove features.
+
+## Current validation status
+
+- `cargo fmt --check` passed.
+- `git diff --check` passed; Git only reported LF-to-CRLF working-copy warnings.
+- `cargo test -p codexmanager-web service_gateway` passed: 6 tests.
+- `cargo test -p codexmanager-core migration_tests` passed: 17 tests.
+- `cargo test -p codexmanager-core account_manager` passed: 28 tests.
+- `cargo test -p codexmanager-core conversation_binding` passed: 5 tests.
+- `cargo test -p codexmanager-service model_picker` passed: 17 tests.
+- `cargo test -p codexmanager-service plugin` passed: 10 tests.
+- `cargo test -p codexmanager-service aggregate_api` passed: 42 tests.
+- `cargo test -p codexmanager-service attempt_flow` passed: 43 lib tests plus 1 `gateway_logs` integration test.
+- `cargo test --manifest-path apps/src-tauri/Cargo.toml http_client_can_be_reused` passed: 1 lib test; app binary had 0 matching tests.
+- `rg "fresh_upstream_client\(" crates/service/src -n` returned no matches, confirming the removed no-arg fresh upstream client is no longer referenced.
+
+## Open continuation notes
+
+- Broad goal remains active; do not mark complete yet.
+- No user-facing feature was removed in this pass because scans did not produce strong evidence for safe removal.
+- Remaining obvious `reqwest::Client::builder()` hits are cached builders, startup-scoped clients, existing usage/auth caches, or tests.
+- A future pass can continue by reviewing large gateway observability modules (`observability/http_bridge/delivery.rs`) or storage hot paths with real query evidence.
+
+## 2026-06-22 continuation - gateway http bridge modularity
+
+- Re-verified runtime: Windows PowerShell Core 7.6.2 in `D:\MyComputer\own\GPTTeam\CodexManager\CodexManager`.
+- Re-read root `AGENTS.md`; used global `skill-router` only because the repo-local `skills/skill-router/SKILL.md` path is absent.
+- Resumed from current worktree and this continuation document rather than relying on compressed context.
+- Scanned `crates/service/src/gateway/observability/http_bridge/delivery.rs`.
+- Chose the lowest-risk modularity improvement: moving the manual HTTP/1.1 chunked streaming writer out of the large protocol delivery file.
+- Added `crates/service/src/gateway/observability/http_bridge/manual_chunked.rs`.
+- Moved the following low-level IO helpers into that module:
+  - `respond_streaming_chunked`
+  - `write_streaming_chunked_response`
+  - chunked header filtering helpers
+  - the streaming read buffer constant
+- Kept protocol adapters, non-stream body conversion, compact normalization, error handling, and response reader logic in `delivery.rs`.
+- Validation:
+  - `cargo test -p codexmanager-service http_bridge` passed after the split: 125 tests.
+  - `cargo fmt` was run after rustfmt reported import ordering changes.
+- Closeout validation completed:
+  - `cargo fmt --check` passed.
+  - `git diff --check` passed; Git only reported LF-to-CRLF working-copy warnings.
+  - `git status --short --branch` showed expected modified/untracked files only.
+
+## 2026-06-22 continuation - image bridge helper extraction
+
+- Continued the same active goal from current worktree state.
+
+## 2026-06-22 continuation - quota pool SQLite query-plan coverage
+
+- Re-read `crates/core/src/storage/quota_pools.rs` before editing because this file already had quota source assignment indexes and several query-plan tests.
+- Confirmed existing schema already has the right structural coverage:
+  - `quota_source_model_assignments` primary key on `(source_kind, source_id, model_slug)`.
+  - `idx_quota_source_model_assignments_source` for source-kind/source-id filtering.
+  - `idx_quota_source_model_assignments_model` for model lookup.
+  - capacity template and override tables use primary keys for ordered list paths.
+- Did not add a migration because no missing index was proven.
+- Added `quota_pool_list_queries_use_existing_index_ordering` in `crates/core/src/storage/quota_pools.rs`.
+- Added a small `assert_no_temp_ordering` helper and reused it in the chunk-query test.
+- The new test locks down:
+  - assignment list by `source_kind` uses the existing source/primary-key index and avoids temp `ORDER BY` sorting.
+  - distinct source-id listing uses the existing source/primary-key index and avoids temp `ORDER BY` sorting.
+  - assignment model listing by source uses the primary-key index and avoids temp `ORDER BY` sorting.
+  - capacity template and override ordered lists avoid temp `ORDER BY` sorting.
+- Validation:
+  - `cargo fmt --check` passed.
+  - `cargo test -p codexmanager-core quota_pool_list_queries_use_existing_index_ordering` passed: 1 test.
+  - `cargo test -p codexmanager-core quota` passed: 21 core unit tests plus 1 storage integration test.
+  - `git diff --check` passed; Git only reported LF-to-CRLF working-copy warnings.
+
+## 2026-06-22 continuation - model catalog SQLite query-plan coverage
+
+- Re-read `crates/core/src/storage/model_options.rs` plus model catalog migrations `047`, `049`, and `095`.
+- Confirmed existing schema already has suitable ordered lookup indexes:
+  - `idx_model_catalog_models_scope_order` on `(scope, sort_index, updated_at DESC, slug)`.
+  - `idx_model_catalog_reasoning_levels_scope_sort` on `(scope, slug, sort_index, effort)`.
+  - `idx_model_catalog_string_items_scope_kind_sort` on `(scope, item_kind, slug, sort_index, value)`.
+- Did not add a migration because the scanned hot list paths are already index-backed.
+- Added `assert_no_temp_ordering` in `model_options` tests.
+- Added `model_catalog_ordered_slug_queries_use_scope_order_index` to prove remote-unedited, API-available, first-API-available, and prefixed API-available slug queries use `idx_model_catalog_models_scope_order` and avoid temp sorting.
+- Added `model_catalog_child_list_queries_use_existing_order_indexes` to prove reasoning-level and string-item list queries use the existing child-table order indexes and avoid temp sorting.
+- Validation:
+  - `cargo fmt --check` passed.
+  - `cargo test -p codexmanager-core model_catalog_ordered_slug_queries_use_scope_order_index` passed: 1 test.
+  - `cargo test -p codexmanager-core model_catalog_child_list_queries_use_existing_order_indexes` passed: 1 test.
+  - `cargo test -p codexmanager-core model_catalog` passed: 16 tests.
+  - `git diff --check` passed; Git only reported LF-to-CRLF working-copy warnings.
+
+## 2026-06-22 continuation - request token hourly rollup query-plan coverage
+
+- Re-read `crates/core/src/storage/request_token_stats.rs`, `crates/core/src/storage/tests/request_token_stats_tests.rs`, and migrations `070`, `087`, `088`.
+- Confirmed hourly rollup schema already has lookup indexes for the main report dimensions:
+  - `idx_request_token_stat_hourly_rollups_bucket_start`.
+  - `idx_request_token_stat_hourly_rollups_key_bucket`.
+  - `idx_request_token_stat_hourly_rollups_owner_bucket`.
+  - `idx_request_token_stat_hourly_rollups_source_bucket`.
+- Did not add a migration because fixed bucket/key/owner/source-id report paths already have matching indexes.
+- Added `assert_uses_index` in request-token stats tests.
+- Added `hourly_rollup_report_queries_match_existing_lookup_indexes` to prove fixed-range hourly rollup report queries use the existing bucket, key, owner, and source lookup indexes.
+- Noted future optimization candidate without changing it in this pass: optional date-range SQL still uses `? IS NULL OR ...` clauses in some paths; changing that would need a parameter-binding refactor and broader regression coverage.
+- Validation:
+  - `cargo fmt --check` passed.
+  - `cargo test -p codexmanager-core hourly_rollup_report_queries_match_existing_lookup_indexes` passed: 1 test.
+  - `cargo test -p codexmanager-core request_token_stats` passed: 18 core unit tests plus 2 storage integration tests.
+  - `git diff --check` passed; Git only reported LF-to-CRLF working-copy warnings.
+- Targeted another low-risk `http_bridge` modularity seam: image generation response conversion helpers in `http_bridge/mod.rs`.
+- Added `crates/service/src/gateway/observability/http_bridge/images.rs`.
+- Moved image-specific helpers/types out of `mod.rs`, including:
+  - `ImagesResponseFormat`
+  - image generation data URL extraction
+  - chat image payload conversion
+  - image API response payload construction
+  - shared image usage extraction helpers used by stream readers.
+- Kept the existing public/internal paths stable by importing the new module helpers back into `http_bridge/mod.rs`.
+- Did not touch protocol delivery, stream reader behavior, response adapter branching, or upstream routing.
+- Validation:
+  - `cargo fmt --check` passed before/after the compile fix.
+  - `cargo test -p codexmanager-service http_bridge` passed: 125 tests.
+
+## 2026-06-22 continuation - compact error helper extraction
+
+- Continued gateway `http_bridge` modularity cleanup from the current dirty worktree.
+- Added `crates/service/src/gateway/observability/http_bridge/compact_errors.rs`.
+- Moved compact and non-success response error helpers out of `delivery.rs`:
+  - compact debug suffix construction.
+  - upstream debug suffix appending.
+  - compact success response schema validation structs.
+  - compact invalid-success and non-success classification.
+  - HTML / Cloudflare challenge / blocked-region detection helpers.
+  - synthesized passthrough and compact error message construction.
+  - header-only Cloudflare challenge hint fallback.
+- Kept `should_suppress_deactivation_delivery()` in `delivery.rs` because it depends on account deactivation and failover semantics rather than body classification.
+- Updated `http_bridge/mod.rs` to register the new module.
+- Updated `delivery.rs` tests to import compact classification helpers from the new module instead of treating them as delivery-local functions.
+- Validation:
+  - `cargo fmt --check` passed.
+  - `cargo test -p codexmanager-service http_bridge` passed: 125 tests.
+  - `git diff --check` passed; Git only reported LF-to-CRLF working-copy warnings.
+
+## Next continuation candidates
+
+- Continue reducing `delivery.rs` by extracting protocol body conversion helpers where boundaries are clear:
+  - Anthropic/Responses body conversion helpers.
+  - Gemini body conversion helpers.
+  - Chat Completions compact conversion helpers.
+- Keep each extraction covered by `cargo test -p codexmanager-service http_bridge` because that suite already covers streaming, non-streaming, compact, image, and passthrough behavior.
+- Do not remove user-facing gateway behavior unless a scan proves it is unreachable or fully duplicated by another maintained path.
+
+## 2026-06-22 continuation - body conversion helper extraction
+
+- Continued reducing `crates/service/src/gateway/observability/http_bridge/delivery.rs` after the compact error extraction.
+- Added `crates/service/src/gateway/observability/http_bridge/body_conversion.rs`.
+- Moved pure compatibility body conversion helpers out of `delivery.rs`:
+  - Anthropic Messages <-> OpenAI Responses JSON body conversion.
+  - OpenAI Responses -> Gemini GenerateContent JSON body conversion.
+  - OpenAI Responses -> Chat Completions JSON body conversion.
+  - Chat Completions -> compact response JSON body conversion.
+  - Images response body conversion and single-SSE payload synthesis helpers.
+  - compatibility error body conversion.
+  - usage merging helper for non-stream converted bodies.
+  - adapter content-type and Gemini CLI response-envelope decisions.
+- Kept actual HTTP response writing, upstream metadata handling, failover/deactivation suppression, and stream delivery in `delivery.rs`.
+- Updated `delivery.rs` tests to import moved conversion helpers from `body_conversion`.
+- Validation:
+  - `cargo fmt --check` passed.
+  - `cargo test -p codexmanager-service http_bridge` passed: 125 tests.
+  - `git diff --check` passed; Git only reported LF-to-CRLF working-copy warnings.
+
+## Updated next continuation candidates
+
+- `delivery.rs` is now primarily delivery/orchestration plus response metadata handling; future modularity work should be smaller and cautious.
+- Potential next low-risk extraction: response metadata/header helpers, if they form a clean group after another scan.
+- Larger protocol stream readers already live under `stream_readers/`; avoid moving those unless a concrete maintenance issue appears.
+- No feature removal has been performed; no scan has yet produced strong evidence for safe removal of user-facing behavior.
+
+## 2026-06-22 continuation - bridge metadata helper extraction
+
+- Added `crates/service/src/gateway/observability/http_bridge/metadata.rs`.
+- Moved upstream response metadata helpers out of `delivery.rs`:
+  - request-id / CF-Ray / auth-error header constants.
+  - `first_upstream_header()`.
+  - `with_bridge_debug_meta()`.
+  - `log_bridge_stream_diagnostics()`.
+- Kept all delivery call sites and result-shaping behavior unchanged; this was a mechanical module boundary cleanup.
+- Validation:
+  - `cargo fmt --check` passed.
+  - `cargo test -p codexmanager-service http_bridge` passed: 125 tests.
+  - `git diff --check` passed; Git only reported LF-to-CRLF working-copy warnings.
+
+## Current module boundary snapshot
+
+- `delivery.rs`: HTTP response delivery, upstream branching, streaming orchestration, failover/deactivation handling, and compact response delivery wrappers.
+- `body_conversion.rs`: compatibility JSON/SSE body conversion and adapter content-type decisions.
+- `compact_errors.rs`: compact/non-success body classification and normalized error message construction.
+- `manual_chunked.rs`: manual HTTP/1.1 chunked response writing.
+- `images.rs`: image generation response helper payloads.
+- `metadata.rs`: upstream metadata extraction, result debug metadata, and stream diagnostics logging.
+
+## 2026-06-22 continuation - account warmup client reuse
+
+- Re-scanned remaining production `reqwest` client construction points after the gateway/client reuse passes.
+- `crates/service/src/http/proxy_runtime.rs` builds one no-proxy backend client when the front proxy starts and stores it in `ProxyState`; no change made.
+- `crates/web/src/main.rs` builds one no-proxy service client into `AppState`; no change made.
+- `crates/service/src/account/account_warmup.rs` still built a blocking upstream client for every warmup operation, then reused it only within that single warmup batch.
+- Added a cached warmup client keyed by current Codex `User-Agent` and upstream proxy URL:
+  - `WARMUP_HTTP_CLIENT: OnceLock<Mutex<Option<WarmupClientCacheEntry>>>`.
+  - `WarmupClientConfig { user_agent, proxy_url }`.
+  - `warmup_client()` returns the cached client when config is unchanged and rebuilds when config changes.
+- Kept the existing timeout, idle pool, proxy application, and warmup request behavior unchanged.
+- Added `warmup_client_reuses_cached_client_for_stable_config` to prove repeated access does not rebuild the client under stable config.
+- Validation:
+  - `cargo test -p codexmanager-service warmup_client_reuses_cached_client_for_stable_config` passed: 1 test.
+  - `cargo test -p codexmanager-service account::warmup` passed: 9 tests.
+  - `cargo fmt --check` passed.
+  - `git diff --check` passed; Git only reported LF-to-CRLF working-copy warnings.
+
+## Remaining client construction scan notes
+
+- `crates/service/src/gateway/core/runtime_config.rs` cached upstream clients are intentional; `fresh_*_for_account` remains for retry-after-fresh-client behavior.
+- `crates/service/src/gateway/model_picker/request.rs` keeps a fresh retry client intentionally after send failure.
+- `crates/service/src/gateway/upstream/attempt_flow/transport.rs` fresh clients are limited to fallback retry paths.
+- `crates/service/src/usage/usage_http.rs` already maintains cached usage/subscription HTTP clients with explicit rebuild hooks.
+- `crates/service/src/aggregate_api.rs` direct `Client::builder()` hits are test-local helper paths in the current scan.
+
+## 2026-06-22 continuation - auth loopback HTTP client reuse
+
+- Re-verified runtime: Windows PowerShell Core 7.6.2 in `D:\MyComputer\own\GPTTeam\CodexManager\CodexManager`.
+- Re-read root `AGENTS.md`; repo-local `skills/skill-router/SKILL.md` is still absent, so routing used the global `skill-router`.
+- Re-scanned `reqwest::Client` / `reqwest::blocking::Client` construction points across `crates` and `apps/src-tauri/src`.
+- Confirmed previous cached paths remain intentional:
+  - gateway upstream runtime config builders are cache/fresh-retry helpers.
+  - model picker keeps a fresh retry client after send failure.
+  - usage/subscription HTTP clients are already cached with rebuild hooks.
+  - web/proxy service clients are startup-scoped.
+  - aggregate API and postprocess `Client::new()` / `Client::builder()` hits inspected in this pass are test-local.
+- Found one remaining production repeated-client path in `crates/service/src/auth/auth_tokens.rs`:
+  - remote/default auth used `OPENAI_AUTH_HTTP_CLIENT`.
+  - loopback issuers still built a new no-proxy `reqwest::Client` for each call to `auth_http_client_for_issuer()`.
+- Added `OPENAI_AUTH_LOOPBACK_HTTP_CLIENT: OnceLock<Client>` and `openai_auth_loopback_http_client()` to reuse the no-proxy loopback client.
+- Kept the existing auth connect timeout, total timeout, `no_proxy()`, and fallback-to-default-client behavior unchanged.
+- Added a test-only build counter and `loopback_auth_http_client_reuses_cached_no_proxy_client` to prove the loopback client initializes at most once and is reused on later calls.
+- Validation:
+  - `cargo test -p codexmanager-service loopback_auth_http_client_reuses_cached_no_proxy_client` passed: 1 test.
+  - `cargo test -p codexmanager-service auth::tokens` passed: 28 tests.
+  - `cargo fmt --check` passed after running `cargo fmt` for import ordering.
+  - `git diff --check` passed; Git only reported LF-to-CRLF working-copy warnings.
+
+## 2026-06-22 continuation - compact delivery helper extraction
+
+- Re-verified runtime: Windows PowerShell Core 7.6.2 in `D:\MyComputer\own\GPTTeam\CodexManager\CodexManager`.
+- Re-read root `AGENTS.md`; repo-local `skills/skill-router/SKILL.md` is still absent, so routing used the global `skill-router`.
+- Re-scanned `crates/service/src/gateway/observability/http_bridge` after the previous helper extractions.
+- `delivery.rs` remained the largest file at about 127 KB and still contained compact response delivery wrappers near the top.
+- Added `crates/service/src/gateway/observability/http_bridge/compact_delivery.rs`.
+- Moved compact delivery-only helpers out of `delivery.rs`:
+  - synthesized compact error response writing.
+  - invalid compact success response writing.
+  - valid compact success response writing.
+  - invalid compact non-success normalization response writing.
+  - normalized passthrough non-success response writing.
+- Kept compact body classification in `compact_errors.rs` and kept delivery orchestration/failover logic in `delivery.rs`.
+- Registered `compact_delivery` in `http_bridge/mod.rs` and imported the moved functions back into `delivery.rs`.
+- File size check after extraction: `delivery.rs` is about 121 KB and `compact_delivery.rs` is about 6 KB.
+- Validation:
+  - `cargo fmt --check` passed.
+  - Initial `cargo test -p codexmanager-service http_bridge` surfaced one missing import for `compact_success_body_is_valid`; fixed by retaining that import from `compact_errors`.
+  - `cargo test -p codexmanager-service http_bridge` passed after the fix: 125 tests.
+  - `git diff --check` passed; Git only reported LF-to-CRLF working-copy warnings.
+
+## 2026-06-22 continuation - response helper extraction
+
+- Continued the same `http_bridge` maintainability pass from the current dirty worktree.
+- `delivery.rs` still held a few pure helper functions near the top after the compact delivery split.
+- Added `crates/service/src/gateway/observability/http_bridge/response_helpers.rs`.
+- Moved response helper functions out of `delivery.rs`:
+  - `extract_error_message_from_json_bytes`.
+  - `replace_content_type_header`.
+  - `force_openai_responses_stream_content_type`.
+- Removed a stale compact-delivery doc comment that remained in `delivery.rs` after the previous extraction.
+- Registered `response_helpers` in `http_bridge/mod.rs` and imported the helpers back into `delivery.rs`.
+- File size check after extraction: `delivery.rs` is about 119.6 KB and `response_helpers.rs` is about 1 KB.
+- Validation:
+  - `cargo test -p codexmanager-service http_bridge` passed: 125 tests.
+  - `cargo fmt` was run because rustfmt wanted module ordering in `mod.rs`.
+  - `cargo fmt --check` passed.
+  - `git diff --check` passed; Git only reported LF-to-CRLF working-copy warnings.
+
+## 2026-06-22 continuation - API key quota usage SQLite filter pushdown
+
+- Re-verified runtime: Windows PowerShell Core 7.6.2 in `D:\MyComputer\own\GPTTeam\CodexManager\CodexManager`.
+- Re-read root `AGENTS.md`; repo-local `skills/skill-router/SKILL.md` is still absent, so routing used the global `skill-router`.
+- Scanned the next SQLite storage candidates:
+  - `model_sources.rs` and `model_groups.rs` already had query-plan regression coverage from earlier passes.
+  - `account_subscriptions.rs` already avoids per-chunk ordering and has an updated-at list index.
+  - `api_key_quota_limits.rs` still had a single-key token usage query that built a three-table `UNION ALL` and filtered by `key_id` outside the union.
+- Updated `Storage::api_key_total_token_usage()`:
+  - Trim and short-circuit blank key ids to `0`.
+  - Extract the SQL into `api_key_total_token_usage_sql()`.
+  - Push `key_id = ?1` and `TRIM(key_id) <> ''` into each branch for `request_token_stats`, `request_token_stat_hourly_rollups`, and `request_token_stat_rollups`.
+  - Kept token total calculation semantics unchanged.
+- Added regression tests in `api_key_quota_limits.rs`:
+  - `api_key_total_usage_filters_each_stats_table_by_key_id` verifies the raw stats, hourly rollup, and legacy rollup branches all use existing key lookup indexes.
+  - `api_key_total_usage_ignores_blank_key_ids` verifies blank ids do not match blank historical rows.
+- No migration was added; existing indexes cover the optimized query:
+  - raw stats uses a `key_id` leading index chosen by SQLite.
+  - hourly rollups use `idx_request_token_stat_hourly_rollups_key_bucket`.
+  - legacy rollups use `idx_request_token_stat_rollups_key_id`.
+- Validation:
+  - Initial narrow test failed because the assertion expected one exact raw-stats index name; SQLite correctly chose an equivalent `key_id`-leading index. The assertion was relaxed to require indexed `key_id` search.
+  - `cargo test -p codexmanager-core api_key_total_usage` passed: 2 tests.
+  - `cargo test -p codexmanager-core api_key_quota` passed: 4 unit tests plus 1 storage integration test.
+  - `cargo fmt --check` passed.
+  - `git diff --check` passed; Git only reported LF-to-CRLF working-copy warnings.
+
+## 2026-06-22 continuation - request token by-key temp filter pushdown
+
+- Continued the SQLite stats-query scan after the quota usage optimization.
+- Found the same shape in `request_token_stats.rs`:
+  - `summarize_request_token_stats_by_key_for_keys()` created a `TempKeyIdFilter`.
+  - `query_request_token_stats_by_key()` applied that filter only to the outer `combined s` query.
+  - The raw, hourly, and legacy branches could still aggregate unselected keys before the final filter.
+- Updated `query_request_token_stats_by_key()` to match the existing filtered model/key+model query pattern:
+  - raw branch now applies `TempKeyIdFilter` against `t.key_id`.
+  - hourly branch now applies it against `NULLIF(TRIM(h.key_id), '')`.
+  - legacy branch now applies it against `NULLIF(TRIM(r.key_id), '')`.
+  - outer `combined s` filtering is retained as a defensive guard.
+- No migration was added; this reuses the existing temporary key filter and existing token stats indexes.
+- Validation:
+  - `cargo fmt --check` passed.
+  - `cargo test -p codexmanager-core request_token_stats_by_key` compiled successfully but matched 0 tests, so it was not considered sufficient.
+  - `cargo test -p codexmanager-core request_token_stats` passed: 18 unit tests plus 2 storage integration tests.
+  - `git diff --check` passed; Git only reported LF-to-CRLF working-copy warnings.
+
+## 2026-06-22 continuation - gateway account candidate latest-usage CTE scope
+
+- Re-verified runtime: Windows PowerShell Core 7.6.2 in `D:\MyComputer\own\GPTTeam\CodexManager\CodexManager`.
+- Re-read root `AGENTS.md`; repo-local `skills/skill-router/SKILL.md` is still absent, so routing used the global `skill-router`.
+- Scanned `request_logs.rs`, `accounts.rs`, and `usage.rs` CTE/query-plan hot paths.
+- `usage.rs` chunked latest-usage helpers already filter `usage_snapshots` by account id inside the ranked CTE and have query-plan coverage.
+- Found one analogous gap in `accounts.rs`:
+  - `list_gateway_candidates_for_accounts()` calls `list_gateway_candidates_filtered(self, Some(chunk))`.
+  - The outer query filtered `a.id`, but the reused `latest_usage_cte_sql()` ranked all rows in `usage_snapshots` before joining to requested accounts.
+- Updated `list_gateway_candidates_filtered()`:
+  - Full `list_gateway_candidates()` still uses the original all-account `latest_usage_cte_sql()`.
+  - Account-scoped calls now use `latest_usage_cte_sql_for_condition()` with `usage_snapshots.account_id IN (...)`.
+  - Account id params are intentionally duplicated for CTE filtering and the outer `a.id` filter.
+  - Result ordering and availability semantics remain unchanged.
+- Added `gateway_candidates_for_accounts_scope_latest_usage_cte_to_requested_ids` to prove the scoped CTE uses the existing `idx_usage_snapshots_account_captured_id` index.
+- No migration was added; this reuses existing usage snapshot indexes.
+- Validation:
+  - `cargo test -p codexmanager-core gateway_candidates_for_accounts_scope_latest_usage_cte_to_requested_ids` passed: 1 test.
+  - `cargo fmt` was run after `cargo fmt --check` reported formatting-only diffs.
+  - `cargo fmt --check` passed.
+  - `cargo test -p codexmanager-core list_gateway_candidates` passed: 2 unit tests.
+  - `cargo test -p codexmanager-core gateway_candidates` passed: 3 unit tests plus 1 storage integration test.
+  - `git diff --check` passed; Git only reported LF-to-CRLF working-copy warnings.
+
+## 2026-06-22 continuation - request log summary helper consolidation
+
+- Re-verified runtime: Windows PowerShell Core 7.6.2 in `D:\MyComputer\own\GPTTeam\CodexManager\CodexManager`.
+- Re-read root `AGENTS.md`; repo-local `skills/skill-router/SKILL.md` is still absent, so routing used the global `skill-router`.
+- Scanned `request_logs.rs` pagination, count, and summary query paths:
+  - Existing tests already cover exact field indexes, page-id filtering before token joins, global search token joins, and empty range short-circuits.
+  - No new SQLite index or migration had strong evidence from this pass.
+- Found a maintainability issue:
+  - `summarize_request_logs_filtered()` and `summarize_request_logs_filtered_for_keys()` built the same SQL and row mapping independently.
+  - This made future request-log summary changes easy to drift between global and key-scoped paths.
+- Consolidated the duplicate SQL into `summarize_request_logs_with_filter()`.
+- Added `map_request_log_query_summary_row()` so summary row mapping is named and shared.
+- Kept SQL, filters, joins, token total expression, and key-scoped behavior unchanged.
+- Re-scanned remaining `reqwest::Client` / `reqwest::blocking::Client` construction points after this change:
+  - `aggregate_api.rs` hits in this scan are test-local probe clients.
+  - `attempt_flow/postprocess.rs`, `attempt_flow/transport.rs`, and protocol aggregate hits inspected in this pass are test-local helpers.
+  - `crates/web/src/main.rs` builds the web proxy client once into `AppState`.
+  - Previously cached production paths in service/web/updater/warmup/auth/runtime config remain covered by earlier entries.
+  - No new repeated production upstream-client construction path was changed in this pass.
+- Validation:
+  - `cargo fmt --check` passed.
+  - `cargo test -p codexmanager-core request_logs` passed: 26 unit tests plus 2 storage integration tests.
+  - `git diff --check` passed; Git only reported LF-to-CRLF working-copy warnings.
+
+## 2026-06-22 continuation - usage latest snapshot CTE helper consolidation
+
+- Re-verified runtime: Windows PowerShell Core 7.6.2 in `D:\MyComputer\own\GPTTeam\CodexManager\CodexManager`.
+- Re-read root `AGENTS.md`; repo-local `skills/skill-router/SKILL.md` is still absent, so routing used the global `skill-router`.
+- Re-scanned `reqwest::Client` construction points before changing storage code:
+  - `usage_http.rs` already uses `OnceLock<RwLock<Client>>` plus explicit reload on env/runtime profile changes.
+  - `web/src/main.rs` builds a startup-scoped proxy client into `AppState`.
+  - Remaining service/gateway hits inspected in this pass are either cached helpers, test-local clients, or intentional retry-fresh paths.
+  - No new repeated production client construction path was changed in this pass.
+- Scanned `usage.rs` latest usage query paths:
+  - Account-filtered latest usage queries already push `account_id IN (...)` into the ranked CTE and have query-plan coverage.
+  - No new SQLite index or migration had strong evidence from this pass.
+  - The same `ROW_NUMBER() OVER (PARTITION BY account_id ORDER BY captured_at DESC, id DESC)` CTE was duplicated across full latest rows, summary rows, quota-source rows, cleanup rows, and low-quota checks.
+- Added `latest_usage_ranked_cte_sql()` to centralize the ranked latest-snapshot CTE construction.
+- Updated the existing latest usage row/summary/quota/cleanup/low-quota queries to call the shared helper while preserving selected fields, filters, ordering, and row mapping semantics.
+- Validation:
+  - `cargo fmt --check` passed.
+  - `cargo test -p codexmanager-core usage` passed: 35 core unit tests, 4 storage integration-filter tests, and 1 usage integration test.
+
+## 2026-06-22 continuation - usage refresh token target status CTE scope
+
+- Continued the SQLite/account refresh scan after the usage latest-snapshot helper consolidation.
+- Found one hot-path query in `accounts.rs`:
+  - `list_account_usage_refresh_token_targets_by_statuses_chunk()` filtered candidate accounts by status and usable token fields.
+  - Its `latest_status` CTE ranked every `account_status_update` event with a `reason=` marker before joining back to the already-filtered account candidates.
+  - Existing event indexes already include `idx_events_account_status_lookup(type, account_id, created_at DESC, id DESC)`, so no new migration was needed.
+- Reworked the query into two CTEs:
+  - `target_accounts` first applies the account status filter and usable token predicates.
+  - `latest_status` now joins `events` to `target_accounts` before applying the `ROW_NUMBER()` ranking.
+  - The blocked reason filter, token field mapping, final Rust ordering, and returned target semantics are unchanged.
+- Added `usage_refresh_token_targets_by_status_sql()` so the SQL shape is named and can be regression-tested directly.
+- Added `usage_refresh_token_targets_scope_latest_status_to_target_accounts` to prove the latest-status CTE is scoped through `target_accounts` and still uses `idx_events_account_status_lookup`.
+- Validation:
+  - `cargo fmt --check` passed.
+  - `cargo test -p codexmanager-core usage_refresh_token_targets` passed: 2 tests.
+  - `cargo test -p codexmanager-core list_account_usage_refresh` passed: 3 tests.
+
+## 2026-06-22 continuation - token refresh due latest-status CTE scope
+
+- Continued the same latest-status CTE scan in `tokens.rs`.
+- Found `Storage::list_tokens_due_for_refresh()` used a `latest_status` CTE that ranked all `account_status_update` events before joining to due refresh tokens.
+- Reworked the SQL shape while preserving the main token query order:
+  - Added `tokens_due_for_refresh_sql()` so production and query-plan tests share the exact SQL.
+  - The `latest_status` CTE now joins through `tokens target_tokens` and applies the same refresh-token-present and due-token predicates before ranking account status events.
+  - The outer query still scans ordered due tokens and keeps the existing blocked-message filter and final `ORDER BY COALESCE(tokens.next_refresh_at, 0), tokens.account_id LIMIT ?3`.
+- No migration was added:
+  - Existing `idx_tokens_refresh_due_order` still covers the outer due-token ordering.
+  - Existing `idx_events_account_status_lookup` remains the status-event lookup index; the new scope prevents ranking unrelated event accounts.
+- Updated `list_tokens_due_for_refresh_uses_due_order_index` to use `tokens_due_for_refresh_sql()` and assert the latest-status CTE is scoped through `target_tokens`.
+- Validation:
+  - `cargo fmt --check` passed.
+  - `cargo test -p codexmanager-core list_tokens_due_for_refresh` passed: 2 tests.
+  - `cargo test -p codexmanager-core token` passed: 48 core unit tests, 4 auth integration-filter tests, and 11 storage integration-filter tests.
+
+## 2026-06-22 continuation - account status event ranked CTE helper consolidation
+
+- Re-verified runtime: Windows PowerShell Core 7.6.2 in `D:\MyComputer\own\GPTTeam\CodexManager\CodexManager`.
+- Re-read root `AGENTS.md`; repo-local `skills/skill-router/SKILL.md` is still absent, so routing used the global `skill-router`.
+- Re-scanned remaining `reqwest::Client` construction points:
+  - `http/proxy_runtime.rs` builds a `Client` into `ProxyState`; request handlers reuse `state.client`, so this is not a per-request construction path.
+  - `usage_http.rs`, gateway runtime config, model picker, web proxy startup, updater runtime, account warmup, auth, and plugin runtime are either cached/startup-scoped or intentional retry-fresh paths from previous passes.
+  - Test-local clients remain intentionally local to tests.
+- Scanned `events.rs` status-event latest-row helpers:
+  - `latest_account_status_reasons_chunk()` and `latest_account_status_blocked_ids_chunk()` duplicated the same `WITH ranked AS (...) ROW_NUMBER() OVER (PARTITION BY account_id ORDER BY created_at DESC, id DESC)` shape.
+  - Both queries already scoped by `account_id IN (...)` and existing tests covered lookup indexes and no outer temp sort; no SQLite migration was justified.
+- Added `latest_account_status_ranked_cte_sql()` to centralize the ranked account-status CTE.
+- Updated both production helpers and the no-temp-sort query-plan test to use the shared CTE helper.
+- Validation:
+  - Initial `cargo fmt --check` reported a formatting-only diff in `events_tests.rs`; `cargo fmt` was run.
+  - `cargo fmt --check` passed after formatting.
+  - `cargo test -p codexmanager-core event` passed: 6 tests.
+  - `git diff --check` passed; Git only reported LF-to-CRLF working-copy warnings.
+
+## 2026-06-22 continuation - post-events scan notes
+
+- Scanned `model_sources.rs` ranked mapping query:
+  - `list_enabled_model_source_mappings_for_sources_chunk()` already filters `platform_model_slug`, `source_kind`, `enabled = 1`, and `source_id IN (...)` inside the ranked CTE.
+  - Existing tests cover `idx_model_source_mappings_platform_source_enabled_priority`.
+  - No code change was made because there was no stronger SQLite optimization evidence than the current filtered CTE plus index coverage.
+- Scanned remaining `aggregate_api.rs`, `attempt_flow/postprocess.rs`, `attempt_flow/transport.rs`, and `gateway/upstream/protocol/aggregate_api.rs` client-construction hits:
+  - The inspected hits are test-local probe/mock clients and not production request-path repeated construction.
+  - No client reuse change was made from these hits.
+- Scanned `request_token_stats.rs` remaining `ROW_NUMBER()` usage:
+  - The remaining window function is the optional per-source top-N ranking after raw/hourly source rollups have already applied time/source-kind constraints.
+  - No new filter-pushdown or index change had strong evidence in this pass.
+
+## 2026-06-22 continuation - aggregate API query helper consolidation
+
+- Re-verified runtime: Windows PowerShell Core 7.6.2 in `D:\MyComputer\own\GPTTeam\CodexManager\CodexManager`.
+- Re-read root `AGENTS.md`; repo-local `skills/skill-router/SKILL.md` is absent, so routing used the global `skill-router`.
+- Re-read global `skill-router` and its generated skill index:
+  - Selected only `skill-router`; no release, deployment, frontend, Notion, Sentry, or OpenAI docs skill was needed for this storage/client scan.
+  - Multi-agent stayed off because the user did not explicitly authorize subagents in this new continuation window.
+- Re-read memory registry lines for this checkout:
+  - Prior CodexManager memory is about large account import, PR review/merge, `aggregate_api`, route/model validation, and push/review expectations.
+  - Treated it as historical context only; current code and tests remain source of truth.
+- Re-scanned `reqwest::Client` / `reqwest::blocking::Client` construction points:
+  - `crates/web/src/service_gateway.rs` and `crates/web/src/main.rs` are startup-scoped proxy clients.
+  - `apps/src-tauri/src/commands/updater/runtime.rs`, service auth, warmup, plugin runtime, usage HTTP, gateway runtime config, and model picker paths are cached/startup-scoped or intentional retry-fresh paths from earlier passes.
+  - `aggregate_api.rs`, auth tests, proxy runtime tests, attempt-flow tests, and protocol aggregate test hits are test-local.
+  - No new repeated production upstream-client construction path was changed in this pass.
+- Scanned `aggregate_apis.rs` list/active/balance-query SQL paths:
+  - Existing indexes and query-plan tests already cover list order, active status order, provider+status order, active balance-query lookup, and balance-query order.
+  - No SQLite migration or new index had strong evidence.
+- Found a maintainability issue:
+  - Production list helpers and query-plan tests duplicated the same active/status/balance-query SQL strings.
+  - `list_aggregate_api_summaries()` duplicated the full aggregate API select column list already represented by `AGGREGATE_API_SELECT_SQL`.
+- Consolidated the duplicated SQL:
+  - Added named helpers for aggregate API id list, active id list, active balance-query id list, balance-query id list, and active full-row selection.
+  - Added shared constants for the normalized active-status condition and normalized provider expression.
+  - Updated query-plan tests to call the same SQL helpers used by production paths.
+  - Switched `list_aggregate_api_summaries()` to reuse `AGGREGATE_API_SELECT_SQL`.
+- Behavior intentionally unchanged:
+  - Returned fields, filters, sort order, provider alias semantics, and index expectations are the same.
+  - No feature removal was made; no safe unused/duplicated feature candidate was proven in this pass.
+- Validation:
+  - Initial `cargo fmt --check` found formatting-only diffs and one test-only helper warning; the helper was marked `#[cfg(test)]` and `cargo fmt` was run.
+  - `cargo fmt --check` passed.
+  - `cargo test -p codexmanager-core aggregate_api` passed: 27 unit tests, with integration binaries filtered to 0 matching tests.
+  - `git diff --check` passed; Git only reported LF-to-CRLF working-copy warnings.
+
+## 2026-06-22 continuation - account manager query helper consolidation
+
+- Continued the core storage maintainability scan after the aggregate API pass.
+- Scanned `account_manager.rs` app-user, dashboard-user, access-summary, API-key-owner, session, billing-rule, wallet, and existing query-plan test areas.
+- Findings:
+  - Existing query-plan tests already cover lower-username lookup, user API-key lookup, app-user list ordering, project membership lookup, chunk queries without per-chunk temp sort, billing-rule active order, session token lookup, wallet/ledger lookup, and delete/update foreign-key paths.
+  - No new SQLite migration or index had strong evidence in this pass.
+  - Several production queries and tests duplicated the same SQL shapes for app-user list, dashboard-user chunk lookup, access-summary chunk lookup, API-key-owner chunk lookup, and user API-key-id lookup.
+- Consolidated duplicated SQL into named helpers:
+  - `app_user_list_sql()`
+  - `dashboard_app_user_summary_sql()`
+  - `app_user_access_summary_sql()`
+  - `api_key_owner_chunk_sql()`
+  - `user_api_key_ids_for_user_sql()`
+- Updated production query paths to call those helpers.
+- Updated query-plan tests to call the same helpers instead of hand-writing parallel SQL.
+- Behavior intentionally unchanged:
+  - Query predicates, joins, selected fields, final Rust ordering, and index expectations are the same.
+  - The dashboard chunk query-plan test now uses the same wallet join shape as production instead of a shortened test-only select.
+  - No feature removal was made; no safe unused/duplicated feature candidate was proven in this pass.
+- Validation:
+  - Initial `cargo test -p codexmanager-core account_manager` failed at compile time because the test module did not import the new private helper functions; fixed by importing from `super`.
+  - `cargo fmt` was run after formatting-only diffs.
+  - `cargo fmt --check` passed.
+  - `cargo test -p codexmanager-core account_manager` passed: 28 unit tests, with integration binaries filtered to 0 matching tests.
+  - `git diff --check` passed; Git only reported LF-to-CRLF working-copy warnings.
+
+## 2026-06-22 continuation - plugin storage query helper consolidation
+
+- Re-verified runtime: Windows PowerShell Core 7.6.2 in `D:\MyComputer\own\GPTTeam\CodexManager\CodexManager`.
+- Re-read root `AGENTS.md`; repo-local `skills/skill-router/SKILL.md` remains absent, so routing used the global `skill-router`.
+- Continued the core storage maintainability scan in `plugins.rs`.
+- Findings:
+  - Existing query-plan tests already cover plugin install list order, plugin task list order, per-plugin task list order, due-task lookup, next-enabled-run lookup, plugin-run-log task lookup, and task-count grouping.
+  - Existing migrations already include the relevant plugin list/due/log indexes, including `idx_plugin_installs_list_order`, `idx_plugin_tasks_due_lookup`, `idx_plugin_run_logs_task_lookup`, `idx_plugin_tasks_list_order`, and `idx_plugin_tasks_plugin_list_order`.
+  - No new SQLite migration or index had strong evidence in this pass.
+  - Production query paths and query-plan tests duplicated the same SQL shapes for install list ordering, plugin task list ordering, due-task lookup, and next-enabled-run lookup.
+- Consolidated duplicated SQL into named helpers:
+  - `plugin_install_list_order_sql()`
+  - `plugin_task_list_sql()`
+  - `plugin_task_summary_list_sql()`
+  - `due_plugin_tasks_sql()`
+  - `next_enabled_plugin_task_run_at_sql()`
+- Updated production query paths to call those helpers.
+- Updated query-plan tests to call the same helpers instead of hand-writing parallel SQL.
+- Behavior intentionally unchanged:
+  - Selected fields, joins, predicates, ordering, `LIMIT`, and index expectations are the same.
+  - No feature removal was made; no safe unused/duplicated feature candidate was proven in this pass.
+- Validation:
+  - Initial `cargo fmt --check` reported import ordering only; `cargo fmt` was run.
+  - `cargo fmt --check` passed.
+  - `cargo test -p codexmanager-core plugin` passed: 21 unit tests, with integration binaries filtered to 0 matching tests.
+  - `git diff --check` passed; Git only reported LF-to-CRLF working-copy warnings.
+
+## 2026-06-22 continuation - model catalog ordered-query helper consolidation
+
+- Re-verified runtime: Windows PowerShell Core 7.6.2 in `D:\MyComputer\own\GPTTeam\CodexManager\CodexManager`.
+- Re-read root `AGENTS.md`; repo-local `skills/skill-router/SKILL.md` remains absent, so routing used the global `skill-router`.
+- Continued the core storage maintainability and SQLite query-plan scan in `model_options.rs`.
+- Findings:
+  - Existing query-plan tests already cover model catalog model ordering, ordered slug list queries, reasoning-level list ordering, string-item list ordering, and primary-key lookup.
+  - Existing indexes already include the relevant model catalog order indexes, including `idx_model_catalog_models_scope_order`, `idx_model_catalog_models_scope_supported_in_api`, `idx_model_catalog_models_scope_visibility`, `idx_model_catalog_reasoning_levels_scope_sort`, and `idx_model_catalog_string_items_scope_kind_sort`.
+  - No new SQLite migration or index had strong evidence in this pass.
+  - Production paths and query-plan tests duplicated the API-available model predicate and model catalog ordering SQL for remote, API-available, first API-available, and prefix-filtered slug queries.
+- Consolidated duplicated SQL:
+  - Added `MODEL_CATALOG_MODEL_ORDER_CLAUSE`.
+  - Added `MODEL_CATALOG_API_AVAILABLE_CONDITION`.
+  - Added `model_catalog_models_for_scope_sql()`.
+  - Added `model_catalog_ordered_slug_sql()`.
+- Updated production query paths to use the shared helpers:
+  - `list_model_catalog_models()`
+  - `list_remote_unedited_model_catalog_slugs()`
+  - `list_api_available_model_catalog_slugs()`
+  - `find_first_api_available_model_catalog_slug()`
+  - `list_api_available_model_catalog_slugs_with_prefix()`
+  - `count_available_model_catalog_models()`
+- Updated query-plan tests to call the same helpers instead of hand-writing parallel SQL.
+- Behavior intentionally unchanged:
+  - Selected fields, filters, ordering, prefix handling, `LIMIT 1`, and index expectations are the same.
+  - No feature removal was made; no safe unused/duplicated feature candidate was proven in this pass.
+- Validation:
+  - Initial `cargo fmt --check` reported formatting-only diffs; `cargo fmt` was run.
+  - `cargo fmt --check` passed.
+  - `cargo test -p codexmanager-core model_catalog` passed: 16 matching tests, including model catalog unit tests and migration-filter tests.
+  - `git diff --check` passed; Git only reported LF-to-CRLF working-copy warnings.
+
+## 2026-06-22 continuation - request token stats query-plan helper alignment
+
+- Re-verified runtime: Windows PowerShell Core 7.6.2 in `D:\MyComputer\own\GPTTeam\CodexManager\CodexManager`.
+- Re-read root `AGENTS.md`; repo-local `skills/skill-router/SKILL.md` remains absent, so routing used the global `skill-router`.
+- Re-read the global `skill-router` and skill index:
+  - Selected only `skill-router`; no release, deployment, frontend, Notion, Sentry, OpenAI docs, or dedicated .NET test skill was needed for this narrow Rust/SQLite storage pass.
+  - Multi-agent stayed off in this continuation window.
+- Re-read the current maintenance log and memory registry entries for the CodexManager checkout:
+  - Treated memory as historical context only; current files, diffs, and tests remained the source of truth.
+- Continued the core storage scan in `request_token_stats.rs` and `request_token_stats_tests.rs`.
+- Findings:
+  - `request_token_stats.rs` already has shared SQL builders for raw token rollups, hourly token rollups, raw key usage, hourly key usage, legacy key usage, optional raw ranges, optional hourly ranges, and fixed hourly range predicates.
+  - Existing indexes already cover the observed report paths, including `idx_request_token_stats_created_at`, `idx_request_token_stats_key_model_created_at`, `idx_request_token_stat_hourly_rollups_bucket_start`, `idx_request_token_stat_hourly_rollups_key_bucket`, `idx_request_token_stat_hourly_rollups_owner_bucket`, and `idx_request_token_stat_hourly_rollups_source_bucket`.
+  - No new SQLite migration or index had strong evidence in this pass.
+  - Query-plan tests still hand-wrote several simplified SQL strings instead of exercising the same helper-generated SQL shape used by production rollup queries.
+- Consolidated the query-plan tests onto existing helpers:
+  - `daily_range_query_matches_created_at_index()` now uses `raw_token_rollup_select()`.
+  - `hourly_rollup_report_queries_match_existing_lookup_indexes()` now uses `hourly_token_rollup_select()` and `hourly_key_usage_select()` for bucket, key, owner, and source lookup plans.
+  - `key_model_range_query_matches_composite_index()` now uses `raw_key_usage_select()`.
+- Behavior intentionally unchanged:
+  - No production SQL semantics, aggregation math, retention behavior, hourly/raw/legacy merge behavior, or schema definitions were changed.
+  - No feature removal was made; no safe unused/duplicated feature candidate was proven in this pass.
+- Validation:
+  - Initial `cargo fmt --check` reported formatting-only diffs; `cargo fmt` was run.
+  - `cargo fmt --check` passed.
+  - `cargo test -p codexmanager-core request_token_stats` passed: 18 unit tests and 2 integration tests matching the filter.
+  - `git diff --check` passed; Git only reported LF-to-CRLF working-copy warnings.
+- Remaining candidates:
+  - `accounts.rs` remains the largest core storage file and is still worth scanning for query/helper drift, but any edit should be incremental because it is a broad persistence surface.
+  - `http_bridge/delivery.rs` remains large after earlier extraction; avoid touching streaming orchestration unless a clean, testable boundary is obvious.
+
+## 2026-06-22 continuation - account storage helper alignment
+
+- Continued after the `request_token_stats` pass and scanned `accounts.rs`.
+- Important worktree note:
+  - `accounts.rs` was already dirty from earlier continuation work before this pass.
+  - Existing dirty changes included prior SQLite-focused work around scoped usage/status CTE helpers and related tests; this pass did not revert or re-attribute those changes.
+- Findings:
+  - `accounts.rs` is still a broad legacy storage surface, but it already has focused helpers for account select columns, token select columns, account filtering, latest usage CTEs, status normalization, gateway availability, and usage-refresh token target SQL.
+  - Existing tests already cover account group filtering, base list ordering, status chunk ordering, cleanup status lookup, id chunk ordering, identity lookup indexes, usage-refresh target filtering, gateway latest-usage scoping, and many field-minimal read paths.
+  - No new SQLite migration or index had strong evidence in this pass.
+  - Several production queries and query-plan tests still duplicated the same account list/chunk/identity SQL shapes.
+- Consolidated duplicated SQL into named helpers:
+  - `account_ids_list_sql()`
+  - `account_query_sql()`
+  - `account_identity_lookup_sql()`
+  - `account_ids_by_statuses_chunk_sql()`
+  - `account_usage_refresh_targets_by_statuses_chunk_sql()`
+  - `account_cleanup_candidates_by_statuses_chunk_sql()`
+  - `account_ids_for_ids_chunk_sql()`
+- Updated production query paths to call those helpers:
+  - `list_account_ids()`
+  - `query_accounts()`
+  - `find_account_by_identity_column()`
+  - `list_account_ids_by_statuses_chunk()`
+  - `list_account_usage_refresh_targets_by_statuses_chunk()`
+  - `list_account_cleanup_candidates_by_statuses_chunk()`
+  - `list_account_ids_for_ids_chunk()`
+- Updated query-plan tests to call the same helpers instead of hand-writing parallel SQL:
+  - `account_group_name_filter_uses_group_sort_index()`
+  - `account_base_lists_use_sort_updated_id_order_index()`
+  - `account_status_chunk_queries_defer_final_ordering_to_rust()`
+  - `account_cleanup_candidates_use_normalized_status_index()`
+  - `account_id_chunk_queries_defer_final_ordering_to_rust()`
+  - `account_identity_lookup_uses_identity_indexes()`
+- Behavior intentionally unchanged:
+  - Selected fields, predicates, ordering, pagination parameter order, chunking behavior, final Rust sorting, and index expectations are the same.
+  - No feature removal was made; no safe unused/duplicated feature candidate was proven in this pass.
+- Validation:
+  - Initial `cargo fmt --check` reported formatting-only diffs; `cargo fmt` was run.
+  - `cargo fmt --check` passed.
+  - `cargo test -p codexmanager-core accounts` passed: 70 unit tests and 2 integration tests matching the filter.
+  - `git diff --check` passed; Git only reported LF-to-CRLF working-copy warnings.
+  - Wider follow-up `cargo test -p codexmanager-core` passed: 292 library tests, 7 auth integration tests, 28 storage integration tests, 1 usage integration test, 1 version integration test, and doc-tests with 0 tests.
+- Remaining candidates:
+  - Continue scanning `accounts.rs` only in small, bounded slices because it still contains many query shapes and tests in one file.
+  - `http_bridge/delivery.rs` remains a modularity candidate, but only touch it with a clean boundary and focused runtime/protocol validation.
+
+## 2026-06-22 continuation - http bridge response header helper extraction
+
+- Re-verified runtime: Windows PowerShell Core 7.6.2 in `D:\MyComputer\own\GPTTeam\CodexManager\CodexManager`.
+- Re-read root `AGENTS.md`; repo-local `skills/skill-router/SKILL.md` remains absent, so routing used the global `skill-router`.
+- Re-read the global `skill-router` and its skill index:
+  - Selected only `skill-router`; no release, deployment, frontend, Notion, Sentry, OpenAI docs, or dedicated .NET/Rust test skill was needed for this bounded Rust service refactor.
+  - Multi-agent stayed off.
+- Re-read the current maintenance log and memory registry entries for the CodexManager checkout:
+  - Treated memory as historical context only; current files, diffs, and tests remained the source of truth.
+- Re-scanned `reqwest::Client` construction points:
+  - `aggregate_api.rs` hits in this pass were inside tests.
+  - `gateway/core/runtime_config.rs` uses cached upstream client builders.
+  - `gateway/model_picker/request.rs` uses a config-keyed cached async client.
+  - No new repeated production per-request upstream-client construction path was changed in this pass.
+- Continued the service modularity scan in `gateway/observability/http_bridge`:
+  - `delivery.rs` remains large, but prior extraction already split body conversion, compact delivery/errors, images, metadata, manual chunking, response helpers, aggregate parsing, and stream readers into sibling modules.
+  - The lowest-risk remaining duplication was response-header delivery setup repeated across blocking and async-stream bridge paths.
+- Extracted duplicated response-header handling into `metadata.rs`:
+  - Added `copy_upstream_response_headers()`.
+  - Moved trace-id header injection into a private helper in `metadata.rs`.
+  - Removed the old `push_trace_id_header()` helper from `http_bridge/mod.rs`.
+  - Updated six `delivery.rs` branches to call `copy_upstream_response_headers()` instead of repeating the same loop.
+  - Added a focused unit test proving hop-by-hop headers are filtered and the trace header is preserved.
+- Behavior intentionally unchanged:
+  - The filtered header set is still `transfer-encoding`, `content-length`, and `connection`.
+  - Trace-id semantics are unchanged except the helper now accepts the optional trace id directly.
+  - Streaming, compact response conversion, SSE collection, status handling, and body conversion logic were not changed.
+  - No feature removal was made; no safe unused/duplicated feature candidate was proven in this pass.
+- Validation:
+  - Initial `cargo test -p codexmanager-service http_bridge` failed only in the new helper unit test because the assertion compared a lowercase header name with the mixed-case constant. The test assertion was fixed to compare lowercase names.
+  - `cargo fmt --check` passed.
+  - `cargo test -p codexmanager-service http_bridge` passed: 126 matching tests, including the new metadata helper test and the existing delivery/stream-reader bridge coverage.
+  - `git diff --check` passed; Git only reported LF-to-CRLF working-copy warnings.
+- Remaining candidates:
+  - `delivery.rs` still has duplicated upstream metadata extraction and content-type flag logic across blocking and async stream paths; this can be extracted next if kept similarly narrow.
+  - Continue treating `delivery.rs` streaming orchestration as high-risk: avoid large rewrites without protocol-specific tests for `/v1/responses`, `/v1/chat/completions`, tools, image generation, compact responses, and passthrough SSE.
+
+## 2026-06-22 continuation - http bridge upstream metadata extraction
+
+- Re-verified runtime:
+  - Windows PowerShell Core 7.6.2 in `D:\MyComputer\own\GPTTeam\CodexManager\CodexManager`.
+- Re-read required context:
+  - Root `AGENTS.md`.
+  - Global `skill-router` because repo-local `skills/skill-router/SKILL.md` is still absent.
+  - Global `skill-router` skill index.
+  - Current maintenance log tail.
+  - Memory registry hits for the CodexManager checkout, used only as historical context.
+- Scope chosen:
+  - Continued the narrow `gateway/observability/http_bridge` modularity pass.
+  - Avoided feature removal; no unused or duplicate feature was proven safe to remove in this slice.
+  - Avoided SQLite/index changes; this slice was service modularity only.
+- Findings:
+  - `delivery.rs` had two entrance paths that repeated the same upstream response metadata extraction:
+    - request id header candidates
+    - `cf-ray`
+    - OpenAI authorization error header
+    - identity error code from `x-error-json`
+    - `content-type`
+    - SSE and JSON content-type flags
+  - The repeated extraction was independent of stream orchestration and safe to centralize.
+- Changes:
+  - Added `UpstreamResponseMetadata` in `metadata.rs`.
+  - Added `upstream_response_metadata()` in `metadata.rs`.
+  - Moved content-type classification into that helper:
+    - `is_sse` checks `text/event-stream` prefix.
+    - `is_json` checks `application/json` containment.
+  - Updated `respond_with_upstream()` and `respond_with_stream_upstream()` in `delivery.rs` to use the shared metadata helper.
+  - Removed repeated local content-type flag blocks from both blocking and stream-response paths.
+  - Added a focused metadata unit test that covers debug headers, `x-error-json` identity extraction, content type preservation, and SSE/JSON flags.
+- Behavior intentionally unchanged:
+  - Header names and trimming semantics are inherited from the existing `first_upstream_header()` helper.
+  - Identity error extraction still uses `crate::gateway::extract_identity_error_code_from_headers()`.
+  - Response status, body conversion, compact response normalization, streaming readers, manual chunked delivery, and trace-id header behavior were not changed.
+- Validation:
+  - Initial `cargo fmt --check` reported formatting-only changes in the new test.
+  - Ran `cargo fmt`.
+  - `cargo test -p codexmanager-service http_bridge` passed: 127 matching service tests, including the new metadata test and existing bridge coverage.
+  - `cargo fmt --check` passed.
+  - `git diff --check` passed; Git only reported LF-to-CRLF working-copy warnings across dirty files.
+- Worktree note:
+  - The repository remains broadly dirty from earlier continuation work.
+  - This pass intentionally touched only `crates/service/src/gateway/observability/http_bridge/delivery.rs`, `crates/service/src/gateway/observability/http_bridge/metadata.rs`, and this maintenance log.
+- Remaining candidates:
+  - Continue service modularity in smaller slices only; `delivery.rs` is still large but now has less duplicated response metadata setup.
+  - Next likely low-risk target is repeated construction of empty `UpstreamResponseBridgeResult` metadata shells, but only if it can be extracted without obscuring branch-specific usage/error fields.
+  - Return to SQLite only with EXPLAIN-backed evidence and query-plan tests; do not add migrations or indexes speculatively.
+
+## 2026-06-22 continuation - upstream client construction rescan
+
+- Re-ran the client construction scan:
+  - `rg -n "reqwest::(blocking::)?Client::(new|builder)|Client::builder\(|Client::new\(" .\crates .\apps\src-tauri\src -g "*.rs"`
+- Findings:
+  - `crates/service/src/gateway/upstream/attempt_flow/postprocess.rs` hits are inside tests that create local mock clients.
+  - `crates/service/src/gateway/upstream/protocol/aggregate_api.rs` hits in the scanned region are probe unit tests that pass clients into request builders.
+  - `crates/service/src/gateway/upstream/attempt_flow/transport.rs` hit is a test helper for mock stream requests.
+  - `crates/service/src/http/proxy_runtime.rs` builds a local backend client once and stores it in `ProxyState`.
+  - `crates/service/src/auth/auth_tokens.rs` uses static cached OpenAI auth clients.
+  - `crates/service/src/usage/usage_http.rs` stores usage/subscription clients in `OnceLock<RwLock<Client>>` and rebuilds only on settings/proxy changes.
+  - `crates/service/src/account/account_warmup.rs` uses a config-keyed cached warmup client.
+  - `crates/service/src/plugin/runtime.rs` caches a blocking plugin HTTP client behind `OnceLock<Mutex<Option<Client>>>`.
+  - `apps/src-tauri/src/commands/updater/runtime.rs` caches the updater HTTP client.
+- Result:
+  - No new production per-request client construction path was proven in this scan.
+  - No code change was made for client reuse in this pass.
+
+## 2026-06-22 continuation - quota pool SQL helper consolidation
+
+- Re-verified context:
+  - Root `AGENTS.md` was read again.
+  - Repo-local `./skills/skill-router/SKILL.md` is still missing, so the global `skill-router` was used.
+  - Global skill index was read; no deployment, frontend, OpenAI, Notion, or security skill was needed for this bounded core storage pass.
+  - Current worktree and this maintenance log were treated as source of truth.
+- Scope chosen:
+  - Returned to the SQLite/core storage side of the long-running goal.
+  - Focused on `crates/core/src/storage/quota_pools.rs`.
+  - Avoided adding SQLite indexes or migrations without new EXPLAIN evidence.
+  - Avoided feature removal; no safe unused quota-pool feature candidate was proven.
+- Findings:
+  - `quota_pools.rs` had production SELECT statements and EXPLAIN query-plan tests maintaining parallel SQL shapes for quota source assignments and account quota capacity rows.
+  - The existing indexes already supported the observed query plans:
+    - `idx_quota_source_model_assignments_source`
+    - `idx_quota_source_model_assignments_model`
+    - the primary-key autoindex on `quota_source_model_assignments`
+    - primary-key ordering for account quota templates/overrides
+  - The useful improvement was to prevent production/test SQL drift, not to add a speculative index.
+- Changes:
+  - Added named SQL helpers for production list/filter queries:
+    - `quota_source_model_assignments_list_sql()`
+    - `quota_source_model_assignments_for_kind_sql()`
+    - `quota_source_model_assignments_for_model_sql()`
+    - `quota_source_model_assignment_targets_for_model_sql()`
+    - `quota_assignment_source_ids_for_kind_sql()`
+    - `quota_assignment_models_for_source_sql()`
+    - `account_quota_capacity_templates_list_sql()`
+    - `account_quota_capacity_overrides_list_sql()`
+  - Added dynamic chunk SQL helpers:
+    - `quota_source_model_assignments_for_sources_chunk_sql()`
+    - `account_quota_capacity_overrides_for_accounts_chunk_sql()`
+  - Updated production query paths to call those helpers.
+  - Updated query-plan tests to call the same helpers.
+  - Extended test EXPLAIN collection to support bound parameters, so tests can use the production placeholder-based SQL directly.
+  - Kept final Rust sorting for chunked calls unchanged.
+- Behavior intentionally unchanged:
+  - Selected fields are unchanged.
+  - Predicate semantics are unchanged.
+  - Parameter ordering is unchanged.
+  - Public return ordering is unchanged.
+  - No table schema, migration, or index was added.
+- Validation:
+  - `cargo fmt` was run after edits.
+  - `cargo test -p codexmanager-core quota_pool` passed: 9 matching tests.
+  - `cargo fmt --check` passed.
+  - `cargo test -p codexmanager-core` passed:
+    - 292 library tests
+    - 7 auth integration tests
+    - 28 storage integration tests
+    - 1 usage integration test
+    - 1 version integration test
+    - doc-tests with 0 tests
+  - `git diff --check` passed; Git only reported LF-to-CRLF working-copy warnings.
+- Remaining candidates:
+  - Continue scanning `request_logs.rs`, `events.rs`, `tokens.rs`, and `usage.rs` for production/test SQL drift.
+  - Only add SQLite indexes when a production query plan demonstrates a real missing index and a migration-level test can prove it.
+  - `request_logs.rs` still looks like a likely high-value candidate because list/count/page query shapes and query-plan tests are complex.
+
+## 2026-06-22 continuation - request log list/count SQL helper consolidation
+
+- Re-verified context:
+  - Runtime is Windows PowerShell Core 7.6.2.
+  - Root `AGENTS.md` was read again.
+  - Repo-local `./skills/skill-router/SKILL.md` is still missing, so the global `skill-router` was used.
+  - This pass stayed under `crates/core`; `apps/AGENTS.md` was not needed.
+  - Current files and tests were treated as source of truth.
+- Scope chosen:
+  - Continued SQLite/core storage maintenance in `crates/core/src/storage/request_logs.rs`.
+  - Focused on list/count request log SQL and their query-plan tests.
+  - Avoided feature removal and avoided SQLite schema/index changes.
+- Findings:
+  - Production request log list/count paths build SQL through `RequestLogSqlFilters`, but several EXPLAIN tests still hand-wrote simplified SQL.
+  - The hand-written tests were close to production query shapes but not identical, especially for the paginated list CTE path and `COUNT(1)` join selection.
+  - Existing indexes already supported the tested paths; the useful improvement was reducing SQL drift between production and tests.
+- Changes:
+  - Added `REQUEST_LOG_LIST_SELECT_COLUMNS` to centralize the selected request log row field order.
+  - Added `request_log_list_sql(&RequestLogSqlFilters)`.
+  - Added `request_log_count_sql(&RequestLogSqlFilters)`.
+  - Updated production `list_request_logs_with_filter()` to call `request_log_list_sql()`.
+  - Updated production `count_request_logs()` and `count_request_logs_for_keys()` to call `request_log_count_sql()`.
+  - Extended request-log EXPLAIN tests to support bound parameters.
+  - Updated request-log query-plan tests to use the same production filter builder and SQL builders for:
+    - method exact list lookup
+    - key exact list lookup
+    - model exact list lookup
+    - route strategy exact list lookup
+    - status-only count
+    - account-free status count
+    - paginated list prefilter CTE
+    - global count with token stats join
+  - Left the `actual_source_id` direct query-plan test unchanged because that route-detail path is intentionally narrower and should not be conflated with the normal list query path.
+- Behavior intentionally unchanged:
+  - Request-log selected column order remains compatible with `map_request_log_row()`.
+  - Filter building, parameter ordering, limit/offset handling, count semantics, account join decisions, token-stats join decisions, and public API behavior are unchanged.
+  - No new index or migration was added.
+- Validation:
+  - `cargo fmt` was run after edits.
+  - `cargo test -p codexmanager-core request_logs` passed: 26 matching library tests plus 2 matching storage integration tests.
+  - `cargo fmt --check` passed.
+  - `cargo test -p codexmanager-core` passed:
+    - 292 library tests
+    - 7 auth integration tests
+    - 28 storage integration tests
+    - 1 usage integration test
+    - 1 version integration test
+    - doc-tests with 0 tests
+  - `git diff --check` passed; Git only reported LF-to-CRLF working-copy warnings.
+- Worktree note:
+  - The repository remains broadly dirty from earlier continuation work.
+  - This pass intentionally touched `crates/core/src/storage/request_logs.rs`, `crates/core/src/storage/tests/request_logs_tests.rs`, and this maintenance log.
+- Remaining candidates:
+  - Continue scanning `request_logs.rs` for summary SQL helper consolidation only if it can reuse production filters without obscuring token usage semantics.
+  - Continue scanning `events.rs`, `tokens.rs`, and `usage.rs` for production/test SQL drift.
+  - Keep avoiding speculative indexes; use EXPLAIN and migration tests before adding any SQLite index.
+
+## 2026-06-22 continuation - events/tokens/usage SQL helper drift reduction
+
+- Re-verified context:
+  - Runtime is Windows PowerShell Core 7.6.2 on Windows.
+  - Root `AGENTS.md` was read again before code work.
+  - Repo-local `./skills/skill-router/SKILL.md` is still missing, so the global `skill-router` and its skill index were used.
+  - This pass stayed under `crates/core`; `apps/AGENTS.md` was not needed.
+  - Current dirty worktree was treated as source of truth; no unrelated dirty files were reverted.
+- Scope chosen:
+  - Continued the SQLite/core storage maintainability track.
+  - Focused on production/test SQL drift in `events.rs`, `tokens.rs`, and `usage.rs`.
+  - Avoided feature removal because no safe unused feature candidate was proven.
+  - Avoided SQLite schema/index changes because existing EXPLAIN tests still showed the intended indexes being used.
+- Changes:
+  - In `crates/core/src/storage/events.rs`:
+    - Added `latest_account_status_reasons_chunk_sql()`.
+    - Added `latest_account_status_blocked_ids_chunk_sql()`.
+    - Kept the existing ranked CTE helper as the shared source for latest account status chunk queries.
+  - In `crates/core/src/storage/tests/events_tests.rs`:
+    - Added a small `collect_query_plan()` helper.
+    - Switched latest reason and blocked-id EXPLAIN tests to use the production SQL builders.
+  - In `crates/core/src/storage/tokens.rs`:
+    - Added `account_token_candidates_for_accounts_chunk_sql()`.
+    - Added `usable_account_token_candidates_for_accounts_chunk_sql()`.
+    - Updated production chunk query functions and their EXPLAIN tests to share those builders.
+  - In `crates/core/src/storage/usage.rs`:
+    - Added `latest_usage_snapshots_for_accounts_chunk_sql()`.
+    - Added `latest_usage_cleanup_rows_for_accounts_chunk_sql()`.
+    - Updated the corresponding production chunk queries and query-plan test to share those builders.
+- Behavior intentionally unchanged:
+  - Selected columns and row mappers are unchanged.
+  - Predicate semantics and parameter ordering are unchanged.
+  - Chunking behavior and Rust-side final ordering/deduplication are unchanged.
+  - No migration, table, or index was added.
+- Validation:
+  - `cargo fmt` was run after edits.
+  - `cargo fmt --check` passed.
+  - `cargo test -p codexmanager-core events` passed: 6 matching library tests.
+  - `cargo test -p codexmanager-core tokens` passed: 16 matching library tests plus 3 matching storage integration tests.
+  - `cargo test -p codexmanager-core usage` passed: 36 matching library tests plus 4 matching storage integration tests plus 1 usage integration test.
+  - `cargo test -p codexmanager-core` passed:
+    - 292 library tests
+    - 7 auth integration tests
+    - 28 storage integration tests
+    - 1 usage integration test
+    - 1 version integration test
+    - doc-tests with 0 tests
+  - `git diff --check` passed; Git only reported LF-to-CRLF working-copy warnings.
+- Worktree note:
+  - This pass intentionally touched `crates/core/src/storage/events.rs`, `crates/core/src/storage/tests/events_tests.rs`, `crates/core/src/storage/tokens.rs`, `crates/core/src/storage/usage.rs`, and this maintenance log.
+  - `tokens.rs` and `usage.rs` already contained earlier continuation changes; this pass worked with them rather than reverting them.
+- Remaining candidates:
+  - Continue scanning `request_token_stats.rs` and its tests for any remaining production/test SQL drift.
+  - Continue service modularity work in `http_bridge/delivery.rs` only in small slices because branch-specific streaming, usage, error-hint, and terminal-state semantics are easy to break.
+  - Re-run the upstream `reqwest::Client` construction scan before claiming that client reuse is fully addressed.
+  - Do not remove features without current call-site evidence and a rollback-safe validation path.
+
+## 2026-06-22 continuation - request token stats key-filter clause consolidation and client scan
+
+- Re-verified context:
+  - Runtime is Windows PowerShell Core 7.6.2 on Windows.
+  - Root `AGENTS.md` was read again.
+  - Repo-local `./skills/skill-router/SKILL.md` is still missing, so the global `skill-router` was used.
+  - This pass stayed under `crates/core` for code edits; `apps/AGENTS.md` was not needed.
+  - Current dirty worktree was treated as source of truth and unrelated dirty files were not reverted.
+- Scope chosen:
+  - Continued the SQLite/core storage maintainability track in `request_token_stats.rs`.
+  - Also re-ran the upstream `reqwest::Client` construction scan because client reuse is part of the long-running goal.
+  - Avoided feature removal because no safe unused feature candidate was proven.
+  - Avoided SQLite schema/index changes because the existing query-plan tests still match the intended indexes.
+- Findings:
+  - `request_token_stats.rs` had the same temp-key filter alias mapping repeated across raw stats, hourly rollups, legacy rollups, and outer combined queries.
+  - The aliases are easy to drift:
+    - raw stats use `t.key_id`
+    - hourly rollups use `NULLIF(TRIM(h.key_id), '')`
+    - legacy rollups use `NULLIF(TRIM(r.key_id), '')`
+    - combined outer queries use `s.key_id`
+  - The current working tree already had branch-level temp-key prefiltering for usage summaries; this pass preserved that behavior and made the alias mapping explicit.
+- Changes:
+  - Added `KeyFilterSqlClauses`.
+  - Added `key_filter_sql_clauses()`.
+  - Replaced repeated temp-key filter clause construction in:
+    - `summarize_request_token_stats_query_for_keys_between()`
+    - `query_request_token_stats_by_key()`
+    - `query_request_token_stats_by_model()`
+    - `query_request_token_stats_by_key_and_model()`
+  - No selected columns, grouping, ordering, parameter binding, or return mapping was intentionally changed.
+- Client scan:
+  - Re-ran:
+    - `rg -n "reqwest::(blocking::)?Client::(new|builder)|\bClient::builder\(|\bClient::new\(" .\crates .\apps\src-tauri\src -g "*.rs"`
+    - `rg -n "struct .*Client|OnceLock|LazyLock|Mutex<Option<Client|RwLock<Client|reqwest::Client|blocking::Client" .\crates\service\src .\apps\src-tauri\src -g "*.rs"`
+  - Current findings:
+    - `gateway/core/runtime_config.rs` keeps upstream clients in `OnceLock<RwLock<...>>` and has an upstream client pool.
+    - `usage_http.rs`, `account_warmup.rs`, `auth_tokens.rs`, `plugin/runtime.rs`, model picker, updater runtime, and proxy runtime all use cached/stateful clients or build once into runtime state.
+    - Remaining obvious `Client::new()` / `Client::builder()` hits inspected in `aggregate_api.rs`, protocol aggregate API, postprocess, and transport were test helpers or mock-test paths in this scan.
+  - Result:
+    - No new production hot path was proven to rebuild an upstream request client per request in this pass.
+    - No service client reuse code change was made in this pass.
+- Validation:
+  - `cargo fmt --check` passed.
+  - `cargo test -p codexmanager-core request_token_stats` passed:
+    - 18 matching library tests
+    - 2 matching storage integration tests
+  - `cargo test -p codexmanager-core` passed:
+    - 292 library tests
+    - 7 auth integration tests
+    - 28 storage integration tests
+    - 1 usage integration test
+    - 1 version integration test
+    - doc-tests with 0 tests
+  - `git diff --check` passed; Git only reported LF-to-CRLF working-copy warnings.
+- Worktree note:
+  - This pass intentionally touched `crates/core/src/storage/request_token_stats.rs` and this maintenance log.
+  - `crates/core/src/storage/tests/request_token_stats_tests.rs` already had prior uncommitted query-plan helper/test changes; this pass left those intact.
+- Remaining candidates:
+  - Continue service modularity work in `http_bridge/delivery.rs` in narrow, well-tested slices.
+  - If continuing SQLite work, inspect `request_token_stats.rs` combined-query builders for further duplication only where helper extraction does not hide raw/hourly/legacy semantic differences.
+  - Keep treating feature removal as unsafe unless current call-site evidence proves a feature is unused and tests can cover removal.
+
+## 2026-06-22 continuation - http bridge synthesized content-type helper reuse
+
+- Re-verified context:
+  - Runtime is Windows PowerShell Core 7.6.2 on Windows.
+  - Root `AGENTS.md` was read again.
+  - Repo-local `./skills/skill-router/SKILL.md` is still missing, so the global `skill-router` was used.
+  - This pass stayed under `crates/service`; `apps/AGENTS.md` was not needed.
+  - Current dirty worktree was treated as source of truth and unrelated dirty files were not reverted.
+- Scope chosen:
+  - Continued the service modularity track in `crates/service/src/gateway/observability/http_bridge/delivery.rs`.
+  - Chose a narrow, low-risk slice because `delivery.rs` still covers many sensitive protocol paths:
+    - `/v1/responses`
+    - `/v1/chat/completions`
+    - passthrough SSE
+    - compact responses
+    - image generation
+    - Gemini / Anthropic adapters
+    - streaming terminal diagnostics
+  - Avoided larger result-construction extraction in this pass because usage, terminal, error-hint, and delivered-status semantics differ by branch.
+- Findings:
+  - `response_helpers::replace_content_type_header()` already centralizes content-type replacement.
+  - `delivery.rs` still had two identical hand-written blocks for synthesized non-stream SSE JSON responses:
+    - remove existing `Content-Type`
+    - append `Content-Type: application/json`
+  - The two hand-written blocks existed once for blocking upstream responses and once for stream upstream responses.
+- Changes:
+  - Replaced both hand-written synthesized-response `Content-Type` blocks with:
+    - `replace_content_type_header(&mut headers, "application/json")`
+  - Removed the now-unused production-level `Header` import from `delivery.rs`.
+  - Moved test-only `Header` usage into the test module import.
+- Behavior intentionally unchanged:
+  - Synthesized response detection is unchanged.
+  - Status code, body, headers other than normalized `Content-Type`, usage collection, upstream error hints, delivery errors, and debug metadata are unchanged.
+  - No protocol adapter branch was removed or rewritten.
+- Validation:
+  - `cargo test -p codexmanager-service http_bridge` passed:
+    - 127 matching service library tests
+    - all matching integration-test filters had 0 selected tests
+  - The initial test run exposed an unused `Header` warning after the helper replacement; the import was cleaned up.
+  - `cargo fmt` was run after edits.
+  - `cargo fmt --check` passed.
+  - `git diff --check` passed; Git only reported LF-to-CRLF working-copy warnings.
+- Worktree note:
+  - This pass intentionally touched `crates/service/src/gateway/observability/http_bridge/delivery.rs` and this maintenance log.
+  - Existing untracked split modules under `http_bridge/` remain part of prior continuation work and were not rewritten.
+- Remaining candidates:
+  - Continue `delivery.rs` modularity only in narrow slices with `cargo test -p codexmanager-service http_bridge` after each slice.
+  - A likely next service slice is reducing repeated `with_bridge_debug_meta(UpstreamResponseBridgeResult { ... })` construction, but only if the helper preserves branch-specific `usage`, terminal, upstream-error, delivery-error, and last-event semantics explicitly.
+  - Avoid feature removal unless current call-site evidence and tests prove the removal is safe.
+
+## 2026-06-22 continuation - http bridge terminal result debug-meta helper
+
+- Re-verified context:
+  - Runtime is Windows PowerShell Core 7.6.2 on Windows.
+  - Root `AGENTS.md` was read again before code work.
+  - Repo-local `./skills/skill-router/SKILL.md` is still missing, so the global `skill-router` was used and its skill index was checked.
+  - This pass stayed under `crates/service`; `apps/AGENTS.md` was not needed.
+  - Current dirty worktree was treated as source of truth and unrelated dirty files were not reverted.
+- Scope chosen:
+  - Continued the `http_bridge/delivery.rs` modularity track.
+  - Focused only on repeated terminal `UpstreamResponseBridgeResult` construction where:
+    - `stream_terminal_seen` is always `true`
+    - `stream_terminal_error` is always `None`
+    - `delivered_status_code` and upstream debug fields are filled by bridge metadata
+    - `last_sse_event_type` is not branch-specific
+  - Left collector/diagnostic branches using explicit `with_bridge_debug_meta(...)` construction because their terminal state, terminal error, upstream error hint, and last SSE event are runtime-collected.
+- Changes:
+  - Added `terminal_bridge_result_with_debug_meta()` in `metadata.rs`.
+  - Replaced terminal result boilerplate in both blocking and stream upstream delivery paths with the helper.
+  - Branch-specific values remain explicit at call sites:
+    - `usage`
+    - `delivery_error`
+    - `upstream_error_hint`
+  - No response body conversion, content-type normalization, status handling, deactivation suppression, usage parsing, or streaming collector logic was intentionally changed.
+- Validation:
+  - `cargo fmt` completed.
+  - `cargo test -p codexmanager-service http_bridge` passed:
+    - 127 matching service library tests
+    - all matching integration-test filters had 0 selected tests
+  - `cargo fmt --check` passed.
+  - `git diff --check` passed; Git only reported existing LF-to-CRLF working-copy warnings.
+- Worktree note:
+  - This pass intentionally touched `crates/service/src/gateway/observability/http_bridge/metadata.rs`, `crates/service/src/gateway/observability/http_bridge/delivery.rs`, and this maintenance log.
+  - The large `delivery.rs` diff still includes earlier split-module work from prior continuation passes; this pass worked on top of it and did not revert those changes.
+- Remaining candidates:
+  - Continue `http_bridge` modularity with one more narrow slice only after inspecting call-site semantics.
+  - A possible next slice is moving repeated bridge debug metadata argument bundles behind a small value object, but only if it improves readability without hiding upstream request id / CF ray / auth / content-type propagation.
+  - Return to SQLite/core only when there is a concrete duplicated query builder or EXPLAIN-backed performance issue to address.
+  - Keep feature removal blocked unless current call-site evidence and tests prove the feature is unused.
+
+## 2026-06-22 continuation - upstream client scan and request log filter helper
+
+- Re-verified context:
+  - Runtime is Windows PowerShell Core 7.6.2 on Windows.
+  - Root `AGENTS.md` was read again before code work.
+  - Repo-local `./skills/skill-router/SKILL.md` is still missing, so the global `skill-router` was used and the relevant skill index entries were checked.
+  - Current dirty worktree was treated as source of truth and unrelated dirty files were not reverted.
+- Upstream client reuse scan:
+  - Re-ran:
+    - `rg -n "reqwest::(blocking::)?Client::(new|builder)|\bClient::builder\(|\bClient::new\(" .\crates .\apps\src-tauri\src -g "*.rs"`
+    - `rg -n "struct .*Client|OnceLock|LazyLock|Mutex<Option<Client|RwLock<Client|reqwest::Client|blocking::Client" .\crates\service\src .\apps\src-tauri\src -g "*.rs"`
+  - Inspected the remaining suspicious production-looking hits:
+    - `crates/service/src/gateway/upstream/protocol/aggregate_api.rs`
+    - `crates/service/src/gateway/upstream/attempt_flow/postprocess.rs`
+    - `crates/service/src/gateway/upstream/attempt_flow/transport.rs`
+    - `crates/service/src/aggregate_api.rs`
+  - Current finding:
+    - Gateway aggregate API request path already uses `gateway::upstream_client()`.
+    - Aggregate API management endpoints for connection test, model discovery, and balance refresh already use `gateway::upstream_client()`.
+    - `postprocess.rs`, `transport.rs`, and protocol aggregate API `Client::new()` hits inspected in this pass were test/mock helper paths.
+    - No new production hot path was proven to create a new upstream request client per request.
+  - Result:
+    - No client reuse code change was made in this pass.
+- SQLite/request log maintainability slice:
+  - Continued in `crates/core/src/storage/request_logs.rs`.
+  - Added internal `request_log_filters(...)` helper on `Storage`.
+  - Replaced repeated `self.has_table("accounts")?` + `build_request_log_filters(...)` construction in:
+    - paginated request-log listing
+    - keyed paginated request-log listing
+    - request-log count
+    - keyed request-log count
+    - filtered request-log summary
+    - keyed filtered request-log summary
+  - SQL text generation and parameter ordering were intentionally unchanged.
+  - Did not add SQLite indexes or migrations because existing EXPLAIN-backed request-log index tests still cover the relevant plans.
+- Validation:
+  - `cargo fmt` completed.
+  - `cargo test -p codexmanager-core request_logs` passed:
+    - 26 matching library tests
+    - 2 matching storage integration tests
+    - other filtered integration targets had 0 selected tests
+  - `cargo fmt --check` passed.
+  - `git diff --check` passed; Git only reported existing LF-to-CRLF working-copy warnings.
+- Worktree note:
+  - This pass intentionally touched `crates/core/src/storage/request_logs.rs` and this maintenance log.
+  - `request_logs.rs` already contained earlier continuation changes for list/count SQL helpers and summary row mapping; this pass worked on top of those changes.
+- Remaining candidates:
+  - If continuing SQLite, inspect `request_token_stats.rs` or `request_logs.rs` only for concrete duplicated query builders or EXPLAIN evidence.
+  - If continuing client reuse, inspect any new `reqwest::Client::new()` hits introduced after this scan before changing code.
+  - Keep feature removal blocked unless current call-site evidence and tests prove the feature is unused.
+
+## 2026-06-22 continuation - request token stats query-summary helper
+
+- Re-verified context:
+  - Runtime is Windows PowerShell Core 7.6.2 on Windows.
+  - Root `AGENTS.md` was read again before code work.
+  - Repo-local `./skills/skill-router/SKILL.md` is still missing, so the global `skill-router` was used.
+  - Current dirty worktree was treated as source of truth and unrelated dirty files were not reverted.
+- Scope chosen:
+  - Continued the SQLite/core maintainability track in `crates/core/src/storage/request_token_stats.rs`.
+  - Focused on the duplicated query-summary path used by request-log filtered summaries:
+    - `summarize_request_token_stats_query_between(...)`
+    - `summarize_request_token_stats_query_for_keys_between(...)`
+  - Avoided changing indexes, migrations, or rollup semantics because the existing EXPLAIN-backed tests already cover the relevant lookup paths.
+- Changes:
+  - Added `request_log_query_summary_from_usage(...)`.
+  - Added shared `query_request_token_stats_query_between(...)`.
+  - Reused the existing `key_filter_sql_clauses(...)` helper for the keyed query-summary path.
+  - Preserved current SQL semantics:
+    - raw stats and hourly rollups still use the same `raw_token_rollup_select(...)` / `hourly_token_rollup_select(...)` builders.
+    - optional time-range parameter binding remains unchanged.
+    - temp key filters still apply to raw and hourly branches with the same aliases.
+    - result mapping to `RequestLogQuerySummary` is unchanged.
+- Validation:
+  - `cargo fmt` completed.
+  - `cargo test -p codexmanager-core request_token_stats` passed:
+    - 18 matching library tests
+    - 2 matching storage integration tests
+    - other filtered integration targets had 0 selected tests
+  - `cargo fmt --check` passed.
+  - `git diff --check` passed; Git only reported existing LF-to-CRLF working-copy warnings.
+  - Full `cargo test -p codexmanager-core` passed:
+    - 292 library tests
+    - 7 auth integration tests
+    - 28 storage integration tests
+    - 1 usage integration test
+    - 1 version integration test
+    - doc-tests with 0 tests
+- Worktree note:
+  - This pass intentionally touched `crates/core/src/storage/request_token_stats.rs` and this maintenance log.
+  - The visible `request_token_stats.rs` diff also includes earlier continuation changes around `KeyFilterSqlClauses`; this pass worked on top of those changes and did not revert them.
+- Remaining candidates:
+  - Continue SQLite only where duplicated query construction or EXPLAIN evidence is concrete.
+  - A possible next SQLite slice is factoring the repeated combined raw/hourly SQL wrapper if it can be done without hiding branch-specific grouping and legacy-rollup inclusion rules.
+  - Continue `http_bridge` modularity only in narrow slices with `cargo test -p codexmanager-service http_bridge`.
+  - Keep feature removal blocked unless current call-site evidence and tests prove the feature is unused.
+
+## 2026-06-22 continuation - request token stats union helper
+
+- Re-verified context:
+  - Runtime is Windows PowerShell Core 7.6.2 on Windows.
+  - Root `AGENTS.md` was read before code work.
+  - Repo-local `./skills/skill-router/SKILL.md` is still missing, so the global `skill-router` was used and its skill index was checked in chunks because direct output was truncated.
+  - Current dirty worktree was treated as source of truth and unrelated dirty files were not reverted.
+- Scope chosen:
+  - Continued the SQLite/core maintainability track in `crates/core/src/storage/request_token_stats.rs`.
+  - Focused only on repeated `UNION ALL` string assembly for key/model usage rollup queries.
+  - Did not add indexes, migrations, or feature removals because there was no new EXPLAIN-backed performance evidence or unused-feature call-site proof in this slice.
+- Changes:
+  - Added `union_all_selects(...)` helper.
+  - Replaced hand-built `combined_selects` string concatenation in:
+    - `query_request_token_stats_by_key(...)`
+    - `query_request_token_stats_by_model(...)`
+    - `query_request_token_stats_by_key_and_model(...)`
+  - Preserved current SQL semantics:
+    - raw, hourly, and legacy select builders are unchanged.
+    - keyed filter aliases are unchanged.
+    - legacy rollup inclusion remains unconditional for by-key and only no-range for by-model / by-key-and-model.
+    - optional time-range parameter binding remains unchanged.
+- Validation:
+  - `cargo fmt --check` passed.
+  - `cargo test -p codexmanager-core request_token_stats` passed:
+    - 18 matching library tests
+    - 2 matching storage integration tests
+    - other filtered integration targets had 0 selected tests
+  - `cargo test -p codexmanager-core` passed:
+    - 292 library tests
+    - 7 auth integration tests
+    - 28 storage integration tests
+    - 1 usage integration test
+    - 1 version integration test
+    - doc-tests with 0 tests
+  - `git diff --check` passed; Git only reported existing LF-to-CRLF working-copy warnings.
+- Worktree note:
+  - This pass intentionally touched `crates/core/src/storage/request_token_stats.rs` and this maintenance log.
+  - The visible `request_token_stats.rs` diff also includes earlier continuation changes around `request_log_query_summary_from_usage(...)`, `KeyFilterSqlClauses`, and `query_request_token_stats_query_between(...)`; this pass worked on top of those changes and did not revert them.
+- Remaining candidates:
+  - Continue SQLite only where duplicated query construction or EXPLAIN evidence is concrete.
+  - Consider a tiny helper for optional time-range query execution only if it stays clearer than the current explicit branches.
+  - Continue `http_bridge` modularity only in narrow slices with `cargo test -p codexmanager-service http_bridge`.
+  - Keep feature removal blocked unless current call-site evidence and tests prove the feature is unused.
+
+## 2026-06-22 continuation - http bridge JSON response helper
+
+- Re-verified context:
+  - Continued from the same Windows PowerShell Core 7.6.2 session.
+  - Current dirty worktree was treated as source of truth and unrelated dirty files were not reverted.
+  - `git diff --check` was run before this slice and only reported existing LF-to-CRLF working-copy warnings.
+- Scope chosen:
+  - Continued the service/gateway modularity track in `crates/service/src/gateway/observability/http_bridge/`.
+  - Focused only on repeated tiny_http JSON byte response construction in blocking and stream upstream delivery paths.
+  - Avoided changing passthrough body delivery, streaming chunked delivery, compact validation branches, SSE collection, adapter conversion, failover suppression, or debug metadata propagation.
+- Changes:
+  - Added `respond_json_bytes(...)` in `response_helpers.rs`.
+  - Replaced repeated JSON response send blocks in `delivery.rs` with that helper.
+  - Cleaned two `mut headers` bindings that no longer needed mutation after content-type replacement moved into the helper.
+  - Preserved current behavior:
+    - `Content-Type` is still forced to `application/json` for the replaced paths.
+    - response length still matches the final byte body length.
+    - delivery errors are still returned as `Option<String>`.
+    - trace-id and copied upstream headers still come from `copy_upstream_response_headers(...)`.
+- Validation:
+  - `cargo fmt` completed.
+  - `cargo test -p codexmanager-service http_bridge` passed:
+    - 127 matching service library tests
+    - all matching integration-test filters had 0 selected tests
+  - `cargo fmt --check` passed.
+  - `git diff --check` passed; Git only reported existing LF-to-CRLF working-copy warnings.
+- Worktree note:
+  - This pass intentionally touched `crates/service/src/gateway/observability/http_bridge/response_helpers.rs`, `crates/service/src/gateway/observability/http_bridge/delivery.rs`, and this maintenance log.
+  - The visible `delivery.rs` diff is still large because it includes earlier split-module work from prior continuation passes; this pass worked on top of it and did not revert those changes.
+- Remaining candidates:
+  - Continue `http_bridge` only in narrow helper extractions where the repeated block is identical and covered by `cargo test -p codexmanager-service http_bridge`.
+  - Avoid factoring collector/diagnostic branches unless the helper can preserve terminal status, terminal error, upstream error hint, and last SSE event explicitly.
+  - Return to SQLite/core only with concrete duplicated query construction or EXPLAIN-backed performance evidence.
+  - Keep feature removal blocked unless current call-site evidence and tests prove the feature is unused.
+
+## 2026-06-22 continuation - upstream client reuse and aggregate route regression follow-up
+
+- Re-verified context:
+  - Runtime is Windows PowerShell Core 7.6.2 on Windows.
+  - Root `AGENTS.md` was read before code work.
+  - Global `skill-router` and its skill index were read because repo-local `./skills/skill-router/SKILL.md` is still missing.
+  - Current dirty worktree was treated as source of truth and unrelated dirty files were not reverted.
+- Handoff state carried forward:
+  - Previous compacted pass scanned production `reqwest::Client` / `blocking::Client` construction under `crates/` and `apps/src-tauri/src`.
+  - Main gateway request paths already used cached clients through `upstream_client_for_account(...)` and `async_upstream_client_for_account(...)`.
+  - Test-only mock clients in `aggregate_api.rs` were left alone.
+  - Startup/probe and runtime helper clients in `crates/web`, `plugin/runtime.rs`, `account_warmup.rs`, `usage_http.rs`, `model_picker/request.rs`, and Tauri updater/runtime were already cached or scoped appropriately.
+  - Concrete optimization target was the retry path: `fresh_upstream_client_for_account(...)` and `fresh_async_upstream_client_for_account(...)` were changed in `crates/service/src/gateway/core/runtime_config.rs` to return cached retry clients, including proxy-pool retry clients, instead of rebuilding per failed request retry.
+  - Previous validation reported:
+    - `cargo fmt`
+    - `cargo fmt --check`
+    - `cargo test -p codexmanager-service runtime_config`
+    - `cargo test -p codexmanager-service gateway::upstream::attempt_flow::transport`
+    - `git diff --check` with only existing LF-to-CRLF working-copy warnings.
+- Regression triage in this window:
+  - Re-ran the two failing `gateway_logs` tests with `--nocapture`.
+  - Both failures were real and had the same shape:
+    - `gateway_aggregate_messages_passthrough_accepts_message_stop_for_non_claude_provider`: `404 aggregate api not found for provider claude`.
+    - `gateway_aggregate_responses_bridge_adds_anthropic_headers_and_messages_path`: `404 aggregate api not found for provider codex`.
+  - The failure was not caused by retry-client caching. It came from route-level candidate resolution losing an explicitly bound `aggregate_api_id` when its stored provider did not match the protocol provider hint.
+- Changes:
+  - Updated `crates/service/src/gateway/upstream/proxy.rs`.
+  - Kept the protocol-level rotation resolver behavior unchanged:
+    - ordinary rotation candidates are still provider-filtered.
+    - `resolve_aggregate_api_rotation_candidates(...)` still only promotes a matching-provider preferred ID.
+  - Added route-level explicit aggregate handling:
+    - `resolve_active_explicit_aggregate_candidate(...)` reads a non-empty explicit `aggregate_api_id` by ID and only accepts it when `status` is active.
+    - explicit active candidates are inserted at the head of route candidates and deduplicated from the provider-filtered list.
+    - provider fallback candidates remain available after the explicit candidate.
+    - model-source mapping filtering was factored into `apply_aggregate_model_mapping(...)` and still applies to both explicit and provider candidates.
+  - Added `explicit_aggregate_route_candidate_precedes_provider_candidates` to cover both directions:
+    - OpenAI/Codex route with explicit Claude aggregate.
+    - Anthropic route with explicit Codex aggregate.
+- Validation:
+  - `cargo fmt` completed.
+  - `cargo test -p codexmanager-service explicit_aggregate_route_candidate_precedes_provider_candidates -- --nocapture` passed.
+  - `cargo test -p codexmanager-service --test gateway_logs anthropic::gateway_aggregate_messages_passthrough_accepts_message_stop_for_non_claude_provider -- --nocapture` passed.
+  - `cargo test -p codexmanager-service --test gateway_logs anthropic::gateway_aggregate_responses_bridge_adds_anthropic_headers_and_messages_path -- --nocapture` passed.
+  - `cargo test -p codexmanager-service gateway::upstream::proxy -- --nocapture` passed:
+    - 33 matching service library tests.
+  - `cargo test -p codexmanager-service --test gateway_logs anthropic -- --nocapture` passed:
+    - 7 matching integration tests.
+  - `cargo test -p codexmanager-service gateway` passed:
+    - 630 matching service library tests.
+    - 1 matching `app_settings` integration test.
+    - 25 matching `gateway_logs` integration tests.
+  - `cargo fmt --check` passed.
+  - `git diff --check` passed; Git only reported existing LF-to-CRLF working-copy warnings.
+- Residual client reuse scan:
+  - Re-ran a production/test grep for `reqwest::Client::new`, `Client::builder`, and `fresh_*upstream_client*`.
+  - Remaining production client builders were checked and left unchanged because they are already scoped correctly:
+    - `crates/service/src/auth/auth_tokens.rs` uses `OnceLock` clients for auth and loopback auth.
+    - `crates/service/src/account/account_warmup.rs` uses a config-keyed cached warmup client.
+    - `crates/service/src/usage/usage_http.rs` uses `OnceLock<RwLock<Client>>` and rebuilds only after proxy/runtime config changes.
+    - `crates/service/src/gateway/model_picker/request.rs` uses a cached config-keyed model picker client.
+    - `crates/web/src/service_gateway.rs` builds one probe client for the service startup probe loop.
+    - `crates/web/src/main.rs` builds one `AppState` client at web startup and reuses it.
+    - `crates/service/src/http/proxy_runtime.rs` stores one front-proxy client in `ProxyState`.
+  - Remaining `Client::new` / `Client::builder` hits in tests and mock helpers were not changed.
+- Worktree note:
+  - This window intentionally touched `crates/service/src/gateway/upstream/proxy.rs` and this maintenance log.
+  - The visible dirty worktree still contains many earlier continuation changes; they were not reverted.
+- Remaining candidates:
+  - Continue client reuse only where a production request path still constructs a fresh client per request.
+  - Continue SQLite only where there is duplicated query construction or EXPLAIN-backed index evidence.
+  - Keep feature removal blocked unless current call-site evidence and tests prove the feature is unused.
+
+## 2026-06-22 continuation - request log today summary ownership
+
+- Re-verified context:
+  - Root `AGENTS.md` was read before code work.
+  - Global `skill-router` and the relevant entries from its skill index were checked because repo-local `./skills/skill-router/SKILL.md` is still missing.
+  - Current dirty worktree was treated as source of truth and unrelated dirty files were not reverted.
+- Scope chosen:
+  - Continued the SQLite/core maintainability track.
+  - Focused on the request-log "today" token summary for key-scoped dashboards:
+    - `Storage::summarize_request_logs_between_for_keys(...)`
+    - `Storage::summarize_request_token_stats_between(...)`
+  - Avoided adding indexes or migrations because the existing small/large key tests already covered the relevant behavior and this slice was about moving SQL ownership, not changing query shape.
+- Changes:
+  - Moved keyed raw/hourly token summary SQL ownership from `request_logs.rs` into `request_token_stats.rs`.
+  - Added `summarize_request_token_stats_between_for_keys(...)`.
+  - Added shared helpers in `request_token_stats.rs`:
+    - `empty_request_log_today_summary(...)`
+    - `request_log_today_summary_from_row(...)`
+    - `request_log_today_summary_sql(...)`
+  - Updated `summarize_request_token_stats_between(...)` to reuse the shared today-summary SQL helper.
+  - Kept small-key and large-key behavior unchanged by using `PairedKeyIdSqlFilter`:
+    - small key sets still use `IN (...)`.
+    - large key sets still use the temp-table filter path.
+  - Reduced `request_logs.rs` to a delegating wrapper for keyed today summaries and removed its now-unused `PairedKeyIdSqlFilter` import and dead empty-summary helper.
+- Validation:
+  - Initial `cargo test -p codexmanager-core request_logs -- --nocapture` caught a parameter-count regression in the no-key summary path.
+  - Fixed the no-key summary path to bind raw and hourly range parameters separately.
+  - `cargo test -p codexmanager-core --test storage clear_request_logs_keeps_token_stats_for_usage_summary -- --nocapture` passed.
+  - `cargo test -p codexmanager-core request_logs -- --nocapture` passed:
+    - 26 matching library tests.
+    - 2 matching storage integration tests.
+  - `cargo test -p codexmanager-core request_token_stats -- --nocapture` passed:
+    - 18 matching library tests.
+    - 2 matching storage integration tests.
+  - `cargo test -p codexmanager-core` passed:
+    - 292 library tests.
+    - 7 auth integration tests.
+    - 28 storage integration tests.
+    - 1 usage integration test.
+    - 1 version integration test.
+    - doc-tests with 0 tests.
+  - `cargo fmt --check` passed.
+  - `git diff --check` passed; Git only reported existing LF-to-CRLF working-copy warnings.
+- Worktree note:
+  - This pass intentionally touched `crates/core/src/storage/request_logs.rs`, `crates/core/src/storage/request_token_stats.rs`, and this maintenance log.
+  - The visible diffs in both storage files still include earlier continuation changes from prior passes; this pass worked on top of them and did not revert unrelated changes.
+- Remaining candidates:
+  - Continue SQLite only where SQL ownership, duplicated query construction, or EXPLAIN-backed index evidence is concrete.
+  - Continue service modularity only in narrow slices with relevant service tests.
+  - Keep feature removal blocked unless current call-site evidence and tests prove the feature is unused.
+
+## 2026-06-22 continuation - http bridge stream collector helper
+
+- Re-verified context:
+  - Runtime is Windows PowerShell Core 7.6.2 on Windows.
+  - Root `AGENTS.md` was read before code work.
+  - Repo-local `./skills/skill-router/SKILL.md` is still missing; global `skill-router` and its skill index were read for lightweight routing.
+  - Current dirty worktree was treated as source of truth and unrelated dirty files were not reverted.
+- Scope carried forward:
+  - Continued the service/gateway modularity track in `crates/service/src/gateway/observability/http_bridge/delivery.rs`.
+  - Focused only on the repeated stream collector tail around `respond_streaming_chunked(...)`.
+  - Avoided changing reader construction, adapter selection, copied headers, protocol conversion, upstream error hints, deactivation suppression, or compact validation behavior.
+- Changes already present from the prior compacted pass:
+  - Added `UpstreamDebugMetaRefs<'a>`.
+  - Added `respond_usage_collector_stream(...)`.
+  - Added `respond_passthrough_collector_stream(...)`.
+  - Replaced repeated streaming adapter tail code for:
+    - `AnthropicMessagesFromResponses`
+    - `ResponsesFromAnthropicMessages`
+    - `ChatCompletionsFromResponses`
+    - `ImagesB64JsonFromResponses` / `ImagesUrlFromResponses`
+    - `GeminiSse` / `GeminiCliSse`
+  - The helper only centralizes:
+    - chunked streaming response delivery,
+    - collector lock/clone/default handling,
+    - optional debug metadata propagation.
+- Validation:
+  - `cargo fmt --check` passed.
+  - `cargo test -p codexmanager-service http_bridge -- --nocapture` passed:
+    - 127 matching service library tests.
+    - all matching integration-test filters had 0 selected tests.
+  - `git diff --check` passed; Git only reported existing LF-to-CRLF working-copy warnings.
+- Worktree note:
+  - This pass intentionally touched this maintenance log.
+  - The `delivery.rs` helper extraction was already present when this window started; this pass verified and documented it rather than rewriting it.
+- Remaining candidates:
+  - Continue `http_bridge` only where repeated blocks are mechanically identical and covered by the same targeted tests.
+  - Continue SQLite only where SQL ownership, duplicated query construction, or EXPLAIN-backed performance evidence is concrete.
+  - Feature removal remains blocked unless current call-site evidence and tests prove the feature is unused.
+
+## 2026-06-22 continuation - usage snapshot chunk SQL helper coverage
+
+- Re-verified context:
+  - Continued the SQLite/core maintainability track after the `http_bridge` stream helper slice was verified.
+  - Existing usage snapshot indexes were checked before editing:
+    - `idx_usage_snapshots_account_captured_id` for account-scoped latest snapshots.
+    - `idx_usage_snapshots_captured_id` for global latest snapshots.
+  - No new index or migration was added because the existing index coverage already matched the query shape.
+- Scope chosen:
+  - Focused on `crates/core/src/storage/usage.rs`.
+  - Worked on the existing `latest_usage_ranked_cte_sql(...)` refactor from prior passes.
+  - Avoided changing retention policy, snapshot semantics, latest-row tie breaking, or account chunking behavior.
+- Changes:
+  - Added `latest_usage_quota_source_rows_for_accounts_chunk_sql(...)`.
+  - Updated `latest_usage_quota_source_rows_for_accounts_chunk(...)` to use the helper instead of inlining the ranked CTE SQL.
+  - Extended `usage_account_chunk_queries_defer_final_ordering_to_rust` so the quota-source chunk query is covered alongside latest snapshot and cleanup chunk queries.
+- Validation:
+  - `cargo test -p codexmanager-core usage -- --nocapture` passed:
+    - 36 matching core library tests.
+    - 4 matching storage integration tests.
+    - 1 matching usage integration test.
+  - `cargo fmt` completed after `cargo fmt --check` identified the expected formatting-only diff.
+  - `cargo fmt --check` passed.
+  - `git diff --check` passed; Git only reported existing LF-to-CRLF working-copy warnings.
+- Worktree note:
+  - This pass intentionally touched `crates/core/src/storage/usage.rs` and this maintenance log.
+  - The larger visible `usage.rs` diff includes earlier continuation changes that introduced `latest_usage_ranked_cte_sql(...)`; this pass only extended that pattern to the quota-source chunk query.
+- Remaining candidates:
+  - Continue SQLite only where the query plan or duplicated SQL construction gives concrete evidence.
+  - Avoid new schema indexes unless an EXPLAIN-backed test shows an actual gap.
+  - Feature removal remains blocked unless current call-site evidence and tests prove the feature is unused.
+
+## 2026-06-22 continuation - http bridge stream-upstream collector helper reuse
+
+- Re-verified context:
+  - Continued the service/gateway modularity track after the SQLite usage snapshot helper slice.
+  - `crates/service/src/gateway/observability/http_bridge/delivery.rs` was inspected for remaining repeated collector-delivery tails.
+  - Existing passthrough streaming branches were left alone where they apply `with_upstream_debug_suffix(...)` and `log_bridge_stream_diagnostics(...)`.
+- Scope chosen:
+  - Reused the existing collector helpers in the stream-upstream adapter path only where the tail behavior was mechanically identical.
+  - Avoided changing body buffering, reader construction, adapter selection, content-type handling, compact validation, passthrough stream diagnostics, or upstream error suffix handling.
+- Changes:
+  - In `respond_with_stream_upstream(...)`, replaced duplicated `respond_streaming_chunked(...)` + collector lock + debug metadata blocks with:
+    - `respond_usage_collector_stream(...)` for `AnthropicMessagesFromResponses`.
+    - `respond_usage_collector_stream(...)` for `ResponsesFromAnthropicMessages`.
+    - `respond_passthrough_collector_stream(...)` for `GeminiSse` / `GeminiCliSse`.
+  - Kept `ChatCompletionsFromResponses` and image adapters unchanged because those stream-upstream branches synthesize a single SSE body from buffered bytes rather than streaming through a collector reader.
+  - Kept passthrough branches unchanged because they intentionally add stream diagnostics and upstream-error debug suffixing after delivery.
+- Validation:
+  - `cargo fmt --check` passed.
+  - `cargo test -p codexmanager-service http_bridge -- --nocapture` passed:
+    - 127 matching service library tests.
+    - all matching integration-test filters had 0 selected tests.
+  - `git diff --check` passed; Git only reported existing LF-to-CRLF working-copy warnings.
+- Worktree note:
+  - This pass intentionally touched `crates/service/src/gateway/observability/http_bridge/delivery.rs` and this maintenance log.
+  - The visible `delivery.rs` diff is large because it includes earlier split-module work; this pass only replaced three repeated stream-upstream collector tails.
+- Remaining candidates:
+  - Continue `http_bridge` only where repeated code is mechanically identical and covered by `cargo test -p codexmanager-service http_bridge`.
+  - Continue SQLite only where query plans or duplicated query construction provide concrete evidence.
+  - Feature removal remains blocked unless current call-site evidence and tests prove the feature is unused.
+
+## 2026-06-22 continuation - request token optional range helper and client scan
+
+- Re-verified context:
+  - Runtime is Windows PowerShell Core 7.6.2 on Windows.
+  - Root `AGENTS.md` was read before code work.
+  - Repo-local `./skills/skill-router/SKILL.md` is still missing; global `skill-router` and relevant skill-index entries were checked for lightweight routing.
+  - Current dirty worktree was treated as source of truth and unrelated dirty files were not reverted.
+- Upstream client reuse scan:
+  - Re-ran `rg` across `crates/` and `apps/src-tauri/src` for `reqwest::Client::new`, `reqwest::Client::builder`, `Client::new`, and `Client::builder`.
+  - Confirmed current main gateway request paths still use cached clients through:
+    - `upstream_client_for_account(...)`
+    - `fresh_upstream_client_for_account(...)`
+    - `async_upstream_client_for_account(...)`
+    - `fresh_async_upstream_client_for_account(...)`
+  - Rechecked new-looking hits:
+    - `crates/service/src/aggregate_api.rs` client builders shown by the scan are inside tests for aggregate API probes.
+    - `crates/service/src/gateway/upstream/attempt_flow/postprocess.rs` `Client::new()` hits are inside tests.
+    - `crates/service/src/gateway/upstream/protocol/aggregate_api.rs` `Client::new()` hit is inside a test.
+  - No new production per-request upstream client construction was found in this pass.
+- Scope chosen:
+  - Continued SQLite/core maintainability in `crates/core/src/storage/request_token_stats.rs`.
+  - Focused on duplicated optional range parameter construction and one remaining hand-written `UNION ALL` assembly.
+  - Avoided changing query shape, range semantics, key filtering, legacy rollup inclusion rules, or indexes.
+- Changes:
+  - Added `optional_range_params(start_ts, end_ts)` to centralize optional range binding values.
+  - Reused it in:
+    - `query_request_token_stats_query_between(...)`
+    - `query_request_token_stats_by_model(...)`
+    - `query_request_token_stats_by_key_and_model(...)`
+  - Updated `query_request_token_stats_by_key_for_user(...)` to assemble raw/hourly/legacy selects with `union_all_selects(...)` instead of spelling `UNION ALL` manually.
+- Validation:
+  - `cargo test -p codexmanager-core request_token_stats -- --nocapture` passed:
+    - 18 matching core library tests.
+    - 2 matching storage integration tests.
+  - `cargo fmt --check` passed.
+  - `git diff --check` passed; Git only reported existing LF-to-CRLF working-copy warnings.
+- Worktree note:
+  - This pass intentionally touched `crates/core/src/storage/request_token_stats.rs` and this maintenance log.
+  - The visible `request_token_stats.rs` diff still includes earlier continuation changes; this pass only added the optional-range helper and one `union_all_selects(...)` reuse.
+- Remaining candidates:
+  - Continue client reuse only if a production request path constructs a fresh client per request.
+  - Continue SQLite only where query plans or duplicated SQL construction provide concrete evidence.
+  - Feature removal remains blocked unless current call-site evidence and tests prove the feature is unused.
+
+## 2026-06-22 continuation - http bridge aggregate import cleanup validation
+
+- Re-verified context:
+  - Runtime is Windows PowerShell Core 7.6.2 on Windows.
+  - Root `AGENTS.md` was read before code work.
+  - Repo-local `./skills/skill-router/SKILL.md` is still missing; global `skill-router` and its skill index were used for lightweight routing.
+  - Current dirty worktree was treated as source of truth and unrelated dirty files were not reverted.
+- Scope chosen:
+  - Closed the in-progress `crates/service/src/gateway/observability/http_bridge/mod.rs` cleanup from the previous compacted pass.
+  - Verified the current private bridge import shape instead of assuming the prior attempted re-export worked.
+- Findings:
+  - The earlier idea to replace the private aggregate helper import with a `pub(super) use aggregate::{...}` re-export is invalid because those aggregate helper items are private to their modules and Rust rejects re-exporting them with `E0364`.
+  - The working shape is to keep the private bridge import with `#[allow(unused_imports)]` for test-configuration reachability.
+  - `append_output_text_raw` is no longer present in that private bridge import; current tests compile without it, so the narrower import is valid.
+- Validation:
+  - `cargo test -p codexmanager-service http_bridge -- --nocapture` passed:
+    - 127 matching service library tests.
+    - all matching integration-test filters had 0 selected tests.
+  - `cargo fmt --check` passed.
+  - `git diff --check` passed; Git only reported existing LF-to-CRLF working-copy warnings.
+- Worktree note:
+  - This pass intentionally touched only this maintenance log.
+  - The visible `http_bridge/mod.rs` diff was already present when this window started; this pass validated and documented it.
+- Remaining candidates:
+  - Continue `http_bridge` only where repeated code is mechanically identical and covered by `cargo test -p codexmanager-service http_bridge`.
+  - Continue SQLite only where query plans or duplicated SQL construction provide concrete evidence.
+  - Continue client reuse only if a production request path constructs a fresh client per request.
+  - Feature removal remains blocked unless current call-site evidence and tests prove the feature is unused.
+
+## 2026-06-22 continuation - API key quota remaining usage scoped CTE
+
+- Re-verified context:
+  - Continued the SQLite/core performance track after validating the `http_bridge` import cleanup.
+  - Current `reqwest::Client` scan was rechecked; updater/plugin runtime hits are cached via `OnceLock`/`Mutex`, and no new production per-request upstream client builder was changed in this pass.
+  - Current dirty worktree was treated as source of truth and unrelated dirty files were not reverted.
+- Existing file state found:
+  - `crates/core/src/storage/api_key_quota_limits.rs` already had a prior unlogged optimization:
+    - `api_key_total_token_usage(...)` trims blank key ids and short-circuits blank input.
+    - `api_key_total_token_usage_sql()` filters `request_token_stats`, `request_token_stat_hourly_rollups`, and legacy `request_token_stat_rollups` by `key_id` inside each UNION branch.
+    - Tests verify the single-key total usage path uses key lookup indexes.
+- Scope chosen:
+  - Focused on `api_key_remaining_quota_tokens(...)`.
+  - This query only needs usage for keys that have positive quota limits, so the usage CTE should not aggregate usage for every key in the database.
+  - Kept `api_key_quota_overview_stats(...)` on the all-key usage CTE because it reports total usage across all API keys, including keys without quota limits.
+- Changes:
+  - Added `ApiKeyUsageScope::{AllKeys, LimitedQuotaKeys}`.
+  - Added `api_key_remaining_quota_tokens_sql()` so the remaining-quota query can be inspected by EXPLAIN tests.
+  - Updated `api_key_usage_cte_sql(include_cost, scope)` to generate either:
+    - all-key usage aggregation for overview stats, or
+    - limited-quota-key usage aggregation for remaining quota.
+  - For the limited-quota scope, each stats branch now starts from `api_key_quota_limits q_* CROSS JOIN <stats_table> alias` with `alias.key_id = q_*.key_id`.
+    - The first attempted `INNER JOIN` form compiled but SQLite reordered it into scanning the stats tables first.
+    - The `CROSS JOIN` form fixes the join order so positive quota keys drive indexed lookups into raw/hourly/legacy token stats.
+  - Added `api_key_remaining_quota_usage_scopes_stats_to_limited_keys` to lock in the query plan:
+    - scans limited quota keys,
+    - searches raw request token stats through a `key_id` index,
+    - searches hourly rollups through `idx_request_token_stat_hourly_rollups_key_bucket`,
+    - searches legacy rollups through `idx_request_token_stat_rollups_key_id`.
+- Validation:
+  - Initial new EXPLAIN test failed on the `INNER JOIN` version and showed scans of `request_token_stats`, hourly rollups, and legacy rollups.
+  - After switching limited scope to `CROSS JOIN`, the EXPLAIN test passed.
+  - `cargo test -p codexmanager-core api_key_quota -- --nocapture` passed:
+    - 5 matching core library tests.
+    - 1 matching storage integration test.
+  - `cargo test -p codexmanager-core api_key -- --nocapture` passed:
+    - 25 matching core library tests.
+    - 3 matching storage integration tests.
+  - `cargo test -p codexmanager-core` passed:
+    - 293 core library tests.
+    - 7 auth integration tests.
+    - 28 storage integration tests.
+    - 1 usage integration test.
+    - 1 version integration test.
+    - doc-tests with 0 tests.
+  - `cargo fmt --check` passed after running `cargo fmt`.
+  - `git diff --check` passed; Git only reported existing LF-to-CRLF working-copy warnings.
+- Worktree note:
+  - This pass intentionally touched `crates/core/src/storage/api_key_quota_limits.rs` and this maintenance log.
+  - The visible diff in `api_key_quota_limits.rs` includes the prior unlogged single-key total usage optimization plus this pass's remaining-quota scoped CTE work.
+- Remaining candidates:
+  - Continue SQLite only where EXPLAIN plans or duplicated query construction provide concrete evidence.
+  - Continue client reuse only if a production request path constructs a fresh client per request.
+  - Feature removal remains blocked unless current call-site evidence and tests prove the feature is unused.
+
+## 2026-06-22 current window handoff
+
+- This window completed and validated three new SQLite/core maintenance slices:
+  - `account_metadata.rs` and `account_subscriptions.rs`: extracted chunk SQL helpers and updated EXPLAIN tests to use production SQL plus account id lookup assertions.
+  - `api_keys.rs` and `tests/api_keys_tests.rs`: extracted full-key and summary for-id chunk SQL helpers; updated chunk EXPLAIN coverage for both production SQL paths.
+  - `aggregate_apis.rs`: extracted aggregate API row/dashboard/balance/secrets chunk SQL helpers; updated EXPLAIN coverage for all four production SQL paths.
+- Notable performance finding:
+  - The new aggregate API EXPLAIN coverage exposed that balance-query for-id chunks were driven by `idx_aggregate_apis_balance_query_order` instead of the requested `id IN (...)` lookup path.
+  - The for-id-specific helper now uses `+balance_query_enabled = 1` so SQLite drives that small-batch query by id lookup while the global balance-query list still uses the balance-order index.
+- Validation completed in this window:
+  - `cargo test -p codexmanager-core account_metadata -- --nocapture` passed.
+  - `cargo test -p codexmanager-core account_subscription -- --nocapture` passed.
+  - `cargo test -p codexmanager-core api_key -- --nocapture` passed.
+  - `cargo test -p codexmanager-core aggregate_api -- --nocapture` passed after the balance for-id plan fix.
+  - `cargo test -p codexmanager-core` passed after each logical slice, including the final aggregate API slice.
+  - `cargo fmt --check` passed.
+  - `git diff --check` passed; Git only reported existing LF-to-CRLF working-copy warnings.
+- Current goal state:
+  - Goal remains active and should not be marked complete yet.
+  - Feature removal remains blocked unless current call-site evidence and tests prove the feature is unused.
+  - Continue SQLite work only where EXPLAIN plans or duplicated SQL construction provide concrete evidence.
+  - Continue client reuse only if a production request path still constructs a fresh stable-config client per request.
+
+## 2026-06-22 follow-up handoff - model price/source helpers
+
+- This follow-up completed two more SQLite/core helper slices:
+  - `crates/core/src/storage/model_price_rules.rs`: extracted `enabled_model_price_rule_patterns_for_patterns_chunk_sql(...)` and updated the index EXPLAIN test to use the production parameterized SQL.
+  - `crates/core/src/storage/model_sources.rs`: extracted `enabled_model_source_mappings_for_sources_chunk_sql(...)` for the ranked source-mapping CTE and added parameterized EXPLAIN coverage for its platform/source lookup index.
+- Validation completed:
+  - `cargo test -p codexmanager-core model_price_rules -- --nocapture` initially failed because EXPLAIN was run without the production `?1` parameter.
+  - After adding parameterized EXPLAIN helpers, `cargo test -p codexmanager-core model_price_rules -- --nocapture` passed.
+  - `cargo test -p codexmanager-core model_sources -- --nocapture` passed.
+  - `cargo test -p codexmanager-core` passed.
+  - `cargo fmt --check` passed.
+  - `git diff --check` passed; Git only reported existing LF-to-CRLF working-copy warnings.
+- Current goal state:
+  - Goal remains active; do not mark complete yet.
+  - Feature removal still requires current call-site evidence plus tests.
+  - Continue SQLite/client-reuse work only where current scans show concrete evidence.
+
+## 2026-06-22 latest tail marker
+
+- Latest detailed section in this file: `2026-06-22 continuation - accounts usable-token refresh helper`.
+- Current window changed only `crates/core/src/storage/accounts.rs` plus this maintenance log:
+  - extracted `account_usage_refresh_targets_with_usable_tokens_by_statuses_chunk_sql(condition)`;
+  - updated the production chunk query to use that helper;
+  - extended EXPLAIN coverage in `account_status_chunk_queries_defer_final_ordering_to_rust` for the usable-token refresh target path.
+- Validation after this window:
+  - `cargo test -p codexmanager-core accounts -- --nocapture` passed.
+  - `cargo test -p codexmanager-core` passed.
+  - `cargo fmt --check` passed after one rustfmt line-wrap fix.
+  - `git diff --check` passed with only existing LF-to-CRLF working-copy warnings.
+- Continue next:
+  - Goal remains active.
+  - Feature removal remains blocked without current call-site evidence plus tests.
+  - Do not chase test-only `reqwest::Client` builders; continue client reuse only if a production/startup stable-config builder is repeatedly constructed.
+  - Continue SQLite only where production SQL and EXPLAIN tests diverge, or a query plan exposes a real index/order issue.
+
+## 2026-06-22 latest tail marker
+
+- Latest detailed section in this file: `2026-06-22 continuation - accounts usable-token refresh helper`.
+- Current window changed only `crates/core/src/storage/accounts.rs` plus this maintenance log:
+  - extracted `account_usage_refresh_targets_with_usable_tokens_by_statuses_chunk_sql(condition)`;
+  - updated the production chunk query to use that helper;
+  - extended EXPLAIN coverage in `account_status_chunk_queries_defer_final_ordering_to_rust` for the usable-token refresh target path.
+- Validation after this window:
+  - `cargo test -p codexmanager-core accounts -- --nocapture` passed.
+  - `cargo test -p codexmanager-core` passed.
+  - `cargo fmt --check` passed after one rustfmt line-wrap fix.
+  - `git diff --check` passed with only existing LF-to-CRLF working-copy warnings.
+- Continue next:
+  - Goal remains active.
+  - Feature removal remains blocked without current call-site evidence plus tests.
+  - Do not chase test-only `reqwest::Client` builders; continue client reuse only if a production/startup stable-config builder is repeatedly constructed.
+  - Continue SQLite only where production SQL and EXPLAIN tests diverge, or a query plan exposes a real index/order issue.
+
+## 2026-06-22 continuation - accounts usable-token refresh helper
+
+- Re-verified context:
+  - Runtime is Windows PowerShell Core 7.6.2 on Windows.
+  - Root `AGENTS.md` was read before code work.
+  - Repo-local `./skills/skill-router/SKILL.md` is still missing; global `skill-router` plus its skill index were used for lightweight routing.
+  - Current dirty worktree was treated as source of truth and unrelated dirty files were not reverted.
+- Client reuse scan:
+  - Re-ran the `reqwest::Client` / `Client::builder` scan across `crates/service`, `crates/web`, and `apps/src-tauri`.
+  - `crates/service/src/aggregate_api.rs` still has four `reqwest::blocking::Client::builder()` hits, but inspection showed they are inside unit tests; production aggregate API probe/discovery helpers already take `&reqwest::blocking::Client`.
+  - No production per-request stable-config upstream client builder was changed in this pass.
+- Scope chosen:
+  - Continued the SQLite/core maintainability track in `crates/core/src/storage/accounts.rs`.
+  - Focused only on the inline SQL inside `list_account_usage_refresh_targets_with_usable_tokens_by_statuses_chunk(...)`, because neighboring status/id chunk queries already use private SQL helpers and EXPLAIN coverage.
+  - Avoided changing query shape, account/token filtering semantics, indexes, or Rust-side final ordering.
+- Changes:
+  - Added `account_usage_refresh_targets_with_usable_tokens_by_statuses_chunk_sql(condition)`.
+  - Updated `list_account_usage_refresh_targets_with_usable_tokens_by_statuses_chunk(...)` to use the helper.
+  - Extended `account_status_chunk_queries_defer_final_ordering_to_rust` to EXPLAIN the same helper SQL used by production.
+  - Added assertions that the usable-token refresh target chunk query uses `idx_accounts_cleanup_status_lookup` and avoids per-chunk `ORDER BY` temp sorting.
+- Validation:
+  - `cargo test -p codexmanager-core accounts -- --nocapture` passed:
+    - 72 matching core library tests.
+    - 2 matching storage integration tests.
+  - `cargo test -p codexmanager-core` passed:
+    - 301 core library tests.
+    - 7 auth integration tests.
+    - 28 storage integration tests.
+    - 1 usage integration test.
+    - 1 version integration test.
+    - doc-tests with 0 tests.
+  - `cargo fmt --check` initially caught one rustfmt line-wrap issue from this pass; after the minimal formatting fix it passed.
+  - `git diff --check` passed; Git only reported existing LF-to-CRLF working-copy warnings.
+- Current goal state:
+  - Goal remains active; do not mark complete yet.
+  - Feature removal remains blocked unless current call-site evidence plus tests prove removal is safe.
+  - Continue SQLite work only where production SQL/query-plan tests diverge or EXPLAIN exposes a real plan issue.
+  - Continue client reuse only if a production/startup path still constructs a fresh stable-config client repeatedly.
+
+## 2026-06-22 continuation - model catalog child list SQL helpers
+
+- Re-verified context:
+  - Runtime is Windows PowerShell Core 7.6.2 on Windows.
+  - Root `AGENTS.md` was read before code work.
+  - Repo-local `./skills/skill-router/SKILL.md` is still missing; global `skill-router` was used for lightweight routing.
+  - Current dirty worktree was treated as source of truth and unrelated dirty files were not reverted.
+- Scope chosen:
+  - Continued the SQLite/core helper-alignment track in `crates/core/src/storage/model_options.rs`.
+  - Focused on model catalog child list queries:
+    - `list_model_catalog_reasoning_levels(...)`
+    - `list_model_catalog_string_items(...)`
+    - `list_model_catalog_string_items_for_kinds(...)`
+  - Avoided changing query semantics, selected columns, parameter order, returned ordering, indexes, or catalog behavior.
+- Changes:
+  - Added `model_catalog_reasoning_levels_list_sql()`.
+  - Added `model_catalog_string_items_list_sql()`.
+  - Added `model_catalog_string_items_for_kinds_sql(placeholders)`.
+  - Updated the three production list paths to use those helpers.
+  - Updated `model_catalog_child_list_queries_use_existing_order_indexes` so EXPLAIN uses the same helper SQL with bound parameters.
+  - Kept the existing assertions that the child list paths use their order indexes and avoid temporary ORDER BY sorting.
+- Validation:
+  - `cargo test -p codexmanager-core model_options -- --nocapture` passed:
+    - 14 matching core library tests.
+  - `cargo test -p codexmanager-core` passed:
+    - 301 core library tests.
+    - 7 auth integration tests.
+    - 28 storage integration tests.
+    - 1 usage integration test.
+    - 1 version integration test.
+    - doc-tests with 0 tests.
+  - `cargo fmt --check` passed after a minimal wrapping fix.
+  - `git diff --check` passed; Git only reported existing LF-to-CRLF working-copy warnings.
+- Current goal state:
+  - Goal remains active; do not mark complete yet.
+  - HTTP client scan still shows no new production hot path needing reuse work in this pass.
+  - Continue SQLite only where current EXPLAIN output or duplicated SQL construction shows concrete evidence.
+  - Feature removal remains blocked unless current call-site evidence plus tests prove the feature is unused.
+
+## 2026-06-22 continuation - plugin task list query-plan parameter alignment
+
+- Re-verified context:
+  - Runtime is Windows PowerShell Core 7.6.2 on Windows.
+  - Root `AGENTS.md` was read before code work.
+  - Repo-local `./skills/skill-router/SKILL.md` is still missing; global `skill-router` and its skill index were used for lightweight routing.
+  - Memory lookup only found older CodexManager import/PR context, so this pass used the current worktree, handoff, and this maintenance log as source of truth.
+- Scope chosen:
+  - Continued the SQLite/core EXPLAIN alignment track in `crates/core/src/storage/plugins.rs`.
+  - Focused on the plugin task list query-plan test that still used handwritten parameter substitution for the per-plugin case.
+  - Avoided changing plugin task behavior, selected columns, ordering semantics, indexes, or runtime plugin execution behavior.
+- Change:
+  - `list_plugin_tasks_uses_list_order_indexes` now collects the per-plugin EXPLAIN plan from the production `plugin_task_list_sql("id, plugin_id", true)` SQL with a real bound `plugin-a` parameter.
+  - Added/reused a local `collect_query_plan(...)` helper for parameterized EXPLAIN collection.
+  - Added/reused `assert_plan_uses_index_without_temp_sort(...)` so the global and per-plugin list-order assertions stay consistent.
+  - Fixed the small rustfmt issue in that assertion helper after validation caught it.
+- Validation:
+  - `cargo test -p codexmanager-core` passed:
+    - 300 core library tests.
+    - 7 auth integration tests.
+    - 28 storage integration tests.
+    - 1 usage integration test.
+    - 1 version integration test.
+    - doc-tests with 0 tests.
+  - `cargo fmt --check` passed after the minimal formatting fix.
+  - `git diff --check` passed; Git only reported existing LF-to-CRLF working-copy warnings.
+- Current goal state:
+  - Goal remains active; do not mark complete yet.
+  - Continue SQLite work only where production SQL/query-plan tests diverge or EXPLAIN exposes a real plan issue.
+  - Continue client reuse only if a production/startup path still constructs a fresh stable-config HTTP client repeatedly.
+  - Feature removal remains blocked unless current call-site evidence plus tests prove the feature is unused.
+
+## 2026-06-22 continuation - plugin run log SQL helpers and plan coverage
+
+- Re-verified scan direction:
+  - The remaining `reqwest::Client` constructor hits in service/web/Tauri code were cached builders, startup-scoped clients, config-scoped clients, or tests.
+  - No new production hot-path HTTP client reuse change was made in this pass.
+  - Continued the SQLite/core helper-alignment track because `plugins.rs` still had a handwritten run-log EXPLAIN query that could drift from production SQL.
+- Scope chosen:
+  - Focused on plugin run log list paths in `crates/core/src/storage/plugins.rs`:
+    - `list_plugin_run_logs(...)`
+    - `list_plugin_run_log_summaries(...)`
+  - Avoided changing filters, result columns, parameter order, order-by semantics, limits, indexes, or runtime plugin execution behavior.
+- Changes:
+  - Added `plugin_run_log_list_sql(plugin_filter, task_filter)`.
+  - Added `plugin_run_log_summary_list_sql(plugin_filter, task_filter)`.
+  - Updated production run-log list and summary functions to use those helpers while preserving the existing parameter order: optional plugin id, optional task id, then limit.
+  - Updated `list_plugin_run_logs_for_task_uses_task_lookup_index` to EXPLAIN the production helper SQL with bound `task_id` and `limit` parameters.
+  - Added `list_plugin_run_log_summaries_for_task_uses_task_lookup_index` to cover the joined summary query with the same task lookup index.
+- Validation:
+  - `cargo test -p codexmanager-core plugins -- --nocapture` passed:
+    - 24 matching core library tests.
+  - `cargo test -p codexmanager-core` passed:
+    - 301 core library tests.
+    - 7 auth integration tests.
+    - 28 storage integration tests.
+    - 1 usage integration test.
+    - 1 version integration test.
+    - doc-tests with 0 tests.
+  - `cargo fmt --check` passed after one import wrapping fix.
+  - `git diff --check` passed; Git only reported existing LF-to-CRLF working-copy warnings.
+- Current goal state:
+  - Goal remains active; do not mark complete yet.
+  - Plugin storage SQL helper/test alignment is now stronger for task lists and run-log task filters.
+  - Continue SQLite only where current scans show production/test SQL divergence or a concrete query-plan issue.
+  - Continue client reuse only if a production/startup path still constructs a fresh stable-config client repeatedly.
+
+## 2026-06-22 continuation - model source platform-kind order index
+
+- Re-verified context:
+  - Runtime is Windows PowerShell Core 7.6.2 on Windows.
+  - Root `AGENTS.md` was read before code work.
+  - Repo-local `./skills/skill-router/SKILL.md` is still missing; global `skill-router` and its skill index were used for lightweight routing.
+  - Current dirty worktree was treated as source of truth and unrelated dirty files were not reverted.
+- Scope chosen:
+  - Continued the SQLite/core query-plan track in `crates/core/src/storage/model_sources.rs`.
+  - Focused on enabled model-source mapping queries for a platform and source kind:
+    - `list_enabled_model_source_mappings_for_platform(...)`
+    - `list_enabled_model_source_mappings_for_platform_and_kind(...)`
+    - `list_enabled_model_source_mapping_source_ids_for_platform_and_kind(...)`
+    - `has_enabled_model_source_mapping_for_platform(...)`
+    - `has_enabled_model_source_mapping_for_platform_and_kind(...)`
+    - `find_enabled_model_source_mapping(...)`
+  - Avoided changing query semantics, selected columns, parameter order, returned ordering, route behavior, or model mapping behavior.
+- Changes:
+  - Added private SQL helpers for the production platform/platform-kind enabled mapping list, existence, source-id list, and single-source lookup queries.
+  - Updated matching production functions to call those helpers.
+  - Updated `model_source_lookup_queries_use_composite_indexes` so EXPLAIN uses the same helper SQL with real bound parameters.
+  - Added a new EXPLAIN assertion for `list_enabled_model_source_mappings_for_platform_and_kind(...)`.
+- Performance finding:
+  - The new platform-kind EXPLAIN coverage initially failed.
+  - SQLite chose `idx_model_source_mappings_platform_enabled_priority_weight` and reported `USE TEMP B-TREE FOR RIGHT PART OF ORDER BY`.
+  - Added `idx_model_source_mappings_platform_kind_enabled_priority` on `(platform_model_slug, source_kind, enabled, priority DESC, weight DESC, source_id, upstream_model)`.
+  - Added migration `crates/core/migrations/109_model_source_platform_kind_order_index.sql`.
+  - Added the same index to `ensure_model_source_tables(...)` for fresh databases.
+  - After the index addition, the platform-kind list query uses the new index and avoids temporary sorting.
+- Validation:
+  - `cargo test -p codexmanager-core model_sources -- --nocapture` passed:
+    - 6 matching core library tests.
+  - `cargo test -p codexmanager-core` passed:
+    - 301 core library tests.
+    - 7 auth integration tests.
+    - 28 storage integration tests.
+    - 1 usage integration test.
+    - 1 version integration test.
+    - doc-tests with 0 tests.
+  - `cargo test -p codexmanager-core migration_tests` passed:
+    - 17 matching core library tests.
+  - `cargo fmt --check` passed.
+  - `git diff --check` passed; Git only reported existing LF-to-CRLF working-copy warnings.
+- Current goal state:
+  - Goal remains active; do not mark complete yet.
+  - Continue SQLite only where current EXPLAIN output or duplicated SQL construction shows concrete evidence.
+  - Continue client reuse only if a production/startup path still constructs a fresh stable-config client repeatedly.
+  - Feature removal remains blocked unless current call-site evidence plus tests prove the feature is unused.
+
+## 2026-06-22 continuation - account gateway/model price SQL helper alignment
+
+- Re-verified context:
+  - Runtime is Windows PowerShell Core 7.6.2 on Windows.
+  - Root `AGENTS.md` was read before code work.
+  - Repo-local `./skills/skill-router/SKILL.md` is still missing; global `skill-router` was used for lightweight routing.
+  - Current dirty worktree was treated as source of truth and unrelated dirty files were not reverted.
+- Scope chosen:
+  - Continued the SQLite/core maintainability track by targeting query-plan tests that still duplicated production SQL.
+  - Did not remove features because no current call-site evidence plus tests proved a feature was unused.
+  - Re-ran the reqwest client construction scan; no new production per-request stable-config client reconstruction was changed in this pass.
+- Changes:
+  - `crates/core/src/storage/accounts.rs`
+    - Added `gateway_candidates_filtered_sql(latest_usage_cte, where_clause)`.
+    - Updated `list_gateway_candidates_filtered(...)` to use that helper for the final candidate query.
+    - Updated `gateway_candidates_for_accounts_scope_latest_usage_cte_to_requested_ids` to EXPLAIN the same helper-built candidate SQL instead of a hand-written reduced SELECT.
+    - Avoided changing selected fields, account availability semantics, latest-usage CTE scoping, return ordering, or parameter binding order.
+  - `crates/core/src/storage/model_price_rules.rs`
+    - Added `enabled_custom_exact_model_price_rule_sql()`.
+    - Updated `find_enabled_custom_exact_model_price_rule(...)` to use the shared SQL helper.
+    - Updated the custom exact lookup EXPLAIN test to use the production SQL helper with a bound parameter.
+    - Removed the now-unused no-parameter EXPLAIN helper from the test module.
+- Validation:
+  - `cargo test -p codexmanager-core accounts -- --nocapture` passed:
+    - 72 matching core library tests.
+    - 2 matching storage integration tests.
+  - `cargo test -p codexmanager-core model_price_rules -- --nocapture` passed after removing the unused helper warning:
+    - 4 matching core library tests.
+  - `cargo test -p codexmanager-core` passed:
+    - 300 core library tests.
+    - 7 auth integration tests.
+    - 28 storage integration tests.
+    - 1 usage integration test.
+    - 1 version integration test.
+    - doc-tests with 0 tests.
+  - `cargo fmt --check` passed.
+  - `git diff --check` passed; Git only reported existing LF-to-CRLF working-copy warnings.
+- Worktree note:
+  - This pass intentionally touched:
+    - `crates/core/src/storage/accounts.rs`
+    - `crates/core/src/storage/model_price_rules.rs`
+    - this maintenance log.
+- Remaining candidates:
+  - Continue SQLite only where production SQL and query-plan tests still diverge, or where EXPLAIN shows a real plan issue.
+  - Continue client reuse only if a production request path constructs a fresh stable-config client per request.
+  - Feature removal remains blocked unless current call-site evidence plus tests prove the feature is unused.
+
+## 2026-06-22 continuation - model options/source query-plan parameter alignment
+
+- Re-verified context:
+  - Runtime is Windows PowerShell Core 7.6.2 on Windows.
+  - Root `AGENTS.md` was read before code work.
+  - Repo-local `./skills/skill-router/SKILL.md` is still missing; global `skill-router` was used for lightweight routing.
+  - Current dirty worktree was treated as source of truth and unrelated dirty files were not reverted.
+- Scope chosen:
+  - Continued the SQLite/core maintainability track by targeting query-plan tests that still drifted from production prepared SQL shape.
+  - Did not remove features because no current call-site evidence plus tests proved a feature was unused.
+  - Re-ran the reqwest client construction scan; no new production per-request stable-config client reconstruction was changed in this pass.
+- Changes:
+  - `crates/core/src/storage/model_options.rs`
+    - Updated model catalog scope/order EXPLAIN tests to use `collect_query_plan_details_with_params(...)` instead of replacing `?1` / `?2` placeholders with literal SQL.
+    - Covered list, API-visible list, first API-visible slug, and prefix-filter API-visible slug with bound parameters.
+    - Avoided changing model catalog production query shape, filters, ordering, or indexes.
+  - `crates/core/src/storage/model_sources.rs`
+    - Added shared SQL helpers:
+      - `available_model_source_models_for_source_sql()`
+      - `available_source_model_ids_by_upstream_model_sql()`
+      - `model_source_model_source_ids_for_kind_sql()`
+      - `available_source_model_exists_sql()`
+    - Updated production source-model lookup methods to use those helpers.
+    - Updated related EXPLAIN coverage to use the production helper SQL with bound parameters instead of duplicate literal SELECTs.
+    - Avoided changing source model lookup semantics, selected fields, return ordering, or mapping behavior.
+- Validation:
+  - `cargo test -p codexmanager-core model_options -- --nocapture` passed:
+    - 14 matching core library tests.
+  - `cargo test -p codexmanager-core model_sources -- --nocapture` passed:
+    - 6 matching core library tests.
+  - `cargo test -p codexmanager-core` passed:
+    - 300 core library tests.
+    - 7 auth integration tests.
+    - 28 storage integration tests.
+    - 1 usage integration test.
+    - 1 version integration test.
+    - doc-tests with 0 tests.
+  - `cargo fmt --check` passed after a minimal formatting patch in `model_options.rs`.
+  - `git diff --check` passed; Git only reported existing LF-to-CRLF working-copy warnings.
+- Worktree note:
+  - This pass intentionally touched:
+    - `crates/core/src/storage/model_options.rs`
+    - `crates/core/src/storage/model_sources.rs`
+    - this maintenance log.
+- Remaining candidates:
+  - Continue SQLite only where production SQL and query-plan tests still diverge, or where EXPLAIN shows a real plan issue.
+  - Continue client reuse only if a production request path constructs a fresh stable-config client per request.
+  - Feature removal remains blocked unless current call-site evidence plus tests prove the feature is unused.
+
+## 2026-06-22 continuation - request log actual source production-path plan coverage
+
+- Re-verified context:
+  - Runtime is Windows PowerShell Core 7.6.2 on Windows.
+  - Root `AGENTS.md` was read before code work.
+  - Repo-local `./skills/skill-router/SKILL.md` is still missing; global `skill-router` and its skill index were used for lightweight routing.
+  - Current dirty worktree was treated as source of truth and unrelated dirty files were not reverted.
+- Scope chosen:
+  - Continued the SQLite/core maintainability track in `crates/core/src/storage/tests/request_logs_tests.rs`.
+  - Focused on replacing duplicated hand-written EXPLAIN SQL with production-path SQL builders.
+  - Avoided changing request log query semantics, filters, schema, indexes, pagination, joins, or runtime behavior.
+- Changes:
+  - Added parameter-aware `collect_query_plan_details_with_params(...)`.
+  - Added `request_log_list_plan_for_query(...)` and `request_log_count_plan_for_query(...)` test helpers that build filters through `request_log_filters::build_request_log_filters(...)` and pass the generated SQL through `request_log_list_sql(...)` / `request_log_count_sql(...)`.
+  - Updated method/key/model/route strategy/actual source list-plan tests to use the production list SQL helper instead of duplicate SELECT strings.
+  - Updated count-plan and token-stats join tests to use the production count/list SQL helpers where applicable.
+  - Important alignment fix: the list-plan helper passes `include_route_detail_fields = true`, matching the ordinary `list_request_logs_paginated(...)` path. A previous false value would generate `1 = 0` for route-detail fields and would not represent the production query.
+- Validation:
+  - `cargo test -p codexmanager-core request_logs -- --nocapture` passed before this continuation handoff.
+  - `cargo test -p codexmanager-core` passed:
+    - 300 core library tests.
+    - 7 auth integration tests.
+    - 28 storage integration tests.
+    - 1 usage integration test.
+    - 1 version integration test.
+    - doc-tests with 0 tests.
+  - `cargo fmt --check` passed.
+  - `git diff --check` passed; Git only reported existing LF-to-CRLF working-copy warnings.
+- Worktree note:
+  - This pass intentionally touched `crates/core/src/storage/tests/request_logs_tests.rs` and this maintenance log.
+- Remaining candidates:
+  - Continue SQLite only where EXPLAIN plans or duplicated query construction provide concrete evidence.
+  - Continue client reuse only if a production request path constructs a fresh stable-config client per request.
+  - Feature removal remains blocked unless current call-site evidence plus tests prove the feature is unused.
+
+## 2026-06-22 continuation - event/api-key/request-token plan helper alignment
+
+- Re-verified context:
+  - Runtime is Windows PowerShell Core 7.6.2 on Windows.
+  - Root `AGENTS.md` was read before code work.
+  - Repo-local `./skills/skill-router/SKILL.md` is still missing; global `skill-router` and its skill index were used for lightweight routing.
+  - Current dirty worktree was treated as source of truth and unrelated dirty files were not reverted.
+- Scope chosen:
+  - Continued the SQLite/core maintainability track by removing remaining small query-plan test drift points.
+  - Avoided feature removal because no current call-site evidence proved any feature was unused.
+  - Avoided further upstream client changes because the current reqwest scan still showed production clients are cached/config-scoped or startup-scoped; remaining uncached hits were test helpers or already-reviewed cached constructors.
+- Changes:
+  - `crates/core/src/storage/events.rs`
+    - Added `delete_events_for_account_sql()`.
+    - Updated `delete_account(...)` in `accounts.rs` to use the shared events cleanup SQL helper.
+    - Updated `account_event_cleanup_uses_account_cleanup_index` to EXPLAIN the same SQL used by production account deletion.
+  - `crates/core/src/storage/api_keys.rs`
+    - Added `api_key_list_sql()`, `api_key_summary_list_sql()`, and `api_key_summary_for_user_sql()`.
+    - Updated `list_api_keys(...)`, `list_api_key_summaries(...)`, and `list_api_key_summaries_for_user(...)` to use helpers.
+    - Made key and summary list ordering explicitly use `created_at DESC, id ASC`, matching `idx_api_keys_list_order`.
+    - Updated EXPLAIN coverage to use the production summary SQL helpers instead of simplified hand-written SELECTs.
+  - `crates/core/src/storage/tests/request_token_stats_tests.rs`
+    - Replaced the no-parameter query-plan helper with `collect_query_plan_details_with_params(...)`.
+    - Updated daily raw rollup, hourly bucket/key/owner/source, and key+model EXPLAIN tests to use parameterized SQL and bound values instead of literal-only predicates.
+    - Removed the now-unused no-parameter plan helper to keep tests warning-free.
+- Validation:
+  - `cargo test -p codexmanager-core events -- --nocapture` passed:
+    - 6 matching events tests.
+  - `cargo test -p codexmanager-core api_key -- --nocapture` passed:
+    - 26 matching core library tests.
+    - 3 matching storage integration tests.
+  - `cargo test -p codexmanager-core request_token_stats -- --nocapture` passed after removing the unused helper warning:
+    - 18 matching core library tests.
+    - 2 matching storage integration tests.
+  - `cargo test -p codexmanager-core` passed:
+    - 300 core library tests.
+    - 7 auth integration tests.
+    - 28 storage integration tests.
+    - 1 usage integration test.
+    - 1 version integration test.
+    - doc-tests with 0 tests.
+  - `cargo fmt --check` passed.
+  - `git diff --check` passed; Git only reported existing LF-to-CRLF working-copy warnings.
+- Worktree note:
+  - This pass intentionally touched:
+    - `crates/core/src/storage/accounts.rs`
+    - `crates/core/src/storage/events.rs`
+    - `crates/core/src/storage/api_keys.rs`
+    - `crates/core/src/storage/tests/events_tests.rs`
+    - `crates/core/src/storage/tests/api_keys_tests.rs`
+    - `crates/core/src/storage/tests/request_token_stats_tests.rs`
+    - this maintenance log.
+- Remaining candidates:
+  - Continue SQLite only where production SQL and query-plan tests still diverge, or where EXPLAIN shows a real plan issue.
+  - Continue client reuse only if a production request path constructs a fresh stable-config client per request.
+  - Feature removal remains blocked unless current call-site evidence plus tests prove the feature is unused.
+
+## 2026-06-22 continuation - accounts status/id chunk query-plan coverage
+
+- Re-verified context:
+  - Runtime is Windows PowerShell Core 7.6.2 on Windows.
+  - Root `AGENTS.md` was read before code work.
+  - Repo-local `./skills/skill-router/SKILL.md` is still missing; global `skill-router` and its skill index were used for lightweight routing.
+  - Current dirty worktree was treated as source of truth and unrelated dirty files were not reverted.
+- Scope chosen:
+  - Continued the SQLite/core storage performance-maintainability track in `crates/core/src/storage/accounts.rs`.
+  - Focused only on existing chunk query-plan coverage for account status/id helper SQL.
+  - No production SQL, indexes, ordering behavior, or feature surface changed in this pass.
+- Changes:
+  - Extended `account_status_chunk_queries_defer_final_ordering_to_rust` to cover `account_usage_refresh_targets_by_statuses_chunk_sql(...)`.
+  - Added EXPLAIN assertions that status id, status account, and usage refresh target chunk queries use `idx_accounts_cleanup_status_lookup`.
+  - Added a no per-chunk `ORDER BY` temp B-tree assertion for the usage refresh target chunk query.
+  - Strengthened `account_id_chunk_queries_defer_final_ordering_to_rust` by asserting the id-only chunk query uses the account primary-key lookup path (`sqlite_autoindex_accounts_1`).
+- Validation:
+  - `cargo test -p codexmanager-core account_status_chunk_queries_defer_final_ordering_to_rust -- --nocapture` passed.
+  - `cargo test -p codexmanager-core account_id_chunk_queries_defer_final_ordering_to_rust -- --nocapture` passed.
+  - `cargo test -p codexmanager-core` passed:
+    - 298 core library tests.
+    - 7 auth integration tests.
+    - 28 storage integration tests.
+    - 1 usage integration test.
+    - 1 version integration test.
+    - doc-tests with 0 tests.
+  - `cargo fmt --check` passed.
+  - `git diff --check` passed; Git only reported existing LF-to-CRLF working-copy warnings.
+- Worktree note:
+  - This pass intentionally touched `crates/core/src/storage/accounts.rs` and this maintenance log only.
+  - The visible `accounts.rs` diff includes earlier continuation changes; this pass only strengthened status/id chunk EXPLAIN coverage.
+- Current goal state:
+  - Goal remains active; do not mark complete yet.
+  - Feature removal remains blocked unless current call-site evidence and tests prove a feature is unused.
+  - Continue SQLite/client-reuse work only where current scans show concrete evidence.
+
+## 2026-06-22 continuation - upstream client reuse rescan
+
+- Scan command:
+  - `rg -n "reqwest::(blocking::)?Client::(new|builder)|\bClient::builder\(|\bClient::new\(" .\crates\service\src .\crates\web\src .\apps\src-tauri\src -g "*.rs"`
+- Current finding:
+  - No production per-request stable-config upstream client reconstruction was changed in this pass.
+  - `crates/web/src/service_gateway.rs` caches the service probe client through `SERVICE_PROBE_CLIENT: OnceLock`.
+  - `crates/service/src/account/account_warmup.rs` caches warmup clients by `WarmupClientConfig`.
+  - `crates/service/src/gateway/model_picker/request.rs` caches the model picker client by `ModelPickerClientConfig`.
+  - `crates/service/src/gateway/core/runtime_config.rs` builds upstream clients through runtime-config/pool-backed helpers; fallback `Client::new()` calls are build-failure fallbacks inside those builders.
+  - `crates/service/src/usage/usage_http.rs`, `crates/service/src/plugin/runtime.rs`, and `apps/src-tauri/src/commands/updater/runtime.rs` already use cached clients.
+  - `crates/service/src/aggregate_api.rs`, `crates/service/src/gateway/upstream/attempt_flow/transport.rs`, `attempt_flow/postprocess.rs`, and `gateway/upstream/protocol/aggregate_api.rs` hits inspected in this pass are under test helpers.
+- Worktree note:
+  - This was a read-only client reuse verification pass; no source changes were made for client reuse.
+
+## 2026-06-22 continuation - model group list SQL helpers and plan coverage
+
+- Re-verified context:
+  - Runtime is Windows PowerShell Core 7.6.2 on Windows.
+  - Root `AGENTS.md` was read before code work.
+  - Repo-local `./skills/skill-router/SKILL.md` is still missing; global `skill-router` was used for lightweight routing.
+  - Current dirty worktree was treated as source of truth and unrelated dirty files were not reverted.
+- Scope chosen:
+  - Continued the SQLite/core storage modularity and query-plan coverage track in `crates/core/src/storage/model_groups.rs`.
+  - Focused on list/delete SQL that was duplicated between production code and EXPLAIN tests.
+  - No schema, query semantics, ordering semantics, or feature surface changed in this pass.
+- Changes:
+  - Extracted production SQL helpers:
+    - `model_group_list_sql()`
+    - `model_group_models_list_sql()`
+    - `model_group_models_for_group_sql()`
+    - `user_model_groups_list_sql()`
+    - `user_model_groups_for_user_sql()`
+    - `delete_user_model_groups_for_group_sql()`
+  - Updated production list/delete methods to use these helpers.
+  - Added a shared test `collect_query_plan(...)` helper for this module.
+  - Updated `list_model_groups_uses_list_order_index` and `replace_user_model_groups_for_group_uses_group_lookup_index` to explain the production helper SQL instead of hand-written duplicate SQL.
+  - Added EXPLAIN coverage that:
+    - global and per-group model-group model lists use `sqlite_autoindex_model_group_models_1`;
+    - global and per-user user-model-group assignment lists use `sqlite_autoindex_user_model_groups_1`;
+    - all covered list queries avoid `USE TEMP B-TREE FOR ORDER BY`.
+- Validation:
+  - `cargo test -p codexmanager-core model_groups -- --nocapture` passed:
+    - 8 matching core library tests.
+  - `cargo test -p codexmanager-core` passed:
+    - 300 core library tests.
+    - 7 auth integration tests.
+    - 28 storage integration tests.
+    - 1 usage integration test.
+    - 1 version integration test.
+    - doc-tests with 0 tests.
+  - `cargo fmt --check` passed.
+  - `git diff --check` passed; Git only reported existing LF-to-CRLF working-copy warnings.
+- Worktree note:
+  - This pass intentionally touched `crates/core/src/storage/model_groups.rs` and this maintenance log.
+  - Goal remains active; do not mark complete yet.
+  - Continue SQLite/client-reuse work only where current scans show concrete evidence.
+
+## 2026-06-22 continuation - conversation binding SQL helper alignment
+
+- Re-verified context:
+  - Runtime is Windows PowerShell Core 7.6.2 on Windows.
+  - Root `AGENTS.md` was read before code work.
+  - Repo-local `./skills/skill-router/SKILL.md` is still missing; global `skill-router` was used for lightweight routing.
+  - Current dirty worktree was treated as source of truth and unrelated dirty files were not reverted.
+- Scope chosen:
+  - Continued the SQLite/core storage modularity and query-plan coverage track in `crates/core/src/storage/conversation_bindings.rs`.
+  - Focused on lookup/touch/delete SQL that was duplicated or hand-written separately from EXPLAIN tests.
+  - No schema, binding semantics, account cleanup behavior, stale cleanup behavior, or upsert conflict behavior changed in this pass.
+- Changes:
+  - Extracted helper SQL:
+    - `conversation_binding_lookup_sql()`
+    - `touch_conversation_binding_sql()`
+    - `delete_conversation_binding_sql()`
+    - `delete_conversation_bindings_for_account_sql()`
+    - `delete_stale_conversation_bindings_sql()`
+  - Updated production lookup/touch/delete methods to use these helpers.
+  - Updated `conversation_binding_lookup_and_cleanup_queries_use_indexes` to run `EXPLAIN QUERY PLAN` against the production helper SQL instead of hand-written duplicate SQL.
+  - Existing EXPLAIN expectations remain:
+    - binding lookup uses the conversation binding primary-key lookup;
+    - account cleanup uses `idx_conversation_bindings_account_id`;
+    - stale cleanup uses `idx_conversation_bindings_last_used_at`.
+- Validation:
+  - `cargo test -p codexmanager-core conversation_bindings -- --nocapture` passed:
+    - 5 matching core library tests.
+  - `cargo test -p codexmanager-core` passed:
+    - 300 core library tests.
+    - 7 auth integration tests.
+    - 28 storage integration tests.
+    - 1 usage integration test.
+    - 1 version integration test.
+    - doc-tests with 0 tests.
+  - `cargo fmt --check` passed.
+  - `git diff --check` passed; Git only reported existing LF-to-CRLF working-copy warnings.
+- Worktree note:
+  - This pass intentionally touched `crates/core/src/storage/conversation_bindings.rs`, `crates/core/src/storage/tests/conversation_bindings_tests.rs`, and this maintenance log.
+  - Goal remains active; do not mark complete yet.
+  - Continue SQLite/client-reuse work only where current scans show concrete evidence.
+
+## 2026-06-22 continuation - usage low-quota chunk SQL helper coverage
+
+- Re-verified context:
+  - Runtime is Windows PowerShell Core 7.6.2 on Windows.
+  - Root `AGENTS.md` was read before code work.
+  - Repo-local `./skills/skill-router/SKILL.md` is still missing; global `skill-router` and its skill index were used for lightweight routing.
+  - Current dirty worktree was treated as source of truth and unrelated dirty files were not reverted.
+- Scope chosen:
+  - Continued the SQLite/core maintainability track in `crates/core/src/storage/usage.rs`.
+  - Focused on the remaining inline low-quota account chunk SQL in `low_quota_account_ids_for_accounts_chunk(...)`.
+  - Avoided changing retention policy, latest usage snapshot semantics, threshold logic, chunking behavior, schema, or indexes.
+- Changes:
+  - Added `low_quota_account_ids_for_accounts_chunk_sql(account_condition)`.
+  - Updated `low_quota_account_ids_for_accounts_chunk(...)` to use the helper.
+  - Extended `usage_account_chunk_queries_defer_final_ordering_to_rust`:
+    - Added a parameterized EXPLAIN helper for SQL with threshold placeholders.
+    - Added low-quota chunk EXPLAIN coverage.
+    - Added index assertions for latest snapshot, quota-source, cleanup, and low-quota chunk queries against `idx_usage_snapshots_account_captured_id`.
+    - Preserved the no per-chunk temp `ORDER BY` assertions.
+- Validation:
+  - `cargo test -p codexmanager-core usage -- --nocapture` passed:
+    - 37 matching core library tests.
+    - 4 matching storage integration tests.
+    - 1 usage integration test.
+  - `cargo test -p codexmanager-core` passed:
+    - 298 core library tests.
+    - 7 auth integration tests.
+    - 28 storage integration tests.
+    - 1 usage integration test.
+    - 1 version integration test.
+    - doc-tests with 0 tests.
+  - `cargo fmt --check` passed after one minimal line-wrap fix in `usage.rs`.
+  - `git diff --check` passed; Git only reported existing LF-to-CRLF working-copy warnings.
+- Current goal state:
+  - Goal remains active and should not be marked complete yet.
+  - Feature removal remains blocked unless current call-site evidence and tests prove the feature is unused.
+  - Continue SQLite/client-reuse work only where current scans show concrete evidence.
+
+## 2026-06-22 continuation - account manager chunk query-plan coverage
+
+- Re-verified context:
+  - Runtime is Windows PowerShell Core 7.6.2 on Windows.
+  - Root `AGENTS.md` was read before code work.
+  - Repo-local `./skills/skill-router/SKILL.md` is still missing; global `skill-router` and its skill index were used for lightweight routing.
+  - Current dirty worktree was treated as source of truth and unrelated dirty files were not reverted.
+- Scope chosen:
+  - Continued the SQLite/core maintainability track in `crates/core/src/storage/account_manager.rs`.
+  - Inspected existing chunk helpers for dashboard app users, access app users, API key owners, and user wallets.
+  - Existing production SQL helpers already owned those query shapes, so no production SQL change was needed in this pass.
+- Changes:
+  - Strengthened `account_manager_chunk_queries_defer_final_ordering_to_rust`.
+  - Added EXPLAIN-backed assertions that:
+    - Dashboard user chunk queries use the `app_users` id lookup autoindex.
+    - Access user chunk queries use the `app_users` id lookup autoindex.
+    - API key owner chunk queries use the `api_key_owners` key lookup autoindex.
+  - Preserved existing assertions that these chunk queries avoid per-chunk temp `ORDER BY` sorting.
+- Validation:
+  - `cargo test -p codexmanager-core account_manager_chunk_queries_defer_final_ordering_to_rust -- --nocapture` passed:
+    - 1 matching core library test.
+  - `cargo test -p codexmanager-core` passed:
+    - 298 core library tests.
+    - 7 auth integration tests.
+    - 28 storage integration tests.
+    - 1 usage integration test.
+    - 1 version integration test.
+    - doc-tests with 0 tests.
+  - `cargo fmt --check` passed.
+  - `git diff --check` passed; Git only reported existing LF-to-CRLF working-copy warnings.
+- Current goal state:
+  - Goal remains active and should not be marked complete yet.
+  - Feature removal remains blocked unless current call-site evidence and tests prove the feature is unused.
+  - Continue SQLite/client-reuse work only where current scans show concrete evidence.
+
+## 2026-06-22 continuation - quota/event chunk plan coverage
+
+- Re-established context in the new window:
+  - Runtime confirmed as Windows PowerShell Core 7.6.2.
+  - Root `AGENTS.md` was read before code work.
+  - Repo-local `./skills/skill-router/SKILL.md` is still missing; global `skill-router` and its skill index were used for lightweight routing.
+  - Current dirty worktree was treated as source of truth and unrelated dirty files were not reverted.
+- SQLite/core scan:
+  - Inspected `quota_pools.rs`, `request_logs.rs`, `request_token_stats.rs`, `events.rs`, `usage.rs`, `account_manager.rs`, and `accounts.rs` for chunk helpers, EXPLAIN tests, ORDER BY plans, and index coverage.
+  - `request_logs.rs` already centralizes list/count SQL through production helpers and tests those helpers with EXPLAIN.
+  - `request_token_stats.rs` already has shared rollup select helpers and EXPLAIN coverage for raw/hourly lookup indexes; no safe production SQL change was made in this pass.
+- Changes:
+  - `crates/core/src/storage/quota_pools.rs`
+    - Strengthened `quota_helper_chunk_queries_defer_final_ordering_to_rust`.
+    - Added assertions that quota assignment chunks use `idx_quota_source_model_assignments_source` or the assignment primary-key autoindex.
+    - Added assertion that quota capacity override chunks use `sqlite_autoindex_account_quota_capacity_overrides`.
+    - No production SQL changed.
+  - `crates/core/src/storage/tests/events_tests.rs`
+    - Strengthened `latest_account_status_blocked_ids_defers_final_ordering_to_rust`.
+    - Added assertion that the blocked-status chunk helper uses `idx_events_account_status_lookup`.
+    - No production SQL changed.
+- Upstream client reuse scan:
+  - Re-ran the `reqwest::Client::new` / `Client::builder` scan across `crates/service/src`, `crates/web/src`, and `apps/src-tauri/src`.
+  - `aggregate_api.rs` hits at this point were verified inside `#[cfg(test)] mod tests`.
+  - `plugin/runtime.rs`, updater runtime, web/service gateway, proxy runtime, auth token clients, usage clients, model picker client, and gateway runtime config are cached/startup/config scoped in the current dirty tree.
+  - No new production per-request stable-config client rebuild was found in this pass.
+- Validation completed so far in this pass:
+  - `cargo test -p codexmanager-core quota -- --nocapture` passed:
+    - 25 matching core tests plus 1 matching storage integration test.
+  - `cargo test -p codexmanager-core events -- --nocapture` passed:
+    - 6 matching core tests.
+- Final validation for this pass:
+  - `cargo test -p codexmanager-core` passed:
+    - 298 core library tests.
+    - 7 auth integration tests.
+    - 28 storage integration tests.
+    - 1 usage integration test.
+    - 1 version integration test.
+    - doc-tests with 0 tests.
+  - `cargo fmt --check` passed.
+  - `git diff --check` passed; Git only reported existing LF-to-CRLF working-copy warnings.
+- Current goal state:
+  - Goal remains active and should not be marked complete yet.
+  - Feature removal remains blocked unless current call-site evidence and tests prove a feature is unused.
+  - Continue SQLite/client-reuse work only where current scans show concrete evidence.
+
+## 2026-06-22 continuation - model options slug chunk helpers
+
+- Re-verified context:
+  - Runtime is Windows PowerShell Core 7.6.2 on Windows.
+  - Root `AGENTS.md` was read before code work.
+  - Repo-local `./skills/skill-router/SKILL.md` is still missing; global `skill-router` was used for lightweight routing.
+  - Current dirty worktree was treated as source of truth and unrelated dirty files were not reverted.
+- Upstream client reuse scan:
+  - Re-ran the `reqwest::Client::new` / `reqwest::Client::builder` scan across `crates/` and `apps/src-tauri/src`.
+  - No new production per-request stable-config upstream client rebuild was found in this pass.
+  - `aggregate_api.rs` direct blocking client builders are currently test-only; production aggregate API test/discovery/balance refresh paths use the gateway upstream client helpers.
+  - Gateway upstream clients, model picker clients, warmup clients, auth/runtime clients, updater clients, and the web service probe client are cached or config-scoped in the current dirty worktree.
+- SQLite/core scope chosen:
+  - Continued the model catalog slug chunk-query track in `crates/core/src/storage/model_options.rs`.
+  - Focused on production SQL used by:
+    - `list_existing_model_catalog_slugs(...)`
+    - `list_remote_unedited_model_catalog_models_for_slugs(...)`
+  - Avoided changing catalog sync semantics, model ordering, or returned fields.
+- Changes:
+  - Added `existing_model_catalog_slugs_chunk_sql(slug_condition)`.
+  - Added `remote_unedited_model_catalog_models_for_slugs_chunk_sql(slug_condition)`.
+  - Updated production chunk functions to use the helpers.
+  - Updated EXPLAIN test helpers so parameterized production SQL can be explained without replacing placeholders by hand.
+  - Updated `model_catalog_slug_chunk_queries_defer_final_ordering_to_rust` to EXPLAIN the production helper SQL for both existing-slug and remote-unedited paths.
+  - Added lookup-index assertions for both slug chunk queries while preserving the no-temp-ORDER-BY assertions.
+- Validation:
+  - `cargo test -p codexmanager-core model_options -- --nocapture` passed.
+  - `cargo test -p codexmanager-core` passed:
+    - 295 core library tests.
+    - 7 auth integration tests.
+    - 28 storage integration tests.
+    - 1 usage integration test.
+    - 1 version integration test.
+    - doc-tests with 0 tests.
+  - `cargo fmt --check` passed.
+  - `git diff --check` passed; Git only reported existing LF-to-CRLF working-copy warnings.
+- Worktree note:
+  - This pass intentionally touched `crates/core/src/storage/model_options.rs` and this maintenance log.
+- Remaining candidates:
+  - `crates/core/src/storage/plugins.rs` still has inline chunk SQL around plugin install/task name lookup and already contains adjacent EXPLAIN coverage for list/due queries.
+  - Continue SQLite work only where production SQL can be shared with tests or EXPLAIN reveals a concrete plan issue.
+  - Feature removal remains blocked unless current call-site evidence and tests prove the feature is unused.
+
+## 2026-06-22 continuation - plugin/account manager chunk helpers
+
+- Scope chosen:
+  - Continued only evidence-backed SQLite/core maintainability work.
+  - Avoided feature removal because there is still no current call-site evidence plus tests proving any feature is unused.
+  - Left unrelated dirty files untouched.
+- `crates/core/src/storage/plugins.rs` changes:
+  - Added `plugin_install_names_for_plugins_chunk_sql(plugin_condition)`.
+  - Added `plugin_task_names_for_tasks_chunk_sql(task_condition)`.
+  - Updated `plugin_install_names_for_plugins(...)` and `plugin_task_names_for_tasks(...)` to use those helpers.
+  - Added EXPLAIN-backed tests for both chunk lookups:
+    - `plugin_install_names_for_plugins_uses_plugin_id_lookup_index`
+    - `plugin_task_names_for_tasks_uses_task_id_lookup_index`
+  - The tests assert primary-key lookup through SQLite autoindexes and no per-chunk ORDER BY temp B-tree.
+- `crates/core/src/storage/account_manager.rs` changes:
+  - Added `user_wallets_for_users_chunk_sql(owner_condition)`.
+  - Updated `user_wallets_for_users(...)` to use the helper.
+  - Extended `account_manager_chunk_queries_defer_final_ordering_to_rust` to EXPLAIN the production wallet chunk SQL.
+  - The wallet assertion confirms lookup through the `app_wallets(owner_kind, owner_id)` autoindex and no per-chunk temp sorting.
+- Validation:
+  - `cargo test -p codexmanager-core plugin -- --nocapture` passed:
+    - 23 matching core plugin tests.
+  - `cargo test -p codexmanager-core account_manager -- --nocapture` passed:
+    - 28 matching core account manager tests.
+  - `cargo test -p codexmanager-core` passed:
+    - 297 core library tests.
+    - 7 auth integration tests.
+    - 28 storage integration tests.
+    - 1 usage integration test.
+    - 1 version integration test.
+    - doc-tests with 0 tests.
+  - `cargo fmt --check` passed after a one-line rustfmt adjustment in a plugin test.
+  - `git diff --check` passed; Git only reported existing LF-to-CRLF working-copy warnings.
+- Worktree note:
+  - This pass intentionally touched `crates/core/src/storage/plugins.rs`, `crates/core/src/storage/account_manager.rs`, and this maintenance log.
+- Remaining candidates:
+  - Continue scanning chunk-query helpers, but prefer files where the current diff already has adjacent tests or where EXPLAIN can prove a concrete index/ordering issue.
+  - Re-scan upstream client construction only if new production request code is touched.
+  - Keep the overall goal active until the broader maintainability, SQLite, and upstream-client reuse objectives are audited end to end.
+
+## 2026-06-22 continuation - model source chunk helper cleanup
+
+- Scope chosen:
+  - Continued the same SQLite/core helper convergence pattern in `crates/core/src/storage/model_sources.rs`.
+  - No query shape, ordering, or returned fields were changed.
+- Changes:
+  - Added `enabled_model_source_mapping_platform_slugs_for_platforms_chunk_sql(platform_condition)`.
+  - Added `model_source_model_upstream_models_for_upstream_models_chunk_sql(upstream_condition)`.
+  - Updated:
+    - `list_enabled_model_source_mapping_platform_slugs_for_platforms(...)`
+    - `list_model_source_model_upstream_models_for_upstream_models(...)`
+  - Updated existing EXPLAIN coverage in `model_source_lookup_queries_use_composite_indexes` so the platform-slug and upstream-model chunk checks use the production helper SQL instead of handwritten duplicate SQL.
+- Validation:
+  - `cargo test -p codexmanager-core model_sources -- --nocapture` passed:
+    - 6 matching core model source tests.
+  - `cargo test -p codexmanager-core` passed after this slice:
+    - 297 core library tests.
+    - 7 auth integration tests.
+    - 28 storage integration tests.
+    - 1 usage integration test.
+    - 1 version integration test.
+    - doc-tests with 0 tests.
+  - `cargo fmt --check` passed.
+  - `git diff --check` passed; Git only reported existing LF-to-CRLF working-copy warnings.
+- Worktree note:
+  - This pass intentionally touched `crates/core/src/storage/model_sources.rs` and this maintenance log.
+- Remaining candidates:
+  - The current low-risk SQLite work should continue only where production SQL can be shared with tests or query plans expose a measurable issue.
+  - Avoid feature removal without call-site evidence and regression coverage.
+
+## 2026-06-22 continuation - account chunk helper coverage and client scan
+
+- Re-verified context:
+  - Runtime is Windows PowerShell Core 7.6.2 on Windows.
+  - Root `AGENTS.md` was read before code work.
+  - Repo-local `./skills/skill-router/SKILL.md` is still missing; global `skill-router` was used for lightweight routing.
+  - Current dirty worktree was treated as source of truth and unrelated dirty files were not reverted.
+- Upstream client reuse scan:
+  - Re-ran the `reqwest::Client::new` / `reqwest::Client::builder` scan across `crates/` and `apps/src-tauri/src`.
+  - Inspected `crates/service/src/http/proxy_runtime.rs`; its no-proxy backend client is built once in `run_front_proxy(...)` and stored in `ProxyState`, then reused by `proxy_handler(...)`.
+  - Inspected `crates/web/src/main.rs`; its web service proxy client is built once into `AppState`.
+  - `crates/service/src/http/proxy_runtime.rs` and `crates/web/src/main.rs` were not changed because this scan did not show a per-request stable-config client rebuild.
+- SQLite/core scope chosen:
+  - Continued helper convergence in `crates/core/src/storage/accounts.rs`.
+  - Focused on remaining account status/id chunk paths where production SQL was still inline while adjacent EXPLAIN tests already existed.
+  - Avoided changing return ordering, selected fields, account availability semantics, or gateway candidate behavior.
+- Changes:
+  - Added `accounts_by_statuses_chunk_sql(condition)`.
+  - Added `accounts_for_ids_chunk_sql(condition)`.
+  - Added `active_account_codex_profile_candidates_for_ids_chunk_sql(condition)`.
+  - Added `account_token_refresh_issuers_for_ids_chunk_sql(condition)`.
+  - Added `account_dashboard_source_metadata_for_ids_chunk_sql(condition)`.
+  - Updated the corresponding production chunk functions to use these helpers.
+  - Extended `account_status_chunk_queries_defer_final_ordering_to_rust` to EXPLAIN the full account status chunk query through production SQL.
+  - Extended `account_id_chunk_queries_defer_final_ordering_to_rust` to EXPLAIN full account, token refresh issuer, dashboard metadata, and active codex profile candidate chunk queries through production SQL.
+  - The new id chunk assertions verify primary-key lookup through `sqlite_autoindex_accounts_1` and no per-chunk ORDER BY temp B-tree.
+- Validation:
+  - `cargo test -p codexmanager-core accounts -- --nocapture` passed:
+    - 72 matching core/storage account tests.
+  - `cargo test -p codexmanager-core` passed after this slice:
+    - 297 core library tests.
+    - 7 auth integration tests.
+    - 28 storage integration tests.
+    - 1 usage integration test.
+    - 1 version integration test.
+    - doc-tests with 0 tests.
+  - `cargo fmt --check` passed after a one-line rustfmt adjustment in an accounts test.
+  - `git diff --check` passed; Git only reported existing LF-to-CRLF working-copy warnings.
+- Worktree note:
+  - This pass intentionally touched `crates/core/src/storage/accounts.rs` and this maintenance log.
+- Remaining candidates:
+  - Continue SQLite/helper work only where production SQL and tests can be kept in sync or query-plan evidence shows a concrete issue.
+  - Continue client reuse only if a production request/startup path still constructs a stable-config client repeatedly.
+  - Feature removal remains blocked without current call-site evidence and regression coverage.
+
+## 2026-06-22 continuation - API key quota limit chunk helper and client cache scan
+
+- Re-verified context:
+  - Runtime is Windows PowerShell Core 7.6.2 on Windows.
+  - Root `AGENTS.md` was read before code work.
+  - Repo-local `./skills/skill-router/SKILL.md` is still missing; global `skill-router` was used for lightweight routing.
+  - Current dirty worktree was treated as source of truth and unrelated dirty files were not reverted.
+- Upstream client reuse scan:
+  - Re-ran the `reqwest::Client::new` / `reqwest::Client::builder` scan across service/web/Tauri Rust code.
+  - Confirmed `crates/service/src/usage/usage_http.rs` uses `OnceLock<RwLock<Client>>` for usage and subscription clients and rebuilds only through explicit reload paths.
+  - Confirmed `crates/service/src/auth/auth_tokens.rs` uses `OnceLock<Client>` for default and loopback auth clients and returns cloned reusable handles.
+  - Confirmed `crates/service/src/account/account_warmup.rs` uses a config-keyed `OnceLock<Mutex<Option<WarmupClientCacheEntry>>>`.
+  - Confirmed `crates/service/src/gateway/model_picker/request.rs` uses a config-keyed cached model picker client.
+  - No production per-request stable-config client rebuild was changed in this pass.
+- SQLite/core scope chosen:
+  - Continued helper convergence in `crates/core/src/storage/api_key_quota_limits.rs`.
+  - Focused only on `list_api_key_quota_limits_for_ids_chunk(...)`, which still had inline SQL despite adjacent quota EXPLAIN tests.
+  - Avoided changing quota calculations, total usage aggregation, or schema.
+- Changes:
+  - Added `api_key_quota_limits_for_ids_chunk_sql(key_condition)`.
+  - Updated `list_api_key_quota_limits_for_ids_chunk(...)` to use the helper.
+  - Added `api_key_quota_limits_for_ids_uses_key_lookup_index`, asserting the for-id quota limit chunk query uses the quota-limit primary-key autoindex and avoids per-chunk ORDER BY temp sorting.
+- Validation:
+  - `cargo test -p codexmanager-core api_key_quota_limits -- --nocapture` passed:
+    - 4 matching core api-key quota limit tests.
+  - `cargo test -p codexmanager-core` passed after this slice:
+    - 298 core library tests.
+    - 7 auth integration tests.
+    - 28 storage integration tests.
+    - 1 usage integration test.
+    - 1 version integration test.
+    - doc-tests with 0 tests.
+  - `cargo fmt --check` passed.
+  - `git diff --check` passed; Git only reported existing LF-to-CRLF working-copy warnings.
+- Worktree note:
+  - This pass intentionally touched `crates/core/src/storage/api_key_quota_limits.rs` and this maintenance log.
+- Remaining candidates:
+  - Continue SQLite/helper work only where production SQL and tests can be kept in sync or EXPLAIN exposes a concrete query-plan issue.
+  - Continue client reuse only if a production request/startup path still constructs a stable-config client repeatedly.
+  - Feature removal remains blocked without current call-site evidence and regression coverage.
+
+## 2026-06-22 continuation - model price/source chunk SQL helpers
+
+- Re-verified context:
+  - Runtime is Windows PowerShell Core 7.6.2 on Windows.
+  - Root `AGENTS.md` was read before code work.
+  - Repo-local `./skills/skill-router/SKILL.md` is still missing; global `skill-router` was used for lightweight routing.
+  - Current dirty worktree was treated as source of truth and unrelated dirty files were not reverted.
+- Scope chosen:
+  - Continued SQLite/core maintainability work where production SQL and EXPLAIN tests had drift risk.
+  - Focused on:
+    - `crates/core/src/storage/model_price_rules.rs`
+    - `crates/core/src/storage/model_sources.rs`
+  - Avoided changing table schema, selected columns, public return behavior, or model routing semantics.
+- Changes:
+  - Added `enabled_model_price_rule_patterns_for_patterns_chunk_sql(pattern_condition)`.
+  - Updated `list_enabled_model_price_rule_patterns_for_patterns_chunk(...)` to use that helper.
+  - Updated `enabled_model_price_rule_pattern_lookup_uses_index` to EXPLAIN the production helper SQL instead of a handwritten copy.
+  - Added parameterized EXPLAIN collection in the model price rule tests because the production helper retains `enabled = ?1`.
+  - Added `enabled_model_source_mappings_for_sources_chunk_sql(source_condition)`.
+  - Updated `list_enabled_model_source_mappings_for_sources_chunk(...)` to use that helper.
+  - Added parameterized EXPLAIN coverage for the ranked CTE source-mapping chunk query and asserted it uses `idx_model_source_mappings_platform_source_enabled_priority`.
+- Validation:
+  - `cargo test -p codexmanager-core model_price_rules -- --nocapture` initially failed because the EXPLAIN test used production SQL with `?1` but provided no parameter.
+  - After adding the parameterized EXPLAIN helper, `cargo test -p codexmanager-core model_price_rules -- --nocapture` passed:
+    - 4 matching core library tests.
+  - `cargo test -p codexmanager-core model_sources -- --nocapture` passed:
+    - 6 matching core library tests.
+  - `cargo test -p codexmanager-core` passed:
+    - 295 core library tests.
+    - 7 auth integration tests.
+    - 28 storage integration tests.
+    - 1 usage integration test.
+    - 1 version integration test.
+    - doc-tests with 0 tests.
+  - `cargo fmt --check` initially caught two line-wrap differences in the new parameterized EXPLAIN helpers; after the minimal formatting fix it passed.
+  - `git diff --check` passed; Git only reported existing LF-to-CRLF working-copy warnings.
+- Worktree note:
+  - This pass intentionally touched `crates/core/src/storage/model_price_rules.rs`, `crates/core/src/storage/model_sources.rs`, and this maintenance log.
+  - The change is helper extraction plus EXPLAIN-backed plan coverage only; no functional behavior change is intended.
+- Remaining candidates:
+  - Continue SQLite only where EXPLAIN plans or duplicated query construction provide concrete evidence.
+  - Continue client reuse only if a production request path constructs a fresh stable-config client repeatedly.
+  - Feature removal remains blocked unless current call-site evidence and tests prove the feature is unused.
+
+## 2026-06-22 continuation - aggregate API chunk SQL helpers and balance for-id plan
+
+- Re-verified context:
+  - Continued the SQLite/core chunk-query maintainability track after API key helper extraction.
+  - `crates/core/src/storage/aggregate_apis.rs` had several production chunk queries still building SQL inline.
+  - Existing aggregate API EXPLAIN coverage used a simplified handwritten query, so it did not verify the actual production chunk SQL.
+- Scope chosen:
+  - Focused on aggregate API for-id chunk paths:
+    - `list_aggregate_apis_for_ids_chunk(...)`
+    - `list_aggregate_api_dashboard_source_metadata_for_ids_chunk(...)`
+    - `list_balance_query_aggregate_api_ids_for_ids_chunk(...)`
+    - `list_aggregate_api_secrets_for_ids_chunk(...)`
+  - Avoided changing selected columns, public return ordering, active/global balance-query list queries, secrets behavior, or supplier-model behavior.
+- Changes:
+  - Added `aggregate_apis_for_ids_chunk_sql(api_condition)`.
+  - Added `aggregate_api_dashboard_source_metadata_for_ids_chunk_sql(api_condition)`.
+  - Added `balance_query_aggregate_api_ids_for_ids_chunk_sql(api_condition)`.
+  - Added `aggregate_api_secrets_for_ids_chunk_sql(secret_condition)`.
+  - Updated the four production chunk functions to use those helpers.
+  - Updated `aggregate_api_id_chunk_queries_defer_final_ordering_to_rust` to EXPLAIN all four production helper SQL strings.
+  - Added assertions that the aggregate API row, dashboard metadata, balance-query for-id, and secret chunk paths use an id lookup index and avoid per-chunk `ORDER BY` temp sorting.
+  - Initial EXPLAIN coverage exposed that `list_balance_query_aggregate_api_ids_for_ids_chunk(...)` chose `idx_aggregate_apis_balance_query_order` instead of an `id IN (...)` lookup.
+  - For the for-id-only balance query helper, changed `balance_query_enabled = 1` to `+balance_query_enabled = 1` so SQLite does not drive this small-batch lookup from the global balance-order index; after this change the EXPLAIN test confirms the id lookup path.
+  - The global balance-query list helpers continue to use the balance-order index and their existing tests still pass.
+- Validation:
+  - First `cargo test -p codexmanager-core aggregate_api -- --nocapture` failed as intended on the new plan assertion:
+    - balance-query for-id chunk used `idx_aggregate_apis_balance_query_order`.
+  - After the for-id helper plan fix, `cargo test -p codexmanager-core aggregate_api -- --nocapture` passed:
+    - 27 matching core library tests.
+  - `cargo test -p codexmanager-core` passed:
+    - 295 core library tests.
+    - 7 auth integration tests.
+    - 28 storage integration tests.
+    - 1 usage integration test.
+    - 1 version integration test.
+    - doc-tests with 0 tests.
+  - `cargo fmt --check` initially caught two line-wrap issues in the aggregate API test array; after the minimal formatting fix it passed.
+  - `git diff --check` passed; Git only reported existing LF-to-CRLF working-copy warnings.
+- Worktree note:
+  - This pass intentionally touched `crates/core/src/storage/aggregate_apis.rs` and this maintenance log.
+  - The visible aggregate API file diff also includes earlier continuation changes in this dirty worktree; this pass's functional plan change is limited to the balance-query for-id helper and the new helper/test coverage.
+- Remaining candidates:
+  - Continue SQLite only where EXPLAIN plans or duplicated query construction provide concrete evidence.
+  - Continue client reuse only if a production request path constructs a fresh client per request.
+  - Feature removal remains blocked unless current call-site evidence and tests prove the feature is unused.
+
+## 2026-06-22 continuation - API key for-id chunk SQL helpers
+
+- Re-verified context:
+  - Continued after the account metadata/subscription chunk helper slice.
+  - `api_keys.rs` still had two production for-id chunk queries with inline SQL assembly.
+  - The matching EXPLAIN test lived in `crates/core/src/storage/tests/api_keys_tests.rs`, loaded as a child test module of `api_keys.rs`, so it can call private helper functions without widening the crate public API.
+- Scope chosen:
+  - Focused on the two API key for-id chunk paths:
+    - `list_api_keys_for_ids_chunk(...)`
+    - `list_api_key_summaries_for_ids_chunk(...)`
+  - Avoided changing selected columns, joins, filtering semantics, quota/profile joins, or final caller-side ordering.
+- Changes:
+  - Added `api_keys_for_ids_chunk_sql(key_condition)`.
+  - Updated `list_api_keys_for_ids_chunk(...)` to use the helper.
+  - Added `api_key_summaries_for_ids_chunk_sql(key_condition)`.
+  - Updated `list_api_key_summaries_for_ids_chunk(...)` to use the helper.
+  - Updated `api_key_id_chunk_queries_defer_final_ordering_to_rust` so it now EXPLAINs both production helper SQL strings:
+    - the full API key row chunk query,
+    - the API key list-summary chunk query.
+  - Added assertions that both plans use the key id primary-key/index lookup path and avoid per-chunk `ORDER BY` temp sorting.
+  - Added a small local `collect_query_plan(...)` helper in the test file to avoid duplicating EXPLAIN collection.
+- Validation:
+  - `cargo test -p codexmanager-core api_key -- --nocapture` passed:
+    - 25 matching core library tests.
+    - 3 matching storage integration tests.
+  - `cargo test -p codexmanager-core` passed:
+    - 295 core library tests.
+    - 7 auth integration tests.
+    - 28 storage integration tests.
+    - 1 usage integration test.
+    - 1 version integration test.
+    - doc-tests with 0 tests.
+  - `cargo fmt --check` initially caught import/line-wrap formatting in `api_keys_tests.rs`; after the minimal formatting fix it passed.
+  - `git diff --check` passed; Git only reported existing LF-to-CRLF working-copy warnings.
+- Worktree note:
+  - This pass intentionally touched `crates/core/src/storage/api_keys.rs`, `crates/core/src/storage/tests/api_keys_tests.rs`, and this maintenance log.
+  - The change is helper extraction plus EXPLAIN-backed plan assertions only; no functional behavior change is intended.
+- Remaining candidates:
+  - Continue SQLite only where EXPLAIN plans or duplicated query construction provide concrete evidence.
+  - Continue client reuse only if a production request path constructs a fresh client per request.
+  - Feature removal remains blocked unless current call-site evidence and tests prove the feature is unused.
+
+## 2026-06-22 continuation - account metadata and subscription chunk SQL helpers
+
+- Re-verified context:
+  - Runtime is Windows PowerShell Core 7.6.2 on Windows.
+  - Root `AGENTS.md` was read before code work.
+  - Repo-local `./skills/skill-router/SKILL.md` is still missing; global `skill-router` was used for lightweight routing.
+  - Current dirty worktree was treated as source of truth and unrelated dirty files were not reverted.
+- Scope chosen:
+  - Continued the SQLite/core maintainability track in two adjacent account-detail modules:
+    - `crates/core/src/storage/account_metadata.rs`
+    - `crates/core/src/storage/account_subscriptions.rs`
+  - Focused on duplicated chunk-query SQL construction where production code and EXPLAIN tests had separate handwritten SQL.
+  - Avoided changing table schema, public method behavior, final Rust-side ordering, or persistence semantics.
+- Changes:
+  - Added `account_metadata_for_accounts_chunk_sql(account_condition)`.
+  - Updated `list_account_metadata_for_accounts_chunk(...)` to use that helper.
+  - Updated `account_metadata_chunk_query_defers_final_ordering_to_rust` to EXPLAIN the same helper SQL used by production code.
+  - Added an assertion that metadata chunk lookup uses the `account_id` primary-key/index path and still avoids per-chunk `ORDER BY` temp sorting.
+  - Added `account_subscriptions_for_accounts_chunk_sql(account_condition)`.
+  - Updated `list_account_subscriptions_for_accounts_chunk(...)` to use that helper.
+  - Updated `account_subscription_chunk_query_defers_final_ordering_to_rust` to EXPLAIN the same helper SQL used by production code.
+  - Added an assertion that subscription chunk lookup uses the `account_id` primary-key/index path and still avoids per-chunk `ORDER BY` temp sorting.
+- Validation:
+  - `cargo test -p codexmanager-core account_metadata -- --nocapture` passed:
+    - 3 matching core library tests.
+    - 1 matching storage integration test.
+  - `cargo test -p codexmanager-core account_subscription -- --nocapture` passed:
+    - 3 matching core library tests.
+    - 1 matching storage integration test.
+  - `cargo test -p codexmanager-core` passed:
+    - 295 core library tests.
+    - 7 auth integration tests.
+    - 28 storage integration tests.
+    - 1 usage integration test.
+    - 1 version integration test.
+    - doc-tests with 0 tests.
+  - `cargo fmt --check` initially caught one line-wrap difference in `account_subscriptions.rs`; after the minimal formatting fix it passed.
+  - `git diff --check` passed; Git only reported existing LF-to-CRLF working-copy warnings.
+- Worktree note:
+  - This pass intentionally touched `crates/core/src/storage/account_metadata.rs`, `crates/core/src/storage/account_subscriptions.rs`, and this maintenance log.
+  - The change is helper extraction plus EXPLAIN-backed plan assertions only; no functional behavior change is intended.
+- Remaining candidates:
+  - Continue SQLite only where EXPLAIN plans or duplicated query construction provide concrete evidence.
+  - Continue client reuse only if a production request path constructs a fresh client per request.
+  - Feature removal remains blocked unless current call-site evidence and tests prove the feature is unused.
+
+## 2026-06-22 continuation - web service probe client cache
+
+- Re-verified context:
+  - Continued the client reuse track after the token chunk SQL helper slice.
+  - `crates/web/src/service_gateway.rs` was inspected because `rg` still showed `reqwest::Client::builder()` there.
+  - Current dirty worktree was treated as source of truth and unrelated dirty files were not reverted.
+- Existing file state found:
+  - The web service gateway already reused `AppState.client` for `/api/rpc`, author content, usage refresh events, and gateway proxy requests.
+  - A prior unlogged change had moved the service startup probe client construction out of `service_rpc_probe(...)` and into `ensure_service_running(...)`, so one `ensure_service_running(...)` call reused the probe client across its retry loop.
+  - However, each separate `ensure_service_running(...)` call still rebuilt the same no-proxy 1200ms timeout probe client.
+- Scope chosen:
+  - Focused only on the web service startup probe client.
+  - Did not change service spawning, TCP probing, RPC handshake semantics, request proxying, gateway proxy headers, or `AppState.client`.
+- Changes:
+  - Added `SERVICE_PROBE_CLIENT: OnceLock<Result<reqwest::Client, String>>`.
+  - Added `service_probe_client()` to return a cloned cached probe client.
+  - Updated `ensure_service_running(...)` to get the probe client from the process-level cache.
+  - Kept `service_rpc_probe(...)` parameterized over `&reqwest::Client`, preserving the existing reuse inside a single startup ensure loop.
+  - Updated the existing probe client test to call `service_probe_client()` twice and confirm both calls succeed through the dedicated config/cache path.
+- Validation:
+  - `cargo test -p codexmanager-web` passed:
+    - 19 web crate tests.
+  - `cargo fmt --check` passed after running `cargo fmt`.
+  - `git diff --check` passed; Git only reported existing LF-to-CRLF working-copy warnings.
+- Worktree note:
+  - This pass intentionally touched `crates/web/src/service_gateway.rs` and this maintenance log.
+  - The visible `service_gateway.rs` diff includes the prior unlogged extraction of `build_service_probe_client(...)`; this pass adds process-level caching on top of that extraction.
+- Remaining candidates:
+  - Continue client reuse only if a production or startup path constructs a fresh client with stable config.
+  - Continue SQLite only where EXPLAIN plans or duplicated query construction provide concrete evidence.
+  - Feature removal remains blocked unless current call-site evidence and tests prove the feature is unused.
+
+## 2026-06-22 continuation - token account chunk SQL helpers
+
+- Re-verified context:
+  - Runtime is Windows PowerShell Core 7.6.2 on Windows.
+  - Root `AGENTS.md` was read before code work.
+  - Repo-local `./skills/skill-router/SKILL.md` is still missing; global `skill-router` and its skill index were used for lightweight routing.
+  - Current dirty worktree was treated as source of truth and unrelated dirty files were not reverted.
+- Upstream client reuse scan:
+  - Re-ran `rg` across `crates/` and `apps/src-tauri/src` for `reqwest::Client::new`, `reqwest::Client::builder`, `Client::new`, and `Client::builder`.
+  - No new production per-request upstream client builder was changed in this pass:
+    - At the time of this token slice, `crates/web/src/service_gateway.rs` still built one probe client per service startup ensure call and reused `AppState.client` for request proxying; the later "web service probe client cache" slice caches that probe client at process scope.
+    - `gateway/core/runtime_config.rs`, `model_picker/request.rs`, `usage_http.rs`, `plugin/runtime.rs`, updater runtime, and auth token clients are cached or config-scoped.
+    - `attempt_flow/transport.rs`, `attempt_flow/postprocess.rs`, and `gateway/upstream/protocol/aggregate_api.rs` hits inspected in this pass are test helpers.
+- Existing file state found:
+  - `crates/core/src/storage/tokens.rs` already had prior unlogged maintainability/performance work:
+    - `tokens_due_for_refresh_sql()` extracted the due-refresh query.
+    - due-refresh EXPLAIN testing verifies the refresh-order index and that the latest-status CTE scopes events through due tokens.
+    - account token candidate chunk SQL helpers already existed for candidate and usable-candidate paths.
+- Scope chosen:
+  - Continued the SQLite/core maintainability track in `tokens.rs`.
+  - Focused on the two remaining inline account chunk queries:
+    - `list_tokens_for_accounts_chunk(...)`
+    - `list_account_token_plans_for_accounts_chunk(...)`
+  - Avoided changing query shape, return ordering, token refresh semantics, or indexes.
+- Changes:
+  - Added `tokens_for_accounts_chunk_sql(account_condition)`.
+  - Added `account_token_plans_for_accounts_chunk_sql(account_condition)`.
+  - Updated the two chunk functions to use those helpers.
+  - Added EXPLAIN-backed tests:
+    - `list_tokens_for_accounts_uses_account_lookup_index`
+    - `list_account_token_plans_for_accounts_uses_account_lookup_index`
+  - Both tests verify lookup through the token account primary-key/index path and no per-chunk `ORDER BY` temp B-tree.
+- Validation:
+  - `cargo test -p codexmanager-core tokens -- --nocapture` passed:
+    - 18 matching core library tests.
+    - 3 matching storage integration tests.
+  - `cargo test -p codexmanager-core` passed:
+    - 295 core library tests.
+    - 7 auth integration tests.
+    - 28 storage integration tests.
+    - 1 usage integration test.
+    - 1 version integration test.
+    - doc-tests with 0 tests.
+  - `cargo fmt --check` passed.
+  - `git diff --check` passed; Git only reported existing LF-to-CRLF working-copy warnings.
+- Worktree note:
+  - This pass intentionally touched `crates/core/src/storage/tokens.rs` and this maintenance log.
+  - The visible `tokens.rs` diff includes earlier continuation changes; this pass only completed the remaining account chunk SQL helper/test coverage for token rows and token plans.
+- Remaining candidates:
+  - Continue SQLite only where EXPLAIN plans or duplicated query construction provide concrete evidence.
+  - Continue client reuse only if a production request path constructs a fresh client per request.
+  - Feature removal remains blocked unless current call-site evidence and tests prove the feature is unused.
+
+## 2026-06-22 current window handoff
+
+- This window completed and validated three new SQLite/core maintenance slices:
+  - `account_metadata.rs` and `account_subscriptions.rs`: extracted chunk SQL helpers and updated EXPLAIN tests to use production SQL plus account id lookup assertions.
+  - `api_keys.rs` and `tests/api_keys_tests.rs`: extracted full-key and summary for-id chunk SQL helpers; updated chunk EXPLAIN coverage for both production SQL paths.
+  - `aggregate_apis.rs`: extracted aggregate API row/dashboard/balance/secrets chunk SQL helpers; updated EXPLAIN coverage for all four production SQL paths.
+- Notable performance finding:
+  - The new aggregate API EXPLAIN coverage exposed that balance-query for-id chunks were driven by `idx_aggregate_apis_balance_query_order` instead of the requested `id IN (...)` lookup path.
+  - The for-id-specific helper now uses `+balance_query_enabled = 1` so SQLite drives that small-batch query by id lookup while the global balance-query list still uses the balance-order index.
+- Validation completed in this window:
+  - `cargo test -p codexmanager-core account_metadata -- --nocapture` passed.
+  - `cargo test -p codexmanager-core account_subscription -- --nocapture` passed.
+  - `cargo test -p codexmanager-core api_key -- --nocapture` passed.
+  - `cargo test -p codexmanager-core aggregate_api -- --nocapture` passed after the balance for-id plan fix.
+  - `cargo test -p codexmanager-core` passed after each logical slice, including the final aggregate API slice.
+  - `cargo fmt --check` passed.
+  - `git diff --check` passed; Git only reported existing LF-to-CRLF working-copy warnings.
+- Current goal state:
+  - Goal remains active and should not be marked complete yet.
+  - Feature removal remains blocked unless current call-site evidence and tests prove the feature is unused.
+  - Continue SQLite work only where EXPLAIN plans or duplicated SQL construction provide concrete evidence.
+  - Continue client reuse only if a production request path still constructs a fresh stable-config client per request.
+
+## 2026-06-22 follow-up handoff - model price/source helpers
+
+- This follow-up completed two more SQLite/core helper slices:
+  - `crates/core/src/storage/model_price_rules.rs`: extracted `enabled_model_price_rule_patterns_for_patterns_chunk_sql(...)` and updated the index EXPLAIN test to use the production parameterized SQL.
+  - `crates/core/src/storage/model_sources.rs`: extracted `enabled_model_source_mappings_for_sources_chunk_sql(...)` for the ranked source-mapping CTE and added parameterized EXPLAIN coverage for its platform/source lookup index.
+- Validation completed:
+  - `cargo test -p codexmanager-core model_price_rules -- --nocapture` initially failed because EXPLAIN was run without the production `?1` parameter.
+  - After adding parameterized EXPLAIN helpers, `cargo test -p codexmanager-core model_price_rules -- --nocapture` passed.
+  - `cargo test -p codexmanager-core model_sources -- --nocapture` passed.
+  - `cargo test -p codexmanager-core` passed.
+  - `cargo fmt --check` passed.
+  - `git diff --check` passed; Git only reported existing LF-to-CRLF working-copy warnings.
+- Current goal state:
+  - Goal remains active; do not mark complete yet.
+  - Feature removal still requires current call-site evidence plus tests.
+  - Continue SQLite/client-reuse work only where current scans show concrete evidence.
+
+## 2026-06-22 latest tail marker
+
+- Latest detailed section in this file: `2026-06-22 continuation - accounts usable-token refresh helper`.
+- Current window changed only `crates/core/src/storage/accounts.rs` plus this maintenance log:
+  - extracted `account_usage_refresh_targets_with_usable_tokens_by_statuses_chunk_sql(condition)`;
+  - updated the production chunk query to use that helper;
+  - extended EXPLAIN coverage in `account_status_chunk_queries_defer_final_ordering_to_rust` for the usable-token refresh target path.
+- Validation after this window:
+  - `cargo test -p codexmanager-core accounts -- --nocapture` passed.
+  - `cargo test -p codexmanager-core` passed.
+  - `cargo fmt --check` passed after one rustfmt line-wrap fix.
+  - `git diff --check` passed with only existing LF-to-CRLF working-copy warnings.
+- Continue next:
+  - Goal remains active.
+  - Feature removal remains blocked without current call-site evidence plus tests.
+  - Do not chase test-only `reqwest::Client` builders; continue client reuse only if a production/startup stable-config builder is repeatedly constructed.
+  - Continue SQLite only where production SQL and EXPLAIN tests diverge, or a query plan exposes a real index/order issue.
+
+## 2026-06-22 continuation - account manager billing SQL helpers
+
+- Re-verified context:
+  - Runtime is Windows PowerShell Core 7.6.2 on Windows.
+  - Root `AGENTS.md` was read before code work.
+  - Repo-local `./skills/skill-router/SKILL.md` is still missing; global `skill-router` was used for lightweight routing.
+  - Current dirty worktree was treated as source of truth and unrelated dirty files were not reverted.
+- Scope chosen:
+  - Continued the SQLite/core maintainability track in `crates/core/src/storage/account_manager.rs`.
+  - Focused on billing rule list/active/context/request-candidate SQL because production functions duplicated the same billing-rule select column list and the active-list EXPLAIN test used a similar handwritten `SELECT id` query instead of production SQL.
+  - Avoided changing billing rule filters, parameter order, ordering semantics, schema, or indexes.
+- Changes:
+  - Added `billing_rule_select_columns()`.
+  - Added `billing_rule_list_sql()`.
+  - Added `active_billing_rule_where_sql()`.
+  - Added `active_billing_rules_sql()`.
+  - Added `active_billing_rules_for_context_sql()`.
+  - Added `active_billing_rules_for_request_candidate_sql()`.
+  - Updated `list_billing_rules(...)`, `list_active_billing_rules(...)`, `list_active_billing_rules_for_context(...)`, and `list_active_billing_rules_for_request_candidate(...)` to use those helpers.
+  - Updated `active_billing_rules_query_uses_order_index` to EXPLAIN `active_billing_rules_sql()` so the plan check covers production SQL.
+- Validation:
+  - `cargo test -p codexmanager-core account_manager -- --nocapture` passed:
+    - 28 matching core library tests.
+  - `cargo test -p codexmanager-core` passed:
+    - 301 core library tests.
+    - 7 auth integration tests.
+    - 28 storage integration tests.
+    - 1 usage integration test.
+    - 1 version integration test.
+    - doc-tests with 0 tests.
+  - `cargo fmt --check` initially caught two rustfmt line-wrap differences; after minimal formatting fixes it passed.
+  - `git diff --check` passed; Git only reported existing LF-to-CRLF working-copy warnings.
+- Continue next:
+  - Goal remains active; do not mark complete yet.
+  - Feature removal remains blocked without current call-site evidence plus tests.
+  - Continue SQLite only where production SQL and EXPLAIN tests diverge, or a query plan exposes a real index/order issue.
+  - Continue client reuse only if a production/startup path still constructs a fresh stable-config client repeatedly.
+
+## 2026-06-22 continuation - account manager app user lookup SQL helpers
+
+- Re-verified context:
+  - Runtime is Windows PowerShell Core 7.6.2 on Windows.
+  - Root `AGENTS.md` was read before code work.
+  - Repo-local `./skills/skill-router/SKILL.md` is still missing; global `skill-router` plus its skill index were used for lightweight routing.
+  - Current dirty worktree was treated as source of truth and unrelated dirty files were not reverted.
+- Scope chosen:
+  - Continued the SQLite/core maintainability track in `crates/core/src/storage/account_manager.rs`.
+  - Focused on `app_users` lookup/list SQL because username/id lookup and access-summary by-id paths still had hand-written production SQL while the EXPLAIN tests used separate SQL strings.
+  - Avoided changing returned columns, filters, parameter order, ordering, schema, or indexes.
+- Changes made in this window:
+  - Added `app_user_select_columns()`.
+  - Added `app_user_lookup_sql(where_condition)`.
+  - Added `app_user_by_username_sql()`.
+  - Added `app_user_by_id_sql()`.
+  - Converted `app_user_list_sql()` from a static literal to a projection-sharing helper.
+  - Updated `list_app_users(...)`, `find_app_user_by_username(...)`, and `find_app_user_by_id(...)` to use those helpers.
+  - Added `app_user_access_summary_by_id_sql()`.
+  - Updated `find_app_user_access_summary_by_id(...)` to use that helper.
+  - Updated `username_lookup_uses_lower_username_index` to EXPLAIN `app_user_by_username_sql()`.
+  - Added `app_user_id_lookup_uses_primary_key_index`.
+  - Extended `app_user_access_summary_by_id_projects_access_fields_only` to EXPLAIN `app_user_access_summary_by_id_sql()` and assert app user primary-key lookup.
+- Validation:
+  - `cargo test -p codexmanager-core account_manager -- --nocapture` passed:
+    - 29 matching core library tests.
+  - `cargo test -p codexmanager-core` passed:
+    - 302 core library tests.
+    - 7 auth integration tests.
+    - 28 storage integration tests.
+    - 1 usage integration test.
+    - 1 version integration test.
+    - doc-tests with 0 tests.
+  - `cargo fmt --check` passed after minimal rustfmt line-wrap fixes.
+  - `git diff --check` passed; Git only reported existing LF-to-CRLF working-copy warnings.
+- Continue next:
+  - Goal remains active; do not mark complete yet.
+  - Feature removal remains blocked without current call-site evidence plus tests.
+  - Continue SQLite only where production SQL and EXPLAIN tests diverge, or a query plan exposes a real index/order issue.
+  - Continue client reuse only if a production/startup path still constructs a fresh stable-config client repeatedly.
+
+## 2026-06-22 continuation - account manager app user lookup SQL helpers
+
+- Re-verified context:
+  - Runtime is Windows PowerShell Core 7.6.2 on Windows.
+  - Root `AGENTS.md` was read before code work.
+  - Repo-local `./skills/skill-router/SKILL.md` is still missing; global `skill-router` plus its skill index were used for lightweight routing.
+  - Current dirty worktree was treated as source of truth and unrelated dirty files were not reverted.
+- Scope chosen:
+  - Continued the SQLite/core maintainability track in `crates/core/src/storage/account_manager.rs`.
+  - Focused on `app_users` lookup/list SQL because username/id lookup and access-summary by-id paths still had hand-written production SQL while the EXPLAIN tests used separate SQL strings.
+  - Avoided changing returned columns, filters, parameter order, ordering, schema, or indexes.
+- Changes made in this window:
+  - Added `app_user_select_columns()`.
+  - Added `app_user_lookup_sql(where_condition)`.
+  - Added `app_user_by_username_sql()`.
+  - Added `app_user_by_id_sql()`.
+  - Converted `app_user_list_sql()` from a static literal to a projection-sharing helper.
+  - Updated `list_app_users(...)`, `find_app_user_by_username(...)`, and `find_app_user_by_id(...)` to use those helpers.
+  - Added `app_user_access_summary_by_id_sql()`.
+  - Updated `find_app_user_access_summary_by_id(...)` to use that helper.
+  - Updated `username_lookup_uses_lower_username_index` to EXPLAIN `app_user_by_username_sql()`.
+  - Added `app_user_id_lookup_uses_primary_key_index`.
+  - Extended `app_user_access_summary_by_id_projects_access_fields_only` to EXPLAIN `app_user_access_summary_by_id_sql()` and assert app user primary-key lookup.
+- Validation:
+  - `cargo test -p codexmanager-core account_manager -- --nocapture` passed:
+    - 29 matching core library tests.
+  - `cargo test -p codexmanager-core` passed:
+    - 302 core library tests.
+    - 7 auth integration tests.
+    - 28 storage integration tests.
+    - 1 usage integration test.
+    - 1 version integration test.
+    - doc-tests with 0 tests.
+  - `cargo fmt --check` passed after minimal rustfmt line-wrap fixes.
+  - `git diff --check` passed; Git only reported existing LF-to-CRLF working-copy warnings.
+- Continue next:
+  - Goal remains active; do not mark complete yet.
+  - Feature removal remains blocked without current call-site evidence plus tests.
+  - Continue SQLite only where production SQL and EXPLAIN tests diverge, or a query plan exposes a real index/order issue.
+  - Continue client reuse only if a production/startup path still constructs a fresh stable-config client repeatedly.
+
+## 2026-06-22 continuation - account manager public user SQL helper
+
+- Re-verified context:
+  - Runtime is Windows PowerShell Core 7.6.2 on Windows.
+  - Root `AGENTS.md` was read before code work.
+  - Repo-local `./skills/skill-router/SKILL.md` is still missing; global `skill-router` was used for lightweight routing.
+  - Current dirty worktree was treated as source of truth and unrelated dirty files were not reverted.
+- Scope chosen:
+  - Continued the SQLite/core maintainability track in `crates/core/src/storage/account_manager.rs`.
+  - Focused on public app user + wallet SQL because list and by-id lookup duplicated the same 16-column projection and wallet join.
+  - Avoided changing returned fields, admin wallet suppression, list ordering, by-id filtering, schema, or indexes.
+- Changes:
+  - Added `public_app_user_with_wallet_sql(where_condition, include_order)`.
+  - Updated `list_public_app_users_with_wallets(...)` to use the helper with list ordering.
+  - Updated `find_public_app_user_with_wallet_by_id(...)` to use the helper with a by-id condition and existing `LIMIT 1`.
+  - Extended `public_app_users_with_wallets_project_public_fields_without_password_hash` to EXPLAIN the list SQL and assert `idx_app_users_list_order` plus no temp `ORDER BY` sort.
+  - Extended `public_app_user_with_wallet_by_id_filters_single_public_user` to EXPLAIN the by-id SQL and assert app user primary-key lookup.
+- Validation:
+  - `cargo test -p codexmanager-core account_manager -- --nocapture` passed:
+    - 28 matching core library tests.
+  - `cargo test -p codexmanager-core` passed:
+    - 301 core library tests.
+    - 7 auth integration tests.
+    - 28 storage integration tests.
+    - 1 usage integration test.
+    - 1 version integration test.
+    - doc-tests with 0 tests.
+  - `cargo fmt --check` passed.
+  - `git diff --check` passed; Git only reported existing LF-to-CRLF working-copy warnings.
+- Continue next:
+  - Goal remains active; do not mark complete yet.
+  - Feature removal remains blocked without current call-site evidence plus tests.
+  - Continue SQLite only where production SQL and EXPLAIN tests diverge, or a query plan exposes a real index/order issue.
+  - Continue client reuse only if a production/startup path still constructs a fresh stable-config client repeatedly.
+
+## 2026-06-22 continuation - account manager API key owner SQL helpers
+
+- Re-verified context:
+  - Runtime is Windows PowerShell Core 7.6.2 on Windows.
+  - Root `AGENTS.md` was read before code work.
+  - Repo-local `./skills/skill-router/SKILL.md` is still missing; global `skill-router` was used for lightweight routing.
+  - Current dirty worktree was treated as source of truth and unrelated dirty files were not reverted.
+- Scope chosen:
+  - Continued the SQLite/core maintainability track in `crates/core/src/storage/account_manager.rs`.
+  - Focused on `api_key_owners` SQL because lookup/list/ordered rows/chunk paths repeated the same projection.
+  - Avoided changing owner filters, returned columns, row ordering, schema, or indexes.
+- Changes:
+  - Added `api_key_owner_select_columns()`.
+  - Added `api_key_owner_lookup_sql()`.
+  - Updated `api_key_owner_chunk_sql(...)` to use the shared projection helper.
+  - Added `api_key_owner_list_sql()`.
+  - Added `api_key_owner_rows_sql()`.
+  - Updated `find_api_key_owner(...)`, `list_api_key_owners(...)`, and `list_api_key_owner_rows(...)` to use those helpers.
+  - Extended `api_key_owner_rows_return_key_ordered_rows` to EXPLAIN `api_key_owner_rows_sql()` and assert the ordered row path scans the key owner primary-key index without a temp `ORDER BY` sort.
+- Validation:
+  - `cargo test -p codexmanager-core account_manager -- --nocapture` passed:
+    - 28 matching core library tests.
+  - `cargo test -p codexmanager-core` passed:
+    - 301 core library tests.
+    - 7 auth integration tests.
+    - 28 storage integration tests.
+    - 1 usage integration test.
+    - 1 version integration test.
+    - doc-tests with 0 tests.
+  - `cargo fmt --check` passed.
+  - `git diff --check` passed; Git only reported existing LF-to-CRLF working-copy warnings.
+- Continue next:
+  - Goal remains active; do not mark complete yet.
+  - Feature removal remains blocked without current call-site evidence plus tests.
+  - Continue SQLite only where production SQL and EXPLAIN tests diverge, or a query plan exposes a real index/order issue.
+  - Continue client reuse only if a production/startup path still constructs a fresh stable-config client repeatedly.
+
+## 2026-06-22 tail marker - latest completed slice
+
+- Latest completed slice in this window:
+  - File touched: `crates/core/src/storage/account_manager.rs`.
+  - Added app user lookup SQL helpers: `app_user_select_columns()`, `app_user_lookup_sql(...)`, `app_user_by_username_sql()`, `app_user_by_id_sql()`.
+  - Converted `app_user_list_sql()` to share the app user projection.
+  - Added `app_user_access_summary_by_id_sql()`.
+  - Updated production methods: `list_app_users(...)`, `find_app_user_by_username(...)`, `find_app_user_by_id(...)`, `find_app_user_access_summary_by_id(...)`.
+  - Updated EXPLAIN coverage to use production SQL for username lookup and access-summary by-id lookup.
+  - Added `app_user_id_lookup_uses_primary_key_index`.
+- Latest validation:
+  - `cargo test -p codexmanager-core account_manager -- --nocapture` passed with 29 matching library tests.
+  - `cargo test -p codexmanager-core` passed with 302 library tests plus auth/storage/usage/version integration tests.
+  - `cargo fmt --check` passed.
+  - `git diff --check` passed with only LF-to-CRLF warnings.
+- Next continuation constraints:
+  - Goal remains active.
+  - Do not remove features without current call-site evidence and tests.
+  - Continue SQLite only where production SQL and EXPLAIN tests diverge or a real plan issue appears.
+  - Continue client reuse only if a production/startup path repeatedly constructs a stable-config client.
+
+## 2026-06-22 tail marker - app session and wallet SQL helpers
+
+- Latest completed slice in this continuation:
+  - File touched: `crates/core/src/storage/account_manager.rs`.
+  - Added session SQL helpers: `app_session_select_columns()`, `active_app_session_by_token_hash_sql()`, `active_app_session_user_with_wallet_sql()`.
+  - Added wallet SQL helpers: `app_wallet_select_columns()`, `app_wallet_by_owner_sql()`, `app_wallet_list_sql()`, `user_wallet_available_credit_sql()`.
+  - Updated production methods: `find_active_app_session_by_token_hash(...)`, `find_active_app_session_user_by_token_hash(...)`, `find_wallet_by_owner(...)`, `list_wallets(...)`, `user_wallet_available_credit_micros(...)`.
+  - Updated `user_wallets_for_users_chunk_sql(...)` to share the wallet projection helper.
+  - Updated EXPLAIN coverage so active session lookup uses the production SQL helper with bound params.
+  - Extended active session user lookup test to assert token-hash index usage and app-user primary-key join.
+  - Updated wallet available-credit EXPLAIN test to use production SQL and added `wallet_owner_lookup_uses_unique_owner_index`.
+- Validation:
+  - `cargo test -p codexmanager-core account_manager -- --nocapture` passed with 30 matching library tests.
+  - `cargo test -p codexmanager-core` passed with 303 library tests plus auth/storage/usage/version integration tests.
+  - `cargo fmt --check` passed after minimal rustfmt line-wrap fixes.
+  - `git diff --check` passed with only LF-to-CRLF warnings.
+- Next continuation constraints:
+  - Goal remains active.
+  - Do not remove features without current call-site evidence and tests.
+  - Continue SQLite only where production SQL and EXPLAIN tests diverge or a real plan issue appears.
+  - Continue client reuse only if a production/startup path repeatedly constructs a stable-config client.
+
+## 2026-06-22 tail marker - metadata and subscription SQL helpers
+
+- Latest completed slice in this continuation:
+  - Files touched:
+    - `crates/core/src/storage/account_metadata.rs`
+    - `crates/core/src/storage/account_subscriptions.rs`
+  - Added metadata SQL helpers: `account_metadata_select_columns()`, `account_metadata_by_account_sql()`, `account_metadata_list_sql()`.
+  - Updated metadata production methods: `find_account_metadata(...)`, `list_account_metadata(...)`.
+  - Updated `account_metadata_for_accounts_chunk_sql(...)` to share the metadata projection helper.
+  - Added `account_metadata_lookup_uses_primary_key_index` to EXPLAIN production lookup SQL.
+  - Added subscription SQL helpers: `account_subscription_select_columns()`, `account_subscription_by_account_sql()`, `account_subscription_list_sql()`.
+  - Updated subscription production methods: `find_account_subscription(...)`, `list_account_subscriptions(...)`.
+  - Updated `account_subscriptions_for_accounts_chunk_sql(...)` to share the subscription projection helper.
+  - Added `account_subscription_lookup_uses_primary_key_index` and `account_subscription_list_uses_updated_at_order_index` to EXPLAIN production SQL.
+  - Did not add a metadata list-order assertion because current schema has no `account_metadata(updated_at DESC, account_id ASC)` index; only verified lookup/chunk primary-key behavior there.
+- Client reuse scan note:
+  - Remaining `reqwest::Client` hits in `attempt_flow/transport.rs`, `attempt_flow/postprocess.rs`, and `gateway/upstream/protocol/aggregate_api.rs` inspected in this continuation were test-only contexts.
+  - No production hot-path client reuse edit was made in this slice.
+- Validation:
+  - `cargo test -p codexmanager-core account_metadata -- --nocapture` passed:
+    - 4 matching library tests.
+    - 1 storage integration test.
+  - `cargo test -p codexmanager-core account_subscription -- --nocapture` passed:
+    - 5 matching library tests.
+    - 1 storage integration test.
+  - `cargo test -p codexmanager-core` passed:
+    - 306 core library tests.
+    - 7 auth integration tests.
+    - 28 storage integration tests.
+    - 1 usage integration test.
+    - 1 version integration test.
+    - doc-tests with 0 tests.
+  - `cargo fmt --check` passed.
+  - `git diff --check` passed with only LF-to-CRLF warnings.
+- Next continuation constraints:
+  - Goal remains active.
+  - Do not remove features without current call-site evidence and tests.
+  - Continue SQLite only where production SQL and EXPLAIN tests diverge or a real plan issue appears.
+  - Continue client reuse only if a production/startup path repeatedly constructs a stable-config client.
+
+## 2026-06-22 tail marker - API key quota limit SQL helpers
+
+- Latest completed slice in this continuation:
+  - File touched: `crates/core/src/storage/api_key_quota_limits.rs`.
+  - Added quota limit SQL helpers: `api_key_quota_limit_select_columns()`, `api_key_quota_limit_value_by_key_sql()`, `api_key_quota_limit_list_sql()`.
+  - Updated production methods: `find_api_key_quota_limit(...)`, `list_api_key_quota_limits(...)`.
+  - Updated `api_key_quota_limits_for_ids_chunk_sql(...)` to share the quota limit projection helper.
+  - Added `api_key_quota_limit_lookup_uses_primary_key_index` to EXPLAIN production lookup SQL.
+  - Did not add a list-order assertion because the production list has no `ORDER BY`; the existing chunk query coverage remains focused on primary-key lookup and no temp sort.
+- Validation:
+  - `cargo test -p codexmanager-core api_key_quota -- --nocapture` passed:
+    - 7 matching library tests.
+    - 1 storage integration test.
+  - `cargo test -p codexmanager-core` passed:
+    - 307 core library tests.
+    - 7 auth integration tests.
+    - 28 storage integration tests.
+    - 1 usage integration test.
+    - 1 version integration test.
+    - doc-tests with 0 tests.
+  - `cargo fmt --check` passed after minimal rustfmt line-wrap fix.
+  - `git diff --check` passed with only LF-to-CRLF warnings.
+- Next continuation constraints:
+  - Goal remains active.
+  - Do not remove features without current call-site evidence and tests.
+  - Continue SQLite only where production SQL and EXPLAIN tests diverge or a real plan issue appears.
+  - Continue client reuse only if a production/startup path repeatedly constructs a stable-config client.
+
+## 2026-06-22 tail marker - API key SQL helper alignment
+
+- Latest completed slice in this continuation:
+  - Files touched:
+    - `crates/core/src/storage/api_keys.rs`
+    - `crates/core/src/storage/tests/api_keys_tests.rs`
+  - Added/reused API key SQL helpers for production paths:
+    - `api_key_quota_summary_list_sql()`
+    - `api_key_codex_profile_candidate_list_sql()`
+    - `api_key_by_hash_sql()`
+    - `api_key_by_id_sql()`
+    - `api_key_status_by_id_sql()`
+    - `api_key_gateway_auth_by_id_sql()`
+    - `api_key_profile_config_by_id_sql()`
+  - Updated production methods to prepare through those helpers instead of inline SQL:
+    - `list_api_key_quota_summaries(...)`
+    - `list_api_key_codex_profile_candidates(...)`
+    - `find_api_key_by_hash(...)`
+    - `find_api_key_by_id(...)`
+    - `find_api_key_status_by_id(...)`
+    - `find_api_key_gateway_auth_by_id(...)`
+    - `find_api_key_profile_config_by_id(...)`
+  - Added `collect_query_plan_with_params(...)` in API key storage tests so EXPLAIN can use production SQL with bound parameters.
+  - Added EXPLAIN coverage:
+    - Specialized quota/profile candidate list helpers use `idx_api_keys_list_order` and avoid temp ORDER BY b-trees.
+    - Hash lookup uses `idx_api_keys_key_hash`.
+    - ID/status/gateway/profile config lookups use `sqlite_autoindex_api_keys_1`.
+    - Gateway auth join uses `sqlite_autoindex_api_key_secrets_1`.
+    - Profile config join uses `sqlite_autoindex_api_key_profiles_1`.
+- Validation:
+  - `cargo test -p codexmanager-core api_keys -- --nocapture` passed:
+    - 16 matching core library tests.
+    - 1 storage integration test.
+  - `cargo test -p codexmanager-core` passed:
+    - 309 core library tests.
+    - 7 auth integration tests.
+    - 28 storage integration tests.
+    - 1 usage integration test.
+    - 1 version integration test.
+    - doc-tests with 0 tests.
+  - `cargo fmt` completed successfully.
+  - `cargo fmt --check` passed.
+  - `git diff --check` passed with only LF-to-CRLF warnings.
+- Notes:
+  - No feature removal was attempted in this slice; there is still no current proof that a feature can be removed safely.
+  - No new SQLite index or migration was added; existing indexes covered the inspected production SQL plans.
+  - No upstream HTTP client reuse edit was made in this slice because the active evidence was API key SQLite/query maintainability, not repeated stable-config client construction.
+- Next continuation constraints:
+  - Goal remains active.
+  - Worktree is still dirty with many prior continuation changes; do not revert unrelated changes.
+  - Continue SQLite work only where production SQL and EXPLAIN tests diverge or a real plan issue appears.
+  - Continue client reuse only if a production/startup path repeatedly constructs a stable-config client.
+
+## 2026-06-22 tail marker - API key exists and secret SQL helpers
+
+- Latest completed slice in this continuation:
+  - Files touched:
+    - `crates/core/src/storage/api_keys.rs`
+    - `crates/core/src/storage/tests/api_keys_tests.rs`
+  - Added API key helper SQL for the remaining small direct read paths:
+    - `api_key_exists_sql()`
+    - `api_key_hash_exists_sql()`
+    - `api_key_secret_by_id_sql()`
+  - Updated production methods to use helpers:
+    - `api_key_exists(...)`
+    - `api_key_hash_exists(...)`
+    - `find_api_key_secret_by_id(...)`
+  - Extended `api_key_lookup_helpers_use_expected_indexes` EXPLAIN coverage:
+    - Exists lookup uses `sqlite_autoindex_api_keys_1`.
+    - Hash exists lookup uses `idx_api_keys_key_hash`.
+    - Secret lookup uses `sqlite_autoindex_api_key_secrets_1`.
+- Validation:
+  - `cargo test -p codexmanager-core api_keys -- --nocapture` passed:
+    - 16 matching core library tests.
+    - 1 storage integration test.
+  - `cargo test -p codexmanager-core` passed:
+    - 309 core library tests.
+    - 7 auth integration tests.
+    - 28 storage integration tests.
+    - 1 usage integration test.
+    - 1 version integration test.
+    - doc-tests with 0 tests.
+  - `cargo fmt` completed successfully.
+- Notes:
+  - This completed the current API key read-path helper alignment slice; remaining direct SQL in `api_keys.rs` is mainly write/update DML or broader usage aggregation and should not be changed without a separate plan.
+  - No feature removal was attempted; no safe-removal proof was found.
+  - Client reuse scan in this continuation found current production aggregate API balance refresh already uses `gateway::upstream_client()`, and account warmup already caches by client config; no client reuse edit was made.
+- Next continuation constraints:
+  - Goal remains active.
+  - Prefer the next SQLite slice in another storage module where production SQL and EXPLAIN coverage can be aligned narrowly.
+  - Do not revert unrelated dirty worktree changes.
+
+## 2026-06-22 tail marker - token SQL helper alignment
+
+- Latest completed slice in this continuation:
+  - File touched: `crates/core/src/storage/tokens.rs`.
+  - Added token SQL helpers for remaining direct read/list paths:
+    - `token_count_sql()`
+    - `token_account_count_sql()`
+    - `token_list_sql()`
+    - `account_token_candidates_sql()`
+    - `usable_account_token_candidates_sql()`
+    - `account_import_token_subjects_sql()`
+    - `token_by_account_sql()`
+  - Updated production methods to use those helpers:
+    - `token_count(...)`
+    - `token_account_count(...)`
+    - `list_tokens(...)`
+    - `list_account_token_candidates(...)`
+    - `list_usable_account_token_candidates(...)`
+    - `list_account_import_token_subjects(...)`
+    - `find_token_by_account_id(...)`
+  - Added `collect_query_plan_with_params(...)` for token storage tests.
+  - Added EXPLAIN coverage:
+    - Full token candidate/import subject list helpers scan token primary-key order and avoid ORDER BY temp b-trees.
+    - `token_by_account_sql()` uses the token account primary-key index.
+    - `token_account_count_sql()` uses the account primary-key/covering index path.
+  - Kept the existing `tokens_due_for_refresh_sql()` helper path and its scoped latest-status CTE coverage intact.
+- Validation:
+  - `cargo test -p codexmanager-core tokens -- --nocapture` passed:
+    - 20 matching core library tests.
+    - 3 storage integration tests.
+  - `cargo test -p codexmanager-core` passed:
+    - 311 core library tests.
+    - 7 auth integration tests.
+    - 28 storage integration tests.
+    - 1 usage integration test.
+    - 1 version integration test.
+    - doc-tests with 0 tests.
+  - `cargo fmt` completed successfully.
+  - `cargo fmt --check` passed before this note was appended; rerun after note append in the same continuation.
+  - `git diff --check` passed before this note was appended with only LF-to-CRLF warnings; rerun after note append in the same continuation.
+- Notes:
+  - No new SQLite index or migration was added; existing primary-key and refresh-due indexes cover the inspected token plans.
+  - No feature removal was attempted; no current safe-removal proof was found.
+  - `apply_patch` still fails in this workspace with sandbox helper `0xc0000005`, so edits in this slice used exact PowerShell/.NET string replacements.
+- Next continuation constraints:
+  - Goal remains active.
+  - Continue with another storage module only when a narrow production SQL/helper/EXPLAIN alignment opportunity is visible.
+  - Continue client reuse only if a production/startup path repeatedly constructs a stable-config client.
+
+## 2026-06-22 tail marker - usage SQL helper alignment
+
+- Latest completed slice in this continuation:
+  - File touched: `crates/core/src/storage/usage.rs`.
+  - Added helper SQL for direct usage snapshot read paths:
+    - `usage_snapshot_count_for_account_sql()`
+    - `usage_snapshot_count_sql()`
+    - `latest_usage_snapshot_sql()`
+    - `latest_usage_snapshot_for_account_sql()`
+    - `latest_usage_snapshot_summary_rows_sql()`
+  - Updated production methods to use those helpers:
+    - `usage_snapshot_count_for_account(...)`
+    - `usage_snapshot_count(...)`
+    - `latest_usage_snapshot(...)`
+    - `latest_usage_snapshot_for_account(...)`
+    - `latest_usage_snapshot_summary_rows(...)`
+  - Added EXPLAIN coverage in `latest_usage_snapshot_lookup_helpers_use_existing_indexes`:
+    - Global latest snapshot uses `idx_usage_snapshots_captured_id` and avoids temp ORDER BY b-trees.
+    - Account latest snapshot uses `idx_usage_snapshots_account_captured_id` and avoids temp ORDER BY b-trees.
+    - Account snapshot count uses `idx_usage_snapshots_account_captured_id`.
+    - Summary latest snapshot query uses `idx_usage_snapshots_account_captured_id` and avoids temp ORDER BY b-trees.
+- Validation:
+  - `cargo test -p codexmanager-core usage -- --nocapture` passed:
+    - 38 matching core library tests.
+    - 4 matching storage integration tests.
+    - 1 usage integration test.
+  - `cargo test -p codexmanager-core` passed:
+    - 312 core library tests.
+    - 7 auth integration tests.
+    - 28 storage integration tests.
+    - 1 usage integration test.
+    - 1 version integration test.
+    - doc-tests with 0 tests.
+  - `cargo fmt` completed successfully.
+  - `cargo fmt --check` passed.
+  - `git diff --check` passed with only LF-to-CRLF warnings.
+- Notes:
+  - No new SQLite index or migration was added; existing usage snapshot indexes cover the inspected read plans.
+  - No feature removal was attempted; no current safe-removal proof was found.
+  - `apply_patch` still fails in this workspace with sandbox helper `0xc0000005`; this slice used exact PowerShell/.NET string replacements after the failed patch attempt.
+- Next continuation constraints:
+  - Goal remains active.
+  - Continue with another storage module only when there is a narrow production SQL/helper/EXPLAIN alignment opportunity or an actual query plan issue.
+  - Continue client reuse only if a production/startup path repeatedly constructs a stable-config client.
+## 2026-06-22 tail marker - aggregate API direct lookup SQL helpers
+
+- Latest completed slice in this continuation:
+  - File touched: `crates/core/src/storage/aggregate_apis.rs`.
+  - Added helper SQL for direct aggregate API read paths:
+    - `aggregate_api_by_id_sql()`
+    - `aggregate_api_with_secrets_by_id_sql()`
+    - `aggregate_api_status_by_id_sql()`
+    - `aggregate_api_auth_type_by_id_sql()`
+    - `aggregate_api_secret_config_by_id_sql()`
+    - `aggregate_api_update_config_by_id_sql()`
+    - `aggregate_api_exists_sql()`
+    - `aggregate_api_supplier_identity_by_id_sql()`
+    - `aggregate_api_secret_by_id_sql()`
+    - `aggregate_api_balance_secret_by_id_sql()`
+  - Updated production methods to use those helpers:
+    - `find_aggregate_api_by_id(...)`
+    - `find_aggregate_api_with_secrets_by_id(...)`
+    - `find_aggregate_api_status_by_id(...)`
+    - `find_aggregate_api_auth_type_by_id(...)`
+    - `find_aggregate_api_secret_config_by_id(...)`
+    - `find_aggregate_api_update_config_by_id(...)`
+    - `aggregate_api_exists(...)`
+    - `find_aggregate_api_supplier_identity_by_id(...)`
+    - `find_aggregate_api_secret_by_id(...)`
+    - `find_aggregate_api_balance_secret_by_id(...)`
+  - Added `collect_query_plan_details_with_params(...)` in aggregate API storage tests.
+  - Added EXPLAIN coverage in `aggregate_api_direct_lookup_helpers_use_primary_key_indexes`:
+    - Aggregate API direct lookups use `sqlite_autoindex_aggregate_apis_1`.
+    - Aggregate API secret lookups use `sqlite_autoindex_aggregate_api_secrets_1`.
+    - Aggregate API balance secret lookups use `sqlite_autoindex_aggregate_api_balance_secrets_1`.
+    - Joined secret/config lookups use both the aggregate API primary key and joined secret primary-key indexes.
+- Validation:
+  - `cargo test -p codexmanager-core aggregate_api -- --nocapture` passed:
+    - 28 matching core library tests.
+  - `cargo test -p codexmanager-core` passed:
+    - 313 core library tests.
+    - 7 auth integration tests.
+    - 28 storage integration tests.
+    - 1 usage integration test.
+    - 1 version integration test.
+    - doc-tests with 0 tests.
+  - `cargo fmt` completed successfully.
+  - `cargo fmt --check` passed.
+  - `git diff --check` passed with only LF-to-CRLF warnings.
+- Notes:
+  - No new SQLite index or migration was added; existing primary-key indexes cover the inspected direct lookup plans.
+  - During cleanup, removing the unary `+` from `balance_query_aggregate_api_ids_for_ids_chunk_sql()` caused SQLite to choose `idx_aggregate_apis_balance_query_order` instead of the id lookup path; restored the unary `+` and added an inline comment explaining it as a planner hint for small id batches.
+  - No feature removal was attempted; no current safe-removal proof was found.
+  - Client reuse scan before this slice found relevant production paths already cache or construct clients once per startup/config: service probe, web `AppState`, usage HTTP, auth, and model picker.
+- Next continuation constraints:
+  - Goal remains active.
+  - Continue with another storage module only when a narrow production SQL/helper/EXPLAIN alignment opportunity or actual query-plan issue is visible.
+  - Continue client reuse only if a production/startup path repeatedly constructs a stable-config client.
+## 2026-06-22 tail marker - model group member access SQL helpers
+
+- Latest completed slice in this continuation:
+  - File touched: `crates/core/src/storage/model_groups.rs`.
+  - Added helper SQL for member model-group access read paths:
+    - `allowed_model_slugs_for_user_sql()`
+    - `model_group_access_for_user_sql()`
+  - Updated production methods to use those helpers:
+    - `allowed_model_slugs_for_user(...)`
+    - `resolve_model_group_access_for_user(...)`
+  - Added EXPLAIN coverage in `member_access_queries_use_existing_lookup_indexes`:
+    - Member assignment lookup uses `idx_user_model_groups_user_status`.
+    - Model group lookup uses `sqlite_autoindex_model_groups_1`.
+    - Model-group model lookup uses `sqlite_autoindex_model_group_models_1`.
+    - Catalog lookup uses `idx_model_catalog_models_scope_supported_in_api` or the catalog primary key depending on planner choice.
+    - Allowed model slug ordering avoids temp ORDER BY b-trees; DISTINCT may still use a temp b-tree and is not treated as an ordering regression.
+- Validation:
+  - `cargo test -p codexmanager-core model_group -- --nocapture` passed:
+    - 9 matching core library tests.
+    - 1 matching storage integration test.
+  - `cargo test -p codexmanager-core` passed:
+    - 314 core library tests.
+    - 7 auth integration tests.
+    - 28 storage integration tests.
+    - 1 usage integration test.
+    - 1 version integration test.
+    - doc-tests with 0 tests.
+  - `cargo fmt` completed successfully.
+  - `cargo fmt --check` passed.
+  - `git diff --check` passed with only LF-to-CRLF warnings.
+- Notes:
+  - No new SQLite index or migration was added; existing user/status, model group, model-group-model, and catalog indexes cover the inspected member access plans.
+  - Initial test expectation that member access would use `sqlite_autoindex_user_model_groups_1` was corrected after EXPLAIN showed the better existing `idx_user_model_groups_user_status` path.
+  - No feature removal was attempted; no current safe-removal proof was found.
+  - Client reuse scan in this slice found remaining blocking client constructors in `postprocess.rs` and `protocol/aggregate_api.rs` are test-local; production service/web usage observed in this slice remains cached or startup/config scoped.
+- Next continuation constraints:
+  - Goal remains active.
+  - Continue with another storage module only when a narrow production SQL/helper/EXPLAIN alignment opportunity or actual query-plan issue is visible.
+  - Continue client reuse only if a production/startup path repeatedly constructs a stable-config client.
+## 2026-06-22 tail marker - plugin storage SQL helper alignment
+
+- Latest completed slice in this continuation:
+  - File touched: `crates/core/src/storage/plugins.rs`.
+  - Added helper SQL for plugin storage read paths:
+    - `plugin_install_summary_list_sql()`
+    - `plugin_install_by_id_sql(select_columns)`
+    - `plugin_task_counts_by_plugin_sql()`
+    - `plugin_task_by_id_sql(select_columns)`
+  - Updated production methods to use helper SQL:
+    - `list_plugin_install_summaries(...)`
+    - `find_plugin_install(...)`
+    - `find_plugin_runtime_install(...)`
+    - `plugin_task_counts_by_plugin(...)`
+    - `find_plugin_task(...)`
+  - Kept prior helper-based production paths intact for plugin install lists, task lists, task summaries, due task lookup, next enabled run lookup, chunked name lookups, and run log lists/summaries.
+  - Added EXPLAIN coverage:
+    - `plugin_install_direct_lookup_helpers_use_primary_key_index` verifies full install/runtime install lookups use `sqlite_autoindex_plugin_installs_1`.
+    - `plugin_task_direct_lookup_helper_uses_primary_key_index` verifies task lookup uses `sqlite_autoindex_plugin_tasks_1`.
+    - `list_plugin_install_summaries_uses_list_order_index` now exercises `plugin_install_summary_list_sql()` directly and continues to verify `idx_plugin_installs_list_order`.
+    - `plugin_task_counts_by_plugin_uses_plugin_lookup_index` now exercises `plugin_task_counts_by_plugin_sql()` directly and continues to verify `idx_plugin_tasks_plugin_id_enabled_next_run_at`.
+- Validation:
+  - `cargo test -p codexmanager-core plugin -- --nocapture` passed:
+    - 26 matching core library tests.
+  - `cargo test -p codexmanager-core` passed:
+    - 316 core library tests.
+    - 7 auth integration tests.
+    - 28 storage integration tests.
+    - 1 usage integration test.
+    - 1 version integration test.
+    - doc-tests with 0 tests.
+  - `cargo fmt` completed successfully.
+  - `cargo fmt --check` passed.
+  - `git diff --check` passed with only LF-to-CRLF warnings.
+- Notes:
+  - No new SQLite index or migration was added; existing plugin install primary key, plugin task primary key, plugin install list-order index, and plugin task plugin lookup index cover the inspected plans.
+  - No feature removal was attempted; no current safe-removal proof was found.
+  - Root `skills/skill-router` path is absent; this slice used global `C:\Users\七线牛马\.codex\skills\skill-router\SKILL.md` per local instruction fallback.
+  - `apply_patch` still fails in this workspace with sandbox helper `0xc0000005`; this slice used exact PowerShell/.NET string replacements after the failed patch attempt.
+- Next continuation constraints:
+  - Goal remains active.
+  - Continue with another storage module only when a narrow production SQL/helper/EXPLAIN alignment opportunity or actual query-plan issue is visible.
+  - Continue feature removal only with current call-site evidence plus tests proving it is safe.
+  - Continue client reuse only if a production/startup path repeatedly constructs a stable-config client.
+## 2026-06-22 tail marker - model price rule SQL helper alignment
+
+- Latest completed slice in this continuation:
+  - File touched: `crates/core/src/storage/model_price_rules.rs`.
+  - Added helper SQL/select-column helpers:
+    - `model_price_rule_select_columns()`
+    - `model_price_rule_count_for_seed_sql()`
+    - `enabled_model_price_rules_sql()`
+  - Updated production methods to use helpers:
+    - `count_model_price_rules_for_seed(...)`
+    - `list_enabled_model_price_rules(...)`
+  - Added EXPLAIN coverage in `count_model_price_rules_for_seed_uses_source_seed_index`:
+    - Seed-count path uses `idx_model_price_rules_source_seed`.
+- Validation:
+  - `cargo test -p codexmanager-core model_price -- --nocapture` passed:
+    - 5 matching core library tests.
+  - `cargo test -p codexmanager-core` passed:
+    - 317 core library tests.
+    - 7 auth integration tests.
+    - 28 storage integration tests.
+    - 1 usage integration test.
+    - 1 version integration test.
+    - doc-tests with 0 tests.
+  - `cargo fmt` completed successfully.
+  - `cargo fmt --check` passed.
+  - `git diff --check` passed with only LF-to-CRLF warnings.
+- Notes:
+  - No new SQLite index or migration was added; existing `idx_model_price_rules_source_seed` covers the seed count plan.
+  - `list_enabled_model_price_rules(...)` still orders by `priority DESC, length(model_pattern) DESC, model_pattern ASC`; no expression index was added because this needs separate evidence that the list path is hot enough and worth a new write-time index cost.
+  - No feature removal was attempted; no current safe-removal proof was found.
+- Next continuation constraints:
+  - Goal remains active.
+  - Continue with another storage module only when a narrow production SQL/helper/EXPLAIN alignment opportunity or actual query-plan issue is visible.
+  - Avoid adding indexes for expression-ordering paths unless current EXPLAIN plus production usage evidence shows a real plan issue.
+  - Continue feature removal only with current call-site evidence plus tests proving it is safe.
+## 2026-06-22 scan note - quota pools no-op
+
+- Read-only scan completed for `crates/core/src/storage/quota_pools.rs`.
+- Finding:
+  - Production read paths are already helper-backed for quota source model assignment lists, source/kind/model lookups, account quota capacity template lists, account quota capacity override lists, and chunked account/source filters.
+  - Existing EXPLAIN coverage already checks source/model indexes, no temp ORDER BY for key list paths, and chunk queries that defer final ordering to Rust.
+- Decision:
+  - No code change in this slice.
+  - No new SQLite index or migration is justified from this scan.
+- Next continuation constraints:
+  - Skip `quota_pools.rs` unless a new production query or failing plan appears.
+## 2026-06-22 tail marker - app settings SQL helper alignment
+
+- Latest completed slice in this continuation:
+  - File touched: `crates/core/src/storage/settings.rs`.
+  - Added helper SQL:
+    - `app_settings_list_sql()`
+    - `app_setting_value_by_key_sql()`
+    - `delete_app_setting_sql()`
+  - Updated production methods to use helpers:
+    - `list_app_settings(...)`
+    - `get_app_setting(...)`
+    - `delete_app_setting(...)`
+  - Added EXPLAIN coverage:
+    - `app_setting_lookup_uses_primary_key_index` verifies key lookup uses `sqlite_autoindex_app_settings_1`.
+    - `app_settings_list_uses_primary_key_order_without_temp_sort` verifies ordered settings list scans primary-key order and avoids temp ORDER BY sorting.
+- Validation:
+  - `cargo test -p codexmanager-core app_setting -- --nocapture` passed:
+    - 2 matching core library tests.
+  - `cargo test -p codexmanager-core` passed:
+    - 319 core library tests.
+    - 7 auth integration tests.
+    - 28 storage integration tests.
+    - 1 usage integration test.
+    - 1 version integration test.
+    - doc-tests with 0 tests.
+  - `cargo fmt` completed successfully.
+  - `cargo fmt --check` passed.
+  - `git diff --check` passed with only LF-to-CRLF warnings.
+- Client reuse scan note:
+  - Rechecked `crates/service/src/http/proxy_runtime.rs`: `build_local_backend_client()` is called once when `run_front_proxy(...)` builds `ProxyState`; requests reuse `state.client`, so no hot-path client rebuild was found there.
+  - Rechecked aggregate API management paths: production `test_aggregate_api_connection(...)`, `discover_aggregate_api_models(...)`, and `refresh_aggregate_api_balance(...)` use cached `gateway::upstream_client()`; remaining `reqwest::blocking::Client::builder()` hits around aggregate API probe tests are test-local.
+  - Rechecked gateway async stream path: normal transport uses cached `async_upstream_client_for_account(...)`; retry path uses cached retry client through `fresh_async_upstream_client_for_account(...)`, not a per-request builder.
+- Notes:
+  - No new SQLite index or migration was added; existing `app_settings` primary key covers lookup and ordered list plans.
+  - No feature removal was attempted; no current safe-removal proof was found.
+- Next continuation constraints:
+  - Goal remains active.
+  - Continue SQLite work only when production SQL/helper/EXPLAIN alignment or a real query-plan issue is visible.
+  - Continue client reuse only if a production/startup path repeatedly constructs a stable-config client in a request or frequent background path.
+  - Continue feature removal only with current call-site evidence plus tests proving it is safe.
+
+## 2026-06-22 tail marker - model catalog scope lookup helper
+
+- Latest completed slice in this continuation:
+  - File touched: `crates/core/src/storage/model_options.rs`.
+  - Added helper SQL:
+    - `model_catalog_scope_by_scope_sql()`
+  - Updated production method to use the helper:
+    - `get_model_catalog_scope(...)`
+  - Added EXPLAIN coverage:
+    - `model_catalog_scope_lookup_uses_primary_key_index` verifies scope lookup uses a `model_catalog_scopes` index, backed by the table primary key.
+- Validation:
+  - `cargo test -p codexmanager-core model_catalog_scope_lookup_uses_primary_key_index -- --nocapture` passed:
+    - 1 matching core library test.
+  - `cargo test -p codexmanager-core model_catalog -- --nocapture` passed:
+    - 17 matching core library/migration tests.
+  - `cargo fmt` completed successfully.
+- Notes:
+  - No new SQLite index or migration was added; the existing `model_catalog_scopes(scope)` primary key covers the inspected lookup plan.
+  - `apply_patch` still fails in this workspace with sandbox helper `0xc0000005`; this slice used exact PowerShell/.NET string replacements with anchor checks.
+  - No feature removal was attempted; no current safe-removal proof was found.
+- Next continuation constraints:
+  - Goal remains active.
+  - Continue SQLite work only when production SQL/helper/EXPLAIN alignment or a real query-plan issue is visible.
+  - Continue feature removal only with current call-site evidence plus tests proving it is safe.
+  - Continue client reuse only if a production/startup path repeatedly constructs a stable-config client in a request or frequent background path.
+## 2026-06-22 tail marker - app user count SQL helpers
+
+- Latest completed slice in this continuation:
+  - File touched: `crates/core/src/storage/account_manager.rs`.
+  - Added helper SQL:
+    - `app_user_count_sql()`
+    - `member_app_user_count_sql()`
+    - `active_admin_count_sql()`
+  - Updated production methods to use helpers:
+    - `app_user_count(...)`
+    - `member_app_user_count(...)`
+    - `active_admin_count(...)`
+  - Added EXPLAIN coverage:
+    - `app_user_role_count_queries_use_role_status_index` verifies member/admin role count paths use `idx_app_users_role_status`.
+- Validation:
+  - `cargo test -p codexmanager-core app_user_role_count_queries_use_role_status_index -- --nocapture` passed:
+    - 1 matching core library test.
+  - `cargo test -p codexmanager-core account_manager -- --nocapture` passed:
+    - 31 matching core library tests.
+  - `cargo fmt` completed successfully.
+- Notes:
+  - No new SQLite index or migration was added; existing `idx_app_users_role_status` covers role/status count paths.
+  - `app_user_count_sql()` remains a whole-table count helper; no separate index assertion was added because SQLite can satisfy a table count with its normal scan/count strategy and no new schema is justified.
+  - No feature removal was attempted; no current safe-removal proof was found.
+- Next continuation constraints:
+  - Goal remains active.
+  - Continue SQLite work only when production SQL/helper/EXPLAIN alignment or a real query-plan issue is visible.
+  - Continue feature removal only with current call-site evidence plus tests proving it is safe.
+  - Continue client reuse only if a production/startup path repeatedly constructs a stable-config client in a request or frequent background path.
+## 2026-06-22 tail marker - account lightweight list SQL helpers
+
+- Latest completed slice in this continuation:
+  - File touched: `crates/core/src/storage/accounts.rs`.
+  - Added helper SQL for lightweight account list paths:
+    - `account_auth_refresh_targets_list_sql()`
+    - `account_quota_source_summaries_list_sql()`
+    - `account_import_snapshots_list_sql()`
+    - `account_summary_rows_list_sql()`
+  - Updated production methods to use helpers:
+    - `list_account_auth_refresh_targets(...)`
+    - `list_account_quota_source_summaries(...)`
+    - `list_account_import_snapshots(...)`
+    - `list_account_summary_rows(...)`
+  - Extended EXPLAIN coverage:
+    - `account_base_lists_use_sort_updated_id_order_index` now checks these lightweight list helpers, in addition to account id list, use `idx_accounts_list_order` and avoid temp ORDER BY sorting.
+- Validation:
+  - `cargo test -p codexmanager-core account_base_lists_use_sort_updated_id_order_index -- --nocapture` passed:
+    - 1 matching core library test.
+  - `cargo test -p codexmanager-core accounts -- --nocapture` passed:
+    - 72 matching core library tests.
+    - 2 matching storage integration tests.
+  - `cargo fmt` completed successfully.
+- Notes:
+  - No new SQLite index or migration was added; existing `idx_accounts_list_order` covers the inspected ordered list plans.
+  - No feature removal was attempted; no current safe-removal proof was found.
+- Next continuation constraints:
+  - Goal remains active.
+  - Continue SQLite work only when production SQL/helper/EXPLAIN alignment or a real query-plan issue is visible.
+  - Continue feature removal only with current call-site evidence plus tests proving it is safe.
+  - Continue client reuse only if a production/startup path repeatedly constructs a stable-config client in a request or frequent background path.
+## 2026-06-22 tail marker - model picker retry client cache refresh
+
+- Latest completed slice in this continuation:
+  - File touched: `crates/service/src/gateway/model_picker/request.rs`.
+  - Client reuse change:
+    - Added `refresh_model_picker_client()` to rebuild the model picker HTTP client for the current user-agent/proxy config and replace the cached client.
+    - Updated the model-list retry path after an initial transport error to use `refresh_model_picker_client()` instead of a one-off `build_model_picker_client()`.
+    - This avoids repeated reuse of a possibly bad cached client followed by repeated one-off client construction on later requests; after a successful refresh, subsequent model picker requests reuse the refreshed cache entry.
+  - Test coverage:
+    - Extended `model_picker_client_reuses_cached_client_until_config_changes` to verify refresh builds exactly one new client and the next `model_picker_client()` call reuses it without another build.
+  - Follow-up cleanup:
+    - Marked `build_model_picker_client()` as `#[cfg(test)]` because production now uses cached clients and cache refresh helpers directly.
+- Validation:
+  - `cargo test -p codexmanager-service model_picker_client_reuses_cached_client_until_config_changes -- --nocapture` passed with no warnings after the `#[cfg(test)]` cleanup.
+  - `cargo test -p codexmanager-service model_picker -- --nocapture` passed:
+    - 17 matching service library tests.
+  - `cargo fmt` completed successfully.
+- Scan notes:
+  - Rechecked current client construction hits:
+    - `usage_http.rs` uses `OnceLock<RwLock<Client>>` with explicit rebuild on proxy/config failures.
+    - `account_warmup.rs` caches blocking clients by user-agent/proxy config.
+    - `auth_tokens.rs`, plugin runtime, web service probe, web `AppState`, gateway runtime config, async upstream transport, and updater runtime already cache or construct clients once per startup/config.
+    - `aggregate_api.rs` `reqwest::blocking::Client::builder()` hits observed in this slice are test-local probe tests; production aggregate API management uses cached gateway upstream clients.
+  - No feature removal was attempted; no current safe-removal proof was found.
+- Next continuation constraints:
+  - Goal remains active.
+  - Continue client reuse only if a production/request/frequent background path repeatedly constructs a stable-config client.
+  - Continue SQLite work only when production SQL/helper/EXPLAIN alignment or a real query-plan issue is visible.
+  - Continue feature removal only with current call-site evidence plus tests proving it is safe.
+## 2026-06-22 tail marker - aggregate API list SQL helper alignment
+
+- Latest completed slice in this continuation:
+  - File touched: `crates/core/src/storage/aggregate_apis.rs`.
+  - Added helper SQL for aggregate API list paths:
+    - `aggregate_api_list_sql()`
+    - `aggregate_api_quota_source_summaries_list_sql()`
+    - `aggregate_api_balance_jsons_list_sql()`
+  - Updated production methods to use helpers:
+    - `list_aggregate_apis(...)`
+    - `list_aggregate_api_summaries(...)`
+    - `list_aggregate_api_quota_source_summaries(...)`
+    - `list_aggregate_api_balance_jsons(...)`
+  - Replaced the list-order EXPLAIN test with broader coverage:
+    - `aggregate_api_list_queries_use_list_order_index_without_temp_sort` verifies aggregate API ids, full rows, quota source summaries, and balance JSON list SQL use `idx_aggregate_apis_list_order` and avoid temp ORDER BY sorting.
+- Validation:
+  - `cargo test -p codexmanager-core aggregate_api_list_queries_use_list_order_index_without_temp_sort -- --nocapture` passed:
+    - 1 matching core library test.
+  - `cargo test -p codexmanager-core aggregate_api -- --nocapture` passed:
+    - 28 matching core library tests.
+  - `cargo fmt` completed successfully.
+  - `cargo fmt --check` passed.
+  - `git diff --check` passed with only LF-to-CRLF warnings.
+- Notes:
+  - No new SQLite index or migration was added; existing `idx_aggregate_apis_list_order` covers the inspected ordered list plans.
+  - `aggregate_api_list_sql()` preserves the previous full-row ordering (`sort ASC, updated_at DESC`) rather than adding `id ASC`; SQLite still uses the existing list-order index prefix without temp sorting.
+  - No feature removal was attempted; no current safe-removal proof was found.
+- Next continuation constraints:
+  - Goal remains active.
+  - Continue SQLite work only when production SQL/helper/EXPLAIN alignment or a real query-plan issue is visible.
+  - Continue client reuse only if a production/request/frequent background path repeatedly constructs a stable-config client.
+  - Continue feature removal only with current call-site evidence plus tests proving it is safe.
+## 2026-06-22 tail marker - request token stat rollup maintenance SQL helpers
+
+- Latest completed slice in this continuation:
+  - Files touched:
+    - `crates/core/src/storage/request_token_stats.rs`
+    - `crates/core/src/storage/tests/request_token_stats_tests.rs`
+  - Added helper SQL for raw request token stat maintenance paths:
+    - `request_token_stats_pending_rollup_exists_sql()`
+    - `delete_request_token_stats_before_sql()`
+  - Updated `rollup_request_token_stats_before(...)` to use those helpers for the pending check and raw-stat delete step.
+  - Added EXPLAIN coverage:
+    - `raw_stat_rollup_maintenance_queries_match_created_at_index` verifies both maintenance SQL paths use `idx_request_token_stats_created_at`.
+- Validation:
+  - `cargo test -p codexmanager-core raw_stat_rollup_maintenance_queries_match_created_at_index -- --nocapture` passed:
+    - 1 matching core library test.
+  - `cargo test -p codexmanager-core request_token_stats -- --nocapture` passed:
+    - 19 matching core library tests.
+    - 2 matching storage integration tests.
+  - `cargo fmt` completed successfully.
+  - `cargo fmt --check` passed.
+  - `git diff --check` passed with only LF-to-CRLF warnings.
+- Notes:
+  - No new SQLite index or migration was added; existing `idx_request_token_stats_created_at` covers the inspected pending/delete maintenance plans.
+  - The file already had broader request-token-stat refactors in the dirty worktree; this slice only added the two maintenance SQL helpers and the corresponding EXPLAIN assertion.
+  - No feature removal was attempted; no current safe-removal proof was found.
+- Next continuation constraints:
+  - Goal remains active.
+  - Continue SQLite work only when production SQL/helper/EXPLAIN alignment or a real query-plan issue is visible.
+  - Continue client reuse only if a production/request/frequent background path repeatedly constructs a stable-config client.
+  - Continue feature removal only with current call-site evidence plus tests proving it is safe.
+## 2026-06-22 tail marker - model source mapping source id SQL helper
+
+- Latest completed slice in this continuation:
+  - File touched: `crates/core/src/storage/model_sources.rs`.
+  - Added helper SQL:
+    - `model_source_mapping_source_ids_for_kind_sql()`
+  - Updated production method to use the helper:
+    - `list_model_source_mapping_source_ids_for_kind(...)`
+  - Extended EXPLAIN coverage:
+    - `model_source_lookup_queries_use_composite_indexes` now verifies this mapping source-id list query uses `idx_model_source_mappings_source` and avoids temp ORDER BY sorting.
+- Validation:
+  - `cargo test -p codexmanager-core model_source_lookup_queries_use_composite_indexes -- --nocapture` passed:
+    - 1 matching core library test.
+  - `cargo test -p codexmanager-core model_source -- --nocapture` passed:
+    - 7 matching core library/migration tests.
+    - 2 matching storage integration tests.
+  - `cargo fmt --check` passed.
+  - `cargo test -p codexmanager-core` passed:
+    - 322 core library tests.
+    - 7 auth integration tests.
+    - 28 storage integration tests.
+    - 1 usage integration test.
+    - 1 version integration test.
+    - doc-tests with 0 tests.
+  - `git diff --check` passed with only LF-to-CRLF warnings.
+- Notes:
+  - No new SQLite index or migration was added; existing `idx_model_source_mappings_source` covers the inspected source-kind source-id list path.
+  - The file already had broader model source SQL helper/index work in the dirty worktree; this slice only added the mapping source-id helper and EXPLAIN assertion.
+  - No feature removal was attempted; no current safe-removal proof was found.
+- Next continuation constraints:
+  - Goal remains active.
+  - Continue SQLite work only when production SQL/helper/EXPLAIN alignment or a real query-plan issue is visible.
+  - Continue client reuse only if a production/request/frequent background path repeatedly constructs a stable-config client.
+  - Continue feature removal only with current call-site evidence plus tests proving it is safe.
+## 2026-06-22 tail marker - model source mapping preference SQL helpers
+
+- Latest completed slice in this continuation:
+  - File touched: `crates/core/src/storage/model_sources.rs`.
+  - Added helper SQL for mapping preference source-scoped paths:
+    - `model_source_mapping_preferences_for_source_sql()`
+    - `delete_model_source_mapping_preferences_for_source_sql()`
+  - Updated production methods to use helpers:
+    - `list_model_source_mapping_preferences(...)`
+    - `delete_model_source_mapping_preferences_for_source(...)`
+  - Extended EXPLAIN coverage:
+    - `model_source_lookup_queries_use_composite_indexes` now verifies preference list/delete source-scoped paths use either `idx_model_source_mapping_preferences_source` or the primary-key autoindex.
+- Validation:
+  - `cargo test -p codexmanager-core model_source_lookup_queries_use_composite_indexes -- --nocapture` passed:
+    - 1 matching core library test.
+  - `cargo test -p codexmanager-core model_source -- --nocapture` passed:
+    - 7 matching core library/migration tests.
+    - 2 matching storage integration tests.
+  - `cargo fmt` completed successfully.
+  - `cargo fmt --check` passed.
+  - `git diff --check` passed with only LF-to-CRLF warnings.
+- Scan notes:
+  - Current HTTP client construction scan found no new production hot-path repeated client builder to change in this slice.
+  - `aggregate_api.rs` blocking client builders observed around provider probe tests are test-local; production aggregate API test/discovery/balance paths use cached `gateway::upstream_client()`.
+  - `crates/service/src/http/proxy_runtime.rs` and `crates/web/src/main.rs` build clients once into startup state, not per request.
+- Notes:
+  - No new SQLite index or migration was added; existing preference source/primary-key indexes cover the inspected plans.
+  - No feature removal was attempted; no current safe-removal proof was found.
+- Next continuation constraints:
+  - Goal remains active.
+  - Continue SQLite work only when production SQL/helper/EXPLAIN alignment or a real query-plan issue is visible.
+  - Continue client reuse only if a production/request/frequent background path repeatedly constructs a stable-config client.
+  - Continue feature removal only with current call-site evidence plus tests proving it is safe.
+## 2026-06-22 tail marker - API key quota limit delete SQL helper
+
+- Latest completed slice in this continuation:
+  - File touched: `crates/core/src/storage/api_key_quota_limits.rs`.
+  - Added helper SQL:
+    - `delete_api_key_quota_limit_by_key_sql()`.
+  - Updated production method:
+    - `upsert_api_key_quota_limit(...)` now uses the helper for `None` / non-positive quota deletion instead of inline SQL.
+  - Extended EXPLAIN coverage:
+    - `api_key_quota_limit_lookup_uses_primary_key_index` now verifies the delete-by-key path uses `sqlite_autoindex_api_key_quota_limits_1`, matching the primary-key lookup path.
+- Validation:
+  - `cargo test -p codexmanager-core api_key_quota_limit -- --nocapture` passed:
+    - 5 matching core library tests.
+    - 1 matching storage integration test.
+  - `cargo fmt` completed successfully.
+- Notes:
+  - No new SQLite index or migration was added; the table primary key already covers the inspected delete path.
+  - No feature removal was attempted; no current safe-removal proof was found.
+- Next continuation constraints:
+  - Goal remains active.
+  - Continue SQLite work only when production SQL/helper/EXPLAIN alignment or a real query-plan issue is visible.
+  - Continue client reuse only if a production/request/frequent background path repeatedly constructs a stable-config client.
+  - Continue feature removal only with current call-site evidence plus tests proving it is safe.
+## 2026-06-22 tail marker - API key update SQL helper alignment
+
+- Latest completed slice in this continuation:
+  - Files touched:
+    - `crates/core/src/storage/api_keys.rs`
+    - `crates/core/src/storage/tests/api_keys_tests.rs`
+  - Added helper SQL for API key update paths:
+    - `api_key_touch_last_used_by_hash_sql()`
+    - `api_key_update_status_by_id_sql()`
+    - `api_key_update_rotation_config_by_id_sql()`
+    - `api_key_update_name_by_id_sql()`
+    - `api_key_update_model_slug_by_id_sql()`
+    - `api_key_update_model_config_by_id_sql()`
+  - Updated production methods to use those helpers:
+    - `update_api_key_last_used(...)`
+    - `update_api_key_status(...)`
+    - `update_api_key_rotation_config(...)`
+    - `update_api_key_name(...)`
+    - `update_api_key_model_slug(...)`
+    - `update_api_key_model_config(...)`
+  - Extended EXPLAIN coverage:
+    - `api_key_lookup_helpers_use_expected_indexes` now verifies last-used hash update uses `idx_api_keys_key_hash`.
+    - The same test verifies id-scoped update helpers use `sqlite_autoindex_api_keys_1`.
+- Validation:
+  - `cargo test -p codexmanager-core api_key -- --nocapture` passed:
+    - 29 matching core library tests.
+    - 3 matching storage integration tests.
+  - `cargo fmt` completed successfully.
+- Notes:
+  - No new SQLite index or migration was added; existing key hash and primary-key indexes cover the inspected update paths.
+  - No feature removal was attempted; no current safe-removal proof was found.
+- Next continuation constraints:
+  - Goal remains active.
+  - Continue SQLite work only when production SQL/helper/EXPLAIN alignment or a real query-plan issue is visible.
+  - Continue client reuse only if a production/request/frequent background path repeatedly constructs a stable-config client.
+  - Continue feature removal only with current call-site evidence plus tests proving it is safe.
+## 2026-06-22 tail marker - model source delete SQL helper alignment
+
+- Latest completed slice in this continuation:
+  - File touched: `crates/core/src/storage/model_sources.rs`.
+  - Added helper SQL for model source delete paths:
+    - `delete_model_source_mapping_by_id_sql()`
+    - `delete_model_source_mappings_for_source_sql()`
+    - `delete_model_source_models_for_source_sql()`
+    - `delete_model_source_mapping_preference_sql()`
+    - `delete_model_source_mappings_for_platform_model_sql()`
+  - Updated production methods to use helpers:
+    - `unlink_model_source_mapping(...)`
+    - `delete_model_source_mapping(...)`
+    - `delete_model_source_routes_for_source(...)`
+    - `delete_model_source_mapping_preference(...)`
+    - `delete_model_source_routes_for_platform_model(...)`
+  - Extended EXPLAIN coverage:
+    - `model_source_lookup_queries_use_composite_indexes` now verifies delete-by-id, delete-by-source, delete-by-platform-model, and delete-preference paths use existing primary-key or composite indexes.
+- Validation:
+  - `cargo test -p codexmanager-core model_source_lookup_queries_use_composite_indexes -- --nocapture` passed:
+    - 1 matching core library test.
+  - `cargo test -p codexmanager-core model_source -- --nocapture` passed:
+    - 7 matching core library/migration tests.
+    - 2 matching storage integration tests.
+  - `cargo fmt` completed successfully.
+- Notes:
+  - No new SQLite index or migration was added; existing model source mapping/source/preference indexes cover the inspected delete paths.
+  - No feature removal was attempted; no current safe-removal proof was found.
+- Next continuation constraints:
+  - Goal remains active.
+  - Continue SQLite work only when production SQL/helper/EXPLAIN alignment or a real query-plan issue is visible.
+  - Continue client reuse only if a production/request/frequent background path repeatedly constructs a stable-config client.
+  - Continue feature removal only with current call-site evidence plus tests proving it is safe.
+## 2026-06-22 validation checkpoint - core storage continuation batch
+
+- Batch validation after the latest API key quota, API key update, and model source delete SQL helper slices:
+  - `cargo test -p codexmanager-core` passed:
+    - 322 core library tests.
+    - 7 auth integration tests.
+    - 28 storage integration tests.
+    - 1 usage integration test.
+    - 1 version integration test.
+    - doc-tests with 0 tests.
+  - `cargo fmt --check` passed.
+  - `git diff --check` passed with only LF-to-CRLF warnings.
+- Current work direction:
+  - Storage changes remain helper/EXPLAIN alignment only, with no behavior-changing index additions in this batch.
+  - HTTP client scan still shows no new production request-path stable-config client rebuild candidate beyond already cached clients.
+  - Feature removal remains intentionally blocked until current call-site evidence plus tests prove a removal is safe.
+## 2026-06-22 tail marker - shared model source delete helper reuse
+
+- Latest completed slice in this continuation:
+  - Files touched:
+    - `crates/core/src/storage/model_sources.rs`
+    - `crates/core/src/storage/accounts.rs`
+    - `crates/core/src/storage/aggregate_apis.rs`
+    - `crates/core/tests/storage.rs`
+  - Modularization change:
+    - Made source-scoped model source delete SQL helpers reusable inside the storage module:
+      - `delete_model_source_mappings_for_source_sql()`
+      - `delete_model_source_models_for_source_sql()`
+      - `delete_model_source_mapping_preferences_for_source_sql()`
+    - Updated `delete_account(...)` to reuse those helpers for `openai_account` model source cleanup.
+    - Updated `delete_aggregate_api(...)` to reuse those helpers for `aggregate_api` model source cleanup.
+  - Test coverage:
+    - Added `delete_aggregate_api_removes_aggregate_model_source_routes` storage integration test.
+    - The test verifies aggregate API deletion removes aggregate model source models, mappings, and preferences, while preserving an `openai_account` row with the same source id.
+- Validation:
+  - `cargo test -p codexmanager-core delete_aggregate_api_removes_aggregate_model_source_routes -- --nocapture` passed:
+    - 1 matching storage integration test.
+  - `cargo test -p codexmanager-core delete_account_removes_openai_model_source_routes -- --nocapture` passed:
+    - 1 matching storage integration test.
+  - `cargo test -p codexmanager-core model_source -- --nocapture` passed:
+    - 7 matching core library/migration tests.
+    - 3 matching storage integration tests.
+  - `cargo test -p codexmanager-core aggregate_api -- --nocapture` passed:
+    - 28 matching core library tests.
+    - 1 matching storage integration test.
+  - `cargo test -p codexmanager-core` passed:
+    - 322 core library tests.
+    - 7 auth integration tests.
+    - 29 storage integration tests.
+    - 1 usage integration test.
+    - 1 version integration test.
+    - doc-tests with 0 tests.
+  - `cargo fmt --check` passed.
+  - `git diff --check` passed with only LF-to-CRLF warnings.
+- Notes:
+  - No SQLite migration or new index was added; this slice reuses already-covered helper SQL and existing indexes.
+  - No feature removal was attempted; no current safe-removal proof was found.
+- Next continuation constraints:
+  - Goal remains active.
+  - Continue SQLite work only when production SQL/helper/EXPLAIN alignment or a real query-plan issue is visible.
+  - Continue client reuse only if a production/request/frequent background path repeatedly constructs a stable-config client.
+  - Continue feature removal only with current call-site evidence plus tests proving it is safe.
+## 2026-06-22 tail marker - API key delete SQL helper reuse
+
+- Latest completed slice in this continuation:
+  - Files touched:
+    - `crates/core/src/storage/api_key_quota_limits.rs`
+    - `crates/core/src/storage/api_keys.rs`
+    - `crates/core/src/storage/tests/api_keys_tests.rs`
+  - Modularization change:
+    - Made `delete_api_key_quota_limit_by_key_sql()` reusable inside the storage module.
+    - Added API key deletion helpers:
+      - `delete_api_key_secret_by_id_sql()`
+      - `delete_api_key_by_id_sql()`
+    - Updated `delete_api_key(...)` to use helper SQL for quota limit, secret, and API key row cleanup instead of inline SQL.
+  - EXPLAIN coverage:
+    - `api_key_lookup_helpers_use_expected_indexes` now verifies API key delete cleanup uses existing primary-key indexes:
+      - quota limit delete -> `sqlite_autoindex_api_key_quota_limits_1`
+      - secret delete -> `sqlite_autoindex_api_key_secrets_1`
+      - API key delete -> `sqlite_autoindex_api_keys_1`
+- Validation:
+  - `cargo test -p codexmanager-core api_key -- --nocapture` passed:
+    - 29 matching core library tests.
+    - 3 matching storage integration tests.
+  - `cargo test -p codexmanager-core` passed:
+    - 322 core library tests.
+    - 7 auth integration tests.
+    - 29 storage integration tests.
+    - 1 usage integration test.
+    - 1 version integration test.
+    - doc-tests with 0 tests.
+  - `cargo fmt --check` passed.
+  - `git diff --check` passed with only LF-to-CRLF warnings.
+- Notes:
+  - No SQLite migration or new index was added; this slice reuses already-covered helper SQL and existing primary-key indexes.
+  - No feature removal was attempted; no current safe-removal proof was found.
+- Next continuation constraints:
+  - Goal remains active.
+  - Continue SQLite work only when production SQL/helper/EXPLAIN alignment or a real query-plan issue is visible.
+  - Continue client reuse only if a production/request/frequent background path repeatedly constructs a stable-config client.
+  - Continue feature removal only with current call-site evidence plus tests proving it is safe.
+## 2026-06-22 tail marker - account cleanup helper reuse
+
+- Latest completed slices in this continuation:
+  - Conversation binding cleanup reuse:
+    - File touched: `crates/core/src/storage/accounts.rs`.
+    - Updated `delete_account(...)` to reuse `delete_conversation_bindings_for_account_sql()` instead of inline `DELETE FROM conversation_bindings WHERE account_id = ?1`.
+    - No new EXPLAIN test was needed because `conversation_bindings_tests.rs` already verifies the helper uses `idx_conversation_bindings_account_id`.
+  - Account dependent cleanup helper reuse:
+    - Files touched:
+      - `crates/core/src/storage/account_metadata.rs`
+      - `crates/core/src/storage/account_subscriptions.rs`
+      - `crates/core/src/storage/tokens.rs`
+      - `crates/core/src/storage/usage.rs`
+      - `crates/core/src/storage/accounts.rs`
+    - Added reusable storage-local delete helpers:
+      - `delete_account_metadata_for_account_sql()`
+      - `delete_account_subscription_for_account_sql()`
+      - `delete_token_for_account_sql()`
+      - `delete_usage_snapshots_for_account_sql()`
+    - Updated module-owned delete paths where applicable:
+      - `upsert_account_metadata(...)` empty metadata cleanup now uses the metadata helper.
+      - `delete_account_subscription(...)` now uses the subscription helper.
+      - `delete_account(...)` now uses all four helper SQL functions before event/conversation/model-source cleanup.
+    - Added EXPLAIN coverage for the new helper SQL paths:
+      - metadata delete -> `sqlite_autoindex_account_metadata_1` / primary-key index.
+      - subscription delete -> `sqlite_autoindex_account_subscriptions_1` / primary-key index.
+      - token delete -> `sqlite_autoindex_tokens_1` / primary-key index.
+      - usage snapshot account delete -> `idx_usage_snapshots_account_captured_id`.
+- Validation:
+  - `cargo test -p codexmanager-core conversation_binding -- --nocapture` passed:
+    - 5 matching core library tests.
+  - `cargo test -p codexmanager-core account_metadata -- --nocapture` passed:
+    - 5 matching core library tests.
+    - 1 matching storage integration test.
+  - `cargo test -p codexmanager-core account_subscription -- --nocapture` passed:
+    - 6 matching core library tests.
+    - 1 matching storage integration test.
+  - `cargo test -p codexmanager-core token_delete_uses_primary_key_index -- --nocapture` passed:
+    - 1 matching core library test.
+  - `cargo test -p codexmanager-core usage_snapshot_delete_for_account_uses_account_index -- --nocapture` passed:
+    - 1 matching core library test.
+  - `cargo test -p codexmanager-core delete_account_removes_openai_model_source_routes -- --nocapture` passed:
+    - 1 matching storage integration test.
+  - `cargo test -p codexmanager-core` passed:
+    - 326 core library tests.
+    - 7 auth integration tests.
+    - 29 storage integration tests.
+    - 1 usage integration test.
+    - 1 version integration test.
+    - doc-tests with 0 tests.
+  - `cargo fmt --check` passed.
+  - `git diff --check` passed with only LF-to-CRLF warnings.
+- Notes:
+  - No SQLite migration or new index was added; all inspected delete paths use existing primary-key or account lookup indexes.
+  - No feature removal was attempted; no current safe-removal proof was found.
+  - HTTP client scan still showed no new production request-path stable-config client rebuild candidate beyond already cached clients.
+- Next continuation constraints:
+  - Goal remains active.
+  - Continue SQLite work only when production SQL/helper/EXPLAIN alignment or a real query-plan issue is visible.
+  - Continue client reuse only if a production/request/frequent background path repeatedly constructs a stable-config client.
+  - Continue feature removal only with current call-site evidence plus tests proving it is safe.
+## 2026-06-22 tail marker - account write SQL helper alignment
+
+- Latest completed slice in this continuation:
+  - File touched: `crates/core/src/storage/accounts.rs`.
+  - Added helper SQL for account row write paths:
+    - `update_account_sort_sql()`
+    - `update_account_label_sql()`
+    - `update_account_workspace_identity_sql()`
+    - `touch_account_updated_at_sql()`
+    - `update_account_status_sql()`
+    - `update_account_status_if_changed_sql()`
+    - `delete_account_by_id_sql()`
+    - `clear_preferred_accounts_sql()`
+    - `set_preferred_account_sql()`
+    - `clear_preferred_account_by_id_sql()`
+  - Updated production methods to use those helpers:
+    - `update_account_sort(...)`
+    - `update_account_label(...)`
+    - `update_account_workspace_identity(...)`
+    - `touch_account_updated_at(...)`
+    - `update_account_status(...)`
+    - `update_account_status_if_changed(...)`
+    - `delete_account(...)`
+    - `set_preferred_account(...)`
+    - `clear_preferred_account_if(...)`
+  - Added EXPLAIN coverage:
+    - `account_write_helpers_use_primary_key_indexes` verifies id-scoped account update/delete/preferred helpers use the account primary-key index (`sqlite_autoindex_accounts_1` / equivalent index detail).
+- Validation:
+  - `cargo test -p codexmanager-core account_write_helpers_use_primary_key_indexes -- --nocapture` passed:
+    - 1 matching core library test.
+  - `cargo test -p codexmanager-core accounts -- --nocapture` passed:
+    - 73 matching core library tests.
+    - 2 matching storage integration tests.
+  - `cargo test -p codexmanager-core` passed:
+    - 327 core library tests.
+    - 7 auth integration tests.
+    - 29 storage integration tests.
+    - 1 usage integration test.
+    - 1 version integration test.
+    - doc-tests with 0 tests.
+  - `cargo fmt --check` passed.
+  - `git diff --check` passed with only LF-to-CRLF warnings.
+- Notes:
+  - No SQLite migration or new index was added; inspected id-scoped write paths use the existing account primary-key index.
+  - `clear_preferred_accounts_sql()` intentionally remains a global preferred reset and was only centralized for maintainability, not treated as a primary-key lookup.
+  - No feature removal was attempted; no current safe-removal proof was found.
+- Next continuation constraints:
+  - Goal remains active.
+  - Continue SQLite work only when production SQL/helper/EXPLAIN alignment or a real query-plan issue is visible.
+  - Continue client reuse only if a production/request/frequent background path repeatedly constructs a stable-config client.
+  - Continue feature removal only with current call-site evidence plus tests proving it is safe.
+## 2026-06-22 tail marker - aggregate API write SQL helper alignment
+
+- Latest completed slice in this continuation:
+  - File touched: `crates/core/src/storage/aggregate_apis.rs`.
+  - Added helper SQL for aggregate API row write paths:
+    - `update_aggregate_api_url_sql()`
+    - `update_aggregate_api_supplier_name_sql()`
+    - `update_aggregate_api_sort_sql()`
+    - `update_aggregate_api_status_sql()`
+    - `update_aggregate_api_provider_type_sql()`
+    - `update_aggregate_api_auth_type_sql()`
+    - `update_aggregate_api_auth_params_json_sql()`
+    - `update_aggregate_api_action_sql()`
+    - `update_aggregate_api_model_override_sql()`
+    - `update_aggregate_api_balance_query_sql()`
+    - `update_aggregate_api_balance_result_sql()`
+    - `update_aggregate_api_test_result_sql()`
+    - `update_aggregate_api_last_test_error_sql()`
+    - `delete_aggregate_api_by_id_sql()`
+  - Updated production methods to use those helpers:
+    - `update_aggregate_api(...)`
+    - `update_aggregate_api_supplier_name(...)`
+    - `update_aggregate_api_sort(...)`
+    - `update_aggregate_api_status(...)`
+    - `update_aggregate_api_type(...)`
+    - `update_aggregate_api_auth_type(...)`
+    - `update_aggregate_api_auth_params_json(...)`
+    - `update_aggregate_api_action(...)`
+    - `update_aggregate_api_model_override(...)`
+    - `update_aggregate_api_balance_query(...)`
+    - `update_aggregate_api_balance_result(...)`
+    - `update_aggregate_api_test_result(...)`
+    - `delete_aggregate_api(...)`
+  - Added EXPLAIN coverage:
+    - `aggregate_api_write_helpers_use_primary_key_indexes` verifies id-scoped aggregate API update/delete helpers use the aggregate API primary-key index (`sqlite_autoindex_aggregate_apis_1` / equivalent index detail).
+- Validation:
+  - `cargo test -p codexmanager-core aggregate_api_write_helpers_use_primary_key_indexes -- --nocapture` passed:
+    - 1 matching core library test.
+  - `cargo test -p codexmanager-core aggregate_api -- --nocapture` passed:
+    - 29 matching core library tests.
+    - 1 matching storage integration test.
+  - `cargo test -p codexmanager-core` passed:
+    - 328 core library tests.
+    - 7 auth integration tests.
+    - 29 storage integration tests.
+    - 1 usage integration test.
+    - 1 version integration test.
+    - doc-tests with 0 tests.
+  - `cargo fmt --check` passed.
+  - `git diff --check` passed with only LF-to-CRLF warnings.
+- Notes:
+  - No SQLite migration or new index was added; inspected id-scoped aggregate API write paths use the existing aggregate API primary-key index.
+  - This slice intentionally did not touch aggregate API secrets/supplier model tables except preserving existing delete order in `delete_aggregate_api(...)`.
+  - No feature removal was attempted; no current safe-removal proof was found.
+- Next continuation constraints:
+  - Goal remains active.
+  - Continue SQLite work only when production SQL/helper/EXPLAIN alignment or a real query-plan issue is visible.
+  - Continue client reuse only if a production/request/frequent background path repeatedly constructs a stable-config client.
+  - Continue feature removal only with current call-site evidence plus tests proving it is safe.
+## 2026-06-22 tail marker - model group SQL helper alignment
+
+- Latest completed slice in this continuation:
+  - File touched: `crates/core/src/storage/model_groups.rs`.
+  - Reused/added storage-local SQL helpers around model group read and write/delete paths:
+    - `model_group_list_sql()`
+    - `model_group_models_list_sql()`
+    - `model_group_models_for_group_sql()`
+    - `user_model_groups_list_sql()`
+    - `user_model_groups_for_user_sql()`
+    - `delete_user_model_groups_for_group_sql()`
+    - `delete_model_group_models_for_platform_model_sql()`
+    - `clear_other_default_model_groups_sql()`
+    - `delete_non_default_model_group_by_id_sql()`
+    - `delete_model_group_models_for_group_sql()`
+    - `allowed_model_slugs_for_user_sql()`
+    - `model_group_access_for_user_sql()`
+  - Updated production methods to use the helpers without changing behavior:
+    - `delete_model_group_model_references(...)`
+    - `list_model_groups(...)`
+    - `upsert_model_group(...)` for default clearing SQL only
+    - `delete_model_group(...)`
+    - `list_model_group_models(...)`
+    - `list_model_group_models_for_group(...)`
+    - `replace_model_group_models(...)`
+    - `list_user_model_groups(...)`
+    - `list_user_model_groups_for_user(...)`
+    - `replace_user_model_groups_for_group(...)`
+    - `allowed_model_slugs_for_user(...)`
+    - `resolve_model_group_access_for_user(...)`
+  - Added EXPLAIN coverage:
+    - `model_group_write_delete_helpers_use_existing_lookup_indexes` verifies:
+      - group-scoped model deletes use `sqlite_autoindex_model_group_models_1`.
+      - platform-model reference deletes use `idx_model_group_models_model`.
+      - non-default model group deletes use `sqlite_autoindex_model_groups_1`.
+  - Existing model group EXPLAIN coverage remains in place for list ordering, per-user assignments, access joins, and user assignment cleanup.
+- Validation:
+  - `cargo test -p codexmanager-core model_group -- --nocapture` passed:
+    - 10 matching core library tests.
+    - 1 matching storage integration test.
+  - `cargo test -p codexmanager-core` passed:
+    - 329 core library tests.
+    - 7 auth integration tests.
+    - 29 storage integration tests.
+    - 1 usage integration test.
+    - 1 version integration test.
+    - doc-tests with 0 tests.
+  - `cargo fmt --check` passed.
+  - `git diff --check` passed with only LF-to-CRLF warnings.
+- Notes:
+  - No SQLite migration or new index was added; inspected write/delete paths use existing indexes.
+  - `clear_other_default_model_groups_sql()` intentionally preserves the original broad `id <> ?1` semantics and is centralized for maintainability only; no index claim was added for that path.
+  - No feature removal was attempted; no current safe-removal proof was found.
+- Next continuation constraints:
+  - Goal remains active.
+  - Continue SQLite work only when production SQL/helper/EXPLAIN alignment or a real query-plan issue is visible.
+  - Continue client reuse only if a production/request/frequent background path repeatedly constructs a stable-config client.
+  - Continue feature removal only with current call-site evidence plus tests proving it is safe.
+## 2026-06-22 tail marker - model catalog delete SQL helper alignment
+
+- Latest completed slice in this continuation:
+  - File touched: `crates/core/src/storage/model_options.rs`.
+  - Added storage-local SQL helpers for model catalog delete paths:
+    - `delete_model_catalog_model_sql()`
+    - `delete_model_catalog_reasoning_levels_sql()`
+    - `delete_model_catalog_string_items_sql()`
+    - `delete_model_catalog_string_item_kinds_sql(...)`
+  - Updated production methods to use the helpers without changing behavior:
+    - `delete_model_catalog_model(...)`
+    - `delete_model_catalog_reasoning_levels(...)`
+    - `delete_model_catalog_string_items(...)`
+    - `delete_model_catalog_string_item_kinds(...)`
+  - Added EXPLAIN coverage:
+    - `model_catalog_delete_helpers_use_existing_lookup_indexes` verifies:
+      - model catalog model delete uses an existing model catalog lookup index.
+      - reasoning level delete uses either `idx_model_catalog_reasoning_levels_scope_sort` or the reasoning-level primary-key autoindex, matching SQLite's chosen plan.
+      - string item delete helpers use either `sqlite_autoindex_model_catalog_string_items_1` or `idx_model_catalog_string_items_scope_kind_sort`, matching SQLite's chosen plan for single-kind and multi-kind deletes.
+- Validation:
+  - `cargo test -p codexmanager-core model_catalog -- --nocapture` passed:
+    - 18 matching core library/migration tests.
+  - `cargo test -p codexmanager-core` passed:
+    - 330 core library tests.
+    - 7 auth integration tests.
+    - 29 storage integration tests.
+    - 1 usage integration test.
+    - 1 version integration test.
+    - doc-tests with 0 tests.
+  - `cargo fmt --check` passed.
+  - `git diff --check` passed with only LF-to-CRLF warnings.
+- Notes:
+  - No SQLite migration or new index was added; inspected delete paths use existing indexes.
+  - EXPLAIN assertions intentionally accept SQLite's actual choice between primary-key autoindexes and existing scope/order lookup indexes where both are valid.
+  - No feature removal was attempted; no current safe-removal proof was found.
+- Next continuation constraints:
+  - Goal remains active.
+  - Continue SQLite work only when production SQL/helper/EXPLAIN alignment or a real query-plan issue is visible.
+  - Continue client reuse only if a production/request/frequent background path repeatedly constructs a stable-config client.
+  - Continue feature removal only with current call-site evidence plus tests proving it is safe.
+## 2026-06-22 tail marker - plugin install delete SQL helper alignment
+
+- Latest completed slice in this continuation:
+  - File touched: `crates/core/src/storage/plugins.rs`.
+  - Added storage-local SQL helpers for plugin install cleanup/delete paths:
+    - `delete_plugin_tasks_for_plugin_sql()`
+    - `delete_plugin_install_by_id_sql()`
+  - Updated production methods to use the helpers without changing behavior:
+    - `replace_plugin_install(...)` now uses `delete_plugin_tasks_for_plugin_sql()` before re-inserting tasks.
+    - `delete_plugin_install(...)` now uses both delete helpers.
+  - Added EXPLAIN coverage:
+    - `plugin_install_delete_helpers_use_existing_lookup_indexes` verifies:
+      - plugin task cleanup uses an existing `plugin_id` lookup index (`idx_plugin_tasks_plugin_id_enabled_next_run_at` or `idx_plugin_tasks_plugin_list_order`).
+      - plugin install delete uses the primary-key autoindex `sqlite_autoindex_plugin_installs_1`.
+- Validation:
+  - `cargo test -p codexmanager-core plugin -- --nocapture` passed:
+    - 27 matching core library tests.
+  - `cargo test -p codexmanager-core` passed:
+    - 331 core library tests.
+    - 7 auth integration tests.
+    - 29 storage integration tests.
+    - 1 usage integration test.
+    - 1 version integration test.
+    - doc-tests with 0 tests.
+  - `cargo fmt --check` passed.
+  - `git diff --check` passed with only LF-to-CRLF warnings.
+- Notes:
+  - No SQLite migration or new index was added; inspected cleanup/delete paths use existing indexes.
+  - No feature removal was attempted; no current safe-removal proof was found.
+- Next continuation constraints:
+  - Goal remains active.
+  - Continue SQLite work only when production SQL/helper/EXPLAIN alignment or a real query-plan issue is visible.
+  - Continue client reuse only if a production/request/frequent background path repeatedly constructs a stable-config client.
+  - Continue feature removal only with current call-site evidence plus tests proving it is safe.
+## 2026-06-22 tail marker - quota pool delete SQL helper alignment
+
+- Latest completed slice in this continuation:
+  - File touched: `crates/core/src/storage/quota_pools.rs`.
+  - Added storage-local SQL helpers for quota cleanup/delete paths:
+    - `delete_quota_source_model_assignments_for_source_sql()`
+    - `delete_account_quota_capacity_override_sql()`
+  - Updated production methods to use the helpers without changing behavior:
+    - `set_quota_source_model_assignments(...)` now uses the assignment cleanup helper before re-inserting normalized model slugs.
+    - `upsert_account_quota_capacity_override(...)` now uses the account override delete helper when both override windows normalize to `None`.
+  - Added EXPLAIN coverage:
+    - `quota_pool_delete_helpers_use_existing_lookup_indexes` verifies:
+      - source-scoped assignment cleanup uses an existing source/primary-key lookup index (`idx_quota_source_model_assignments_source` or the primary-key autoindex).
+      - account override delete uses the primary-key autoindex `sqlite_autoindex_account_quota_capacity_overrides`.
+- Validation:
+  - `cargo test -p codexmanager-core quota -- --nocapture` passed:
+    - 27 matching core library tests.
+    - 1 matching storage integration test.
+  - `cargo test -p codexmanager-core` passed:
+    - 332 core library tests.
+    - 7 auth integration tests.
+    - 29 storage integration tests.
+    - 1 usage integration test.
+    - 1 version integration test.
+    - doc-tests with 0 tests.
+  - `cargo fmt` passed.
+  - `cargo fmt --check` passed.
+  - `git diff --check` passed with only LF-to-CRLF warnings.
+- Notes:
+  - No SQLite migration or new index was added; inspected delete paths use existing indexes.
+  - No feature removal was attempted; no current safe-removal proof was found.
+- Next continuation constraints:
+  - Goal remains active.
+  - Continue SQLite work only when production SQL/helper/EXPLAIN alignment or a real query-plan issue is visible.
+  - Continue client reuse only if a production/request/frequent background path repeatedly constructs a stable-config client.
+  - Continue feature removal only with current call-site evidence plus tests proving it is safe.
+## 2026-06-22 tail marker - app user delete SQL helper alignment
+
+- Latest completed slice in this continuation:
+  - File touched: `crates/core/src/storage/account_manager.rs`.
+  - Added storage-local SQL helpers for app-user deletion and dependent cleanup paths:
+    - `delete_api_key_owners_for_user_sql()`
+    - `delete_app_user_sessions_for_user_sql()`
+    - `delete_user_model_groups_for_user_sql()`
+    - `delete_app_wallet_ledger_entries_for_user_wallets_sql()`
+    - `delete_app_wallets_for_user_sql()`
+    - `delete_app_user_by_id_sql()`
+  - Updated production method `delete_app_user(...)` to use those helpers without changing delete order or behavior.
+  - Expanded EXPLAIN coverage in `app_user_delete_dependent_paths_use_lookup_indexes` to verify helper SQL uses existing lookup paths:
+    - API key owners use `idx_api_key_owners_user_key_lookup`.
+    - App sessions use `idx_app_user_sessions_user_id`.
+    - User model groups use `idx_user_model_groups_user_status`.
+    - User wallets and the wallet subquery use `sqlite_autoindex_app_wallets_2`.
+    - Wallet ledger cleanup uses `idx_app_wallet_ledger_wallet_created`.
+    - Final app-user delete uses `sqlite_autoindex_app_users_1`.
+- Validation:
+  - `cargo test -p codexmanager-core app_user_delete_dependent_paths_use_lookup_indexes -- --nocapture` passed:
+    - 1 matching core library test.
+  - `cargo test -p codexmanager-core account_manager -- --nocapture` passed:
+    - 31 matching core library tests.
+  - `cargo test -p codexmanager-core` passed:
+    - 332 core library tests.
+    - 7 auth integration tests.
+    - 29 storage integration tests.
+    - 1 usage integration test.
+    - 1 version integration test.
+    - doc-tests with 0 tests.
+  - `cargo fmt` passed.
+  - `cargo fmt --check` passed.
+  - `git diff --check` passed with only LF-to-CRLF warnings.
+- Notes:
+  - No SQLite migration or new index was added; inspected delete paths use existing indexes.
+  - No feature removal was attempted; no current safe-removal proof was found.
+- Next continuation constraints:
+  - Goal remains active.
+  - Continue SQLite work only when production SQL/helper/EXPLAIN alignment or a real query-plan issue is visible.
+  - Continue client reuse only if a production/request/frequent background path repeatedly constructs a stable-config client.
+  - Continue feature removal only with current call-site evidence plus tests proving it is safe.
+## 2026-06-22 tail marker - usage snapshot prune SQL helper alignment
+
+- Latest completed slice in this continuation:
+  - File touched: `crates/core/src/storage/usage.rs`.
+  - Added storage-local SQL helpers for usage snapshot pruning paths:
+    - `prune_usage_snapshots_for_account_sql()`
+    - `prune_usage_snapshots_all_accounts_sql()`
+  - Updated production methods to use the helpers without changing behavior:
+    - `prune_usage_snapshots_for_account(...)`
+    - `prune_usage_snapshots_all_accounts(...)`
+  - Added EXPLAIN coverage:
+    - `usage_snapshot_prune_helpers_use_existing_indexes` verifies:
+      - account-scoped snapshot pruning uses `idx_usage_snapshots_account_captured_id`.
+      - global per-account retention pruning uses `idx_usage_snapshots_account_captured_id` for the window ordering path.
+- Validation:
+  - `cargo test -p codexmanager-core usage_snapshot_prune_helpers_use_existing_indexes -- --nocapture` passed:
+    - 1 matching core library test.
+  - `cargo test -p codexmanager-core usage -- --nocapture` passed:
+    - 40 matching core library tests.
+    - 4 matching storage integration tests.
+    - 1 usage integration test.
+  - `cargo test -p codexmanager-core` passed:
+    - 333 core library tests.
+    - 7 auth integration tests.
+    - 29 storage integration tests.
+    - 1 usage integration test.
+    - 1 version integration test.
+    - doc-tests with 0 tests.
+  - `cargo fmt` passed.
+  - `cargo fmt --check` passed.
+  - `git diff --check` passed with only LF-to-CRLF warnings.
+- Notes:
+  - No SQLite migration or new index was added; inspected prune paths use existing indexes.
+  - No feature removal was attempted; no current safe-removal proof was found.
+- Next continuation constraints:
+  - Goal remains active.
+  - Continue SQLite work only when production SQL/helper/EXPLAIN alignment or a real query-plan issue is visible.
+  - Continue client reuse only if a production/request/frequent background path repeatedly constructs a stable-config client.
+  - Continue feature removal only with current call-site evidence plus tests proving it is safe.
+## 2026-06-22 tail marker - request log prune SQL helper alignment
+
+- Latest completed slice in this continuation:
+  - Files touched:
+    - `crates/core/src/storage/request_logs.rs`
+    - `crates/core/src/storage/tests/request_logs_tests.rs`
+  - Added storage-local SQL helpers for request log cleanup/prune paths:
+    - `clear_request_logs_sql()`
+    - `prune_request_logs_before_sql()`
+  - Updated production methods to use the helpers without changing behavior:
+    - `clear_request_logs(...)`
+    - `prune_request_logs_before(...)`
+  - Added EXPLAIN coverage:
+    - `request_log_prune_helper_uses_created_at_index` verifies time-based log pruning uses an existing created-at index (`idx_request_logs_created_at_id` or `idx_request_logs_created_at`).
+- Validation:
+  - `cargo test -p codexmanager-core request_log_prune_helper_uses_created_at_index -- --nocapture` passed:
+    - 1 matching core library test.
+  - `cargo test -p codexmanager-core request_log -- --nocapture` passed:
+    - 39 matching core library tests.
+    - 4 matching storage integration tests.
+  - `cargo test -p codexmanager-core` passed:
+    - 334 core library tests.
+    - 7 auth integration tests.
+    - 29 storage integration tests.
+    - 1 usage integration test.
+    - 1 version integration test.
+    - doc-tests with 0 tests.
+  - `cargo fmt` passed.
+  - `cargo fmt --check` passed.
+  - `git diff --check` passed with only LF-to-CRLF warnings.
+- Notes:
+  - No SQLite migration or new index was added; inspected prune path uses existing created-at indexes.
+  - `clear_request_logs_sql()` is centralized for maintainability only; full-table cleanup has no targeted lookup-index claim.
+  - No feature removal was attempted; no current safe-removal proof was found.
+- Next continuation constraints:
+  - Goal remains active.
+  - Continue SQLite work only when production SQL/helper/EXPLAIN alignment or a real query-plan issue is visible.
+  - Continue client reuse only if a production/request/frequent background path repeatedly constructs a stable-config client.
+  - Continue feature removal only with current call-site evidence plus tests proving it is safe.
+## 2026-06-22 tail marker - upstream client reuse audit
+
+- Latest completed slice in this continuation:
+  - Scope: read-only audit of current upstream/client construction paths in `crates/service`, `crates/web`, and `apps/src-tauri`.
+  - Scan command:
+    - `rg -n "Client::new\(|Client::builder\(|reqwest::Client|reqwest::blocking::Client|build_.*client|\.client\(" .\crates\service .\crates\web .\apps\src-tauri --glob "*.rs"`
+  - Findings from current code:
+    - Gateway upstream clients in `crates/service/src/gateway/core/runtime_config.rs` are cached behind `OnceLock<RwLock<...>>` and refreshed only on runtime config/proxy changes.
+    - `fresh_upstream_client_for_account(...)` and `fresh_async_upstream_client_for_account(...)` return cached retry clients or cached per-account proxy-pool clients; they do not build a new client per request.
+    - Account warmup, model picker, usage/subscription HTTP, auth token, plugin HTTP, web service probe, Tauri updater, and web app-state clients all use a cache, startup construction, or config-change rebuild pattern.
+    - `aggregate_api.rs`, `gateway/upstream/attempt_flow/transport.rs`, `gateway/upstream/attempt_flow/postprocess.rs`, and `gateway/upstream/protocol/aggregate_api.rs` `Client::new`/`Client::builder` hits inspected in this pass are test-only or receive clients from the cached gateway path in production.
+  - Code changes:
+    - None. No production high-frequency stable-config path was found that still repeatedly constructs a new upstream client.
+- Validation:
+  - `cargo test -p codexmanager-service upstream_client -- --nocapture` passed:
+    - 5 matching service library tests covering default, async, proxy-pool, and retry upstream client reuse.
+  - `cargo test -p codexmanager-service model_picker_client_reuses_cached_client_until_config_changes -- --nocapture` passed:
+    - 1 matching service library test.
+  - `cargo test -p codexmanager-service warmup_client_reuses_cached_client_for_stable_config -- --nocapture` passed:
+    - 1 matching service library test.
+- Notes:
+  - No feature removal was attempted; no current safe-removal proof was found.
+  - Continue client reuse work only if a future scan finds a production/request/frequent background path that repeatedly constructs clients under stable config.
+- Next continuation constraints:
+  - Goal remains active.
+  - Continue SQLite work only when production SQL/helper/EXPLAIN alignment or a real query-plan issue is visible.
+  - Continue feature removal only with current call-site evidence plus tests proving it is safe.
+  - If revisiting client reuse, prefer current-code evidence over stale assumptions and verify with focused service tests.
+## 2026-06-22 tail marker - aggregate API delete SQL helper alignment
+
+- Latest completed slice in this continuation:
+  - File touched: `crates/core/src/storage/aggregate_apis.rs`.
+  - Added storage-local SQL helpers for aggregate API delete paths:
+    - `delete_aggregate_api_secret_by_id_sql()`
+    - `delete_aggregate_api_balance_secret_by_id_sql()`
+    - `delete_aggregate_api_supplier_model_sql()`
+  - Updated production methods to use those helpers without changing behavior:
+    - `delete_aggregate_api(...)` now uses helper SQL for balance-secret and secret cleanup before model-source cleanup and final aggregate API deletion.
+    - `delete_aggregate_api_balance_secret(...)` now uses the shared balance-secret delete helper.
+    - `delete_aggregate_api_supplier_model(...)` now uses the supplier-model delete helper.
+  - Expanded EXPLAIN coverage in `aggregate_api_write_helpers_use_primary_key_indexes` to verify helper SQL uses existing lookup indexes:
+    - Aggregate API secrets use `sqlite_autoindex_aggregate_api_secrets_1`.
+    - Aggregate API balance secrets use `sqlite_autoindex_aggregate_api_balance_secrets_1`.
+    - Aggregate API supplier model deletion uses `sqlite_autoindex_aggregate_api_supplier_models_1`.
+- Validation:
+  - `cargo test -p codexmanager-core aggregate_api_write_helpers_use_primary_key_indexes -- --nocapture` passed:
+    - 1 matching core library test.
+  - `cargo test -p codexmanager-core aggregate_api -- --nocapture` passed:
+    - 29 matching core library tests.
+    - 1 matching storage integration test.
+  - `cargo fmt` passed.
+  - `cargo fmt --check` passed.
+- Notes:
+  - No SQLite migration or new index was added; inspected delete paths use existing primary-key indexes.
+  - No feature removal was attempted; no current safe-removal proof was found.
+- Next continuation constraints:
+  - Goal remains active.
+  - Continue SQLite work only when production SQL/helper/EXPLAIN alignment or a real query-plan issue is visible.
+  - Continue client reuse only if a production/request/frequent background path repeatedly constructs a stable-config client.
+  - Continue feature removal only with current call-site evidence plus tests proving it is safe.
+## 2026-06-22 tail marker - app user/session write SQL helper alignment
+
+- Latest completed slice in this continuation:
+  - File touched: `crates/core/src/storage/account_manager.rs`.
+  - Added storage-local SQL helpers for app user, app session, and billing-rule write paths:
+    - `app_user_exists_sql()`
+    - `update_app_user_last_login_sql()`
+    - `update_app_user_status_sql()`
+    - `update_app_user_role_sql()`
+    - `update_app_user_display_name_sql()`
+    - `update_app_user_password_hash_sql()`
+    - `touch_app_user_session_sql()`
+    - `revoke_app_user_session_by_token_hash_sql()`
+    - `delete_billing_rule_by_id_sql()`
+  - Updated production methods to use those helpers without changing behavior:
+    - `app_user_exists(...)`
+    - app-user update methods for last login, status, role, display name, and password hash.
+    - `touch_app_user_session(...)`
+    - `revoke_app_user_session_by_token_hash(...)`
+    - `delete_billing_rule(...)`
+  - Updated EXPLAIN coverage:
+    - `app_session_token_paths_use_token_hash_index` now verifies the production revoke helper SQL instead of a duplicated inline SQL string.
+    - Added `app_user_write_helpers_use_primary_key_indexes` to verify app-user writes use `sqlite_autoindex_app_users_1`, session touch uses `sqlite_autoindex_app_user_sessions_1`, and billing-rule delete uses `sqlite_autoindex_billing_rules_1`.
+- Validation:
+  - `cargo test -p codexmanager-core app_user_write_helpers_use_primary_key_indexes -- --nocapture` passed:
+    - 1 matching core library test.
+  - `cargo test -p codexmanager-core account_manager -- --nocapture` passed:
+    - 32 matching core library tests.
+  - `cargo fmt` passed.
+- Notes:
+  - No SQLite migration or new index was added; inspected write paths use existing primary-key/token lookup indexes.
+  - No feature removal was attempted; no current safe-removal proof was found.
+- Next continuation constraints:
+  - Goal remains active.
+  - Continue SQLite work only when production SQL/helper/EXPLAIN alignment or a real query-plan issue is visible.
+  - Continue client reuse only if a production/request/frequent background path repeatedly constructs a stable-config client.
+  - Continue feature removal only with current call-site evidence plus tests proving it is safe.
+## 2026-06-22 tail marker - model source stale route delete SQL helper alignment
+
+- Latest completed slice in this continuation:
+  - File touched: `crates/core/src/storage/model_sources.rs`.
+  - Added storage-local SQL helpers for stale discovered model cleanup:
+    - `delete_model_source_mappings_for_source_upstream_sql()`
+    - `delete_model_source_model_for_source_discovery_upstream_sql()`
+  - Updated production method `upsert_discovered_source_models(...)` to use helper SQL when pruning stale discovered routes:
+    - source/upstream mappings now use `delete_model_source_mappings_for_source_upstream_sql()`.
+    - source/upstream/discovery model rows now use `delete_model_source_model_for_source_discovery_upstream_sql()`.
+    - mapping preferences now reuse existing `delete_model_source_mapping_preference_sql()` instead of a duplicated inline delete statement.
+  - Expanded EXPLAIN coverage in `model_source_lookup_queries_use_composite_indexes` to verify helper SQL uses existing lookup paths:
+    - source/upstream mapping cleanup uses `idx_model_source_mappings_source` or the unique mapping autoindex.
+    - source/upstream/discovery model cleanup uses `idx_model_source_models_source_status_upstream` or the model primary-key autoindex.
+- Validation:
+  - `cargo test -p codexmanager-core model_source_lookup_queries_use_composite_indexes -- --nocapture` passed:
+    - 1 matching core library test.
+  - `cargo test -p codexmanager-core model_source -- --nocapture` passed:
+    - 7 matching core library tests.
+    - 3 matching storage integration tests.
+  - `cargo test -p codexmanager-core` passed:
+    - 335 core library tests.
+    - 7 auth integration tests.
+    - 29 storage integration tests.
+    - 1 usage integration test.
+    - 1 version integration test.
+    - doc-tests with 0 tests.
+  - `cargo fmt` passed.
+  - `cargo fmt --check` passed.
+  - `git diff --check` passed with only LF-to-CRLF warnings.
+- Notes:
+  - No SQLite migration or new index was added; inspected stale cleanup paths use existing indexes.
+  - No feature removal was attempted; no current safe-removal proof was found.
+- Next continuation constraints:
+  - Goal remains active.
+  - Continue SQLite work only when production SQL/helper/EXPLAIN alignment or a real query-plan issue is visible.
+  - Continue client reuse only if a production/request/frequent background path repeatedly constructs a stable-config client.
+  - Continue feature removal only with current call-site evidence plus tests proving it is safe.
+## 2026-06-22 tail marker - default model group prune SQL helper alignment
+
+- Latest completed slice in this continuation:
+  - File touched: `crates/core/src/storage/model_groups.rs`.
+  - Added storage-local SQL helper for the default model-group bootstrap cleanup path:
+    - `prune_default_model_group_models_not_in_catalog_sql()`
+  - Updated production method `prune_default_model_group_models_not_in_catalog(...)` to use the helper without changing behavior.
+  - Expanded EXPLAIN coverage in `model_group_write_delete_helpers_use_existing_lookup_indexes` to verify default model-group pruning uses existing lookup paths:
+    - model-group model cleanup uses `sqlite_autoindex_model_group_models_1`.
+    - default-group lookup uses `idx_model_groups_default` or the model-group primary-key autoindex.
+    - model catalog filtering uses `idx_model_catalog_models_scope_supported_in_api` or the model catalog primary-key autoindex.
+- Validation:
+  - `cargo test -p codexmanager-core model_group_write_delete_helpers_use_existing_lookup_indexes -- --nocapture` passed:
+    - 1 matching core library test.
+  - `cargo test -p codexmanager-core model_group -- --nocapture` passed:
+    - 10 matching core library tests.
+    - 1 matching storage integration test.
+  - `cargo test -p codexmanager-core` passed:
+    - 335 core library tests.
+    - 7 auth integration tests.
+    - 29 storage integration tests.
+    - 1 usage integration test.
+    - 1 version integration test.
+    - doc-tests with 0 tests.
+  - `cargo fmt --check` passed.
+  - `git diff --check` passed with only LF-to-CRLF warnings.
+- Notes:
+  - No SQLite migration or new index was added; inspected bootstrap prune path uses existing indexes.
+  - No feature removal was attempted; no current safe-removal proof was found.
+- Next continuation constraints:
+  - Goal remains active.
+  - Continue SQLite work only when production SQL/helper/EXPLAIN alignment or a real query-plan issue is visible.
+  - Continue client reuse only if a production/request/frequent background path repeatedly constructs a stable-config client.
+  - Continue feature removal only with current call-site evidence plus tests proving it is safe.
+## 2026-06-22 tail marker - plugin task write SQL helper alignment
+
+- Latest completed slice in this continuation:
+  - File touched: `crates/core/src/storage/plugins.rs`.
+  - Added storage-local SQL helpers for plugin task write/update paths:
+    - `repair_plugin_task_schedules_sql(plugin_filter: bool)`
+    - `update_plugin_task_enabled_sql()`
+    - `update_plugin_task_definition_sql()`
+    - `update_plugin_task_schedule_sql()`
+  - Updated production methods to use those helpers without changing behavior:
+    - `repair_plugin_task_schedules(...)`
+    - `set_plugin_task_enabled(...)`
+    - `update_plugin_task_definition(...)`
+    - `update_plugin_task_schedule(...)`
+  - Added EXPLAIN coverage:
+    - `plugin_task_write_helpers_use_expected_indexes` verifies id-scoped task updates use `sqlite_autoindex_plugin_tasks_1`.
+    - scoped schedule repair uses `idx_plugin_tasks_plugin_id_enabled_next_run_at` or `idx_plugin_tasks_plugin_list_order`.
+    - global schedule repair uses `idx_plugin_tasks_due_lookup` or `idx_plugin_tasks_list_order`.
+- Validation:
+  - `cargo test -p codexmanager-core plugin_task_write_helpers_use_expected_indexes -- --nocapture` passed:
+    - 1 matching core library test.
+  - `cargo test -p codexmanager-core plugin -- --nocapture` passed:
+    - 28 matching core library tests.
+  - `cargo test -p codexmanager-core` passed:
+    - 336 core library tests.
+    - 7 auth integration tests.
+    - 29 storage integration tests.
+    - 1 usage integration test.
+    - 1 version integration test.
+    - doc-tests with 0 tests.
+  - `cargo fmt` passed.
+  - `cargo fmt --check` passed.
+  - `git diff --check` passed with only LF-to-CRLF warnings.
+- Notes:
+  - No SQLite migration or new index was added; inspected plugin task update paths use existing indexes.
+  - No feature removal was attempted; no current safe-removal proof was found.
+- Next continuation constraints:
+  - Goal remains active.
+  - Continue SQLite work only when production SQL/helper/EXPLAIN alignment or a real query-plan issue is visible.
+  - Continue client reuse only if a production/request/frequent background path repeatedly constructs a stable-config client.
+  - Continue feature removal only with current call-site evidence plus tests proving it is safe.
+## 2026-06-22 tail marker - login session SQL helper alignment
+
+- Latest completed slice in this continuation:
+  - File touched: `crates/core/src/storage/mod.rs`.
+  - Added storage-local SQL helpers for login-session read/write paths:
+    - `login_session_select_columns()`
+    - `insert_login_session_sql()`
+    - `login_session_by_id_sql()`
+    - `update_login_session_status_sql()`
+    - `update_login_session_code_verifier_sql()`
+  - Updated production methods to use those helpers without changing behavior:
+    - `insert_login_session(...)`
+    - `get_login_session(...)`
+    - `update_login_session_status(...)`
+    - `update_login_session_code_verifier(...)`
+  - Added EXPLAIN coverage:
+    - `login_session_primary_key_helpers_use_primary_key_index` verifies lookup and update helpers use `sqlite_autoindex_login_sessions_1`.
+- Validation:
+  - `cargo test -p codexmanager-core login_session_primary_key_helpers_use_primary_key_index -- --nocapture` passed:
+    - 1 matching core library test.
+  - `cargo test -p codexmanager-core login_session -- --nocapture` passed:
+    - 1 matching core library test.
+    - 1 matching storage integration test.
+  - `cargo fmt` passed.
+  - `cargo fmt --check` passed.
+  - `cargo test -p codexmanager-core` passed:
+    - 337 core library tests.
+    - 7 auth integration tests.
+    - 29 storage integration tests.
+    - 1 usage integration test.
+    - 1 version integration test.
+    - doc-tests with 0 tests.
+  - `git diff --check` passed with only LF-to-CRLF warnings.
+- Notes:
+  - No SQLite migration or new index was added; inspected login-session paths use the existing primary-key index.
+  - No feature removal was attempted; no current safe-removal proof was found.
+- Next continuation constraints:
+  - Goal remains active.
+  - Continue SQLite work only when production SQL/helper/EXPLAIN alignment or a real query-plan issue is visible.
+  - Continue client reuse only if a production/request/frequent background path repeatedly constructs a stable-config client.
+  - Continue feature removal only with current call-site evidence plus tests proving it is safe.
+## 2026-06-22 tail marker - app username exists SQL helper alignment
+
+- Latest completed slice in this continuation:
+  - File touched: `crates/core/src/storage/account_manager.rs`.
+  - Added storage-local SQL helper for username existence checks:
+    - `app_username_exists_sql()`
+  - Updated production method `app_username_exists(...)` to use the helper without changing behavior.
+  - Expanded EXPLAIN coverage:
+    - `username_lookup_uses_lower_username_index` now verifies both `app_user_by_username_sql()` and `app_username_exists_sql()` use `idx_app_users_lower_username`.
+    - The EXISTS plan must collect all EXPLAIN rows because SQLite reports `SCAN CONSTANT ROW` before the scalar subquery detail.
+- Validation:
+  - `cargo test -p codexmanager-core username_lookup_uses_lower_username_index -- --nocapture` passed:
+    - 1 matching core library test.
+  - `cargo test -p codexmanager-core account_manager -- --nocapture` passed:
+    - 32 matching core library tests.
+  - `cargo fmt` passed.
+  - `cargo fmt --check` passed.
+  - `cargo test -p codexmanager-core` passed:
+    - 337 core library tests.
+    - 7 auth integration tests.
+    - 29 storage integration tests.
+    - 1 usage integration test.
+    - 1 version integration test.
+    - doc-tests with 0 tests.
+  - `git diff --check` passed with only LF-to-CRLF warnings.
+- Notes:
+  - No SQLite migration or new index was added; inspected username-exists path uses the existing lower(username) index.
+  - No feature removal was attempted; no current safe-removal proof was found.
+- Next continuation constraints:
+  - Goal remains active.
+  - Continue SQLite work only when production SQL/helper/EXPLAIN alignment or a real query-plan issue is visible.
+  - Continue client reuse only if a production/request/frequent background path repeatedly constructs a stable-config client.
+  - Continue feature removal only with current call-site evidence plus tests proving it is safe.

@@ -1,5 +1,6 @@
 use super::{RequestLog, RequestTokenStat, Storage};
 use crate::storage::request_log_filters;
+use rusqlite::{params_from_iter, types::Value};
 
 /// 函数 `collect_query_plan_details`
 ///
@@ -13,9 +14,13 @@ use crate::storage::request_log_filters;
 ///
 /// # 返回
 /// 返回函数执行结果
-fn collect_query_plan_details(storage: &Storage, sql: &str) -> Vec<String> {
+fn collect_query_plan_details_with_params(
+    storage: &Storage,
+    sql: &str,
+    params: Vec<Value>,
+) -> Vec<String> {
     let mut stmt = storage.conn.prepare(sql).expect("prepare explain");
-    let mut rows = stmt.query([]).expect("query explain");
+    let mut rows = stmt.query(params_from_iter(params)).expect("query explain");
     let mut details = Vec::new();
     while let Some(row) = rows.next().expect("next explain row") {
         let detail: String = row.get(3).expect("detail");
@@ -30,6 +35,61 @@ fn query_plan_uses_index(details: &[String], index_name: &str) -> bool {
         let padded = format!(" {detail} ");
         padded.contains(&needle)
     })
+}
+
+fn request_log_list_plan_for_query(
+    storage: &Storage,
+    query: Option<&str>,
+    status_filter: Option<&str>,
+    start_ts: Option<i64>,
+    end_ts: Option<i64>,
+) -> Vec<String> {
+    let filters = request_log_filters::build_request_log_filters(
+        query,
+        status_filter,
+        start_ts,
+        end_ts,
+        storage.has_table("accounts").expect("check accounts table"),
+        None,
+        true,
+    );
+    let mut params = filters.params.clone();
+    params.push(Value::Integer(100));
+    params.push(Value::Integer(0));
+    collect_query_plan_details_with_params(
+        storage,
+        &format!(
+            "EXPLAIN QUERY PLAN {}",
+            super::request_log_list_sql(&filters)
+        ),
+        params,
+    )
+}
+
+fn request_log_count_plan_for_query(
+    storage: &Storage,
+    query: Option<&str>,
+    status_filter: Option<&str>,
+    start_ts: Option<i64>,
+    end_ts: Option<i64>,
+) -> Vec<String> {
+    let filters = request_log_filters::build_request_log_filters(
+        query,
+        status_filter,
+        start_ts,
+        end_ts,
+        storage.has_table("accounts").expect("check accounts table"),
+        None,
+        true,
+    );
+    collect_query_plan_details_with_params(
+        storage,
+        &format!(
+            "EXPLAIN QUERY PLAN {}",
+            super::request_log_count_sql(&filters)
+        ),
+        filters.params.clone(),
+    )
 }
 
 /// 函数 `method_exact_query_matches_composite_index`
@@ -47,15 +107,7 @@ fn query_plan_uses_index(details: &[String], index_name: &str) -> bool {
 fn method_exact_query_matches_composite_index() {
     let storage = Storage::open_in_memory().expect("open");
     storage.init().expect("init");
-    let details = collect_query_plan_details(
-        &storage,
-        "EXPLAIN QUERY PLAN
-         SELECT key_id, account_id, request_path, method, model, reasoning_effort, upstream_url, status_code, error, created_at
-         FROM request_logs
-         WHERE method = 'POST'
-         ORDER BY created_at DESC, id DESC
-         LIMIT 100",
-    );
+    let details = request_log_list_plan_for_query(&storage, Some("method:=POST"), None, None, None);
     assert!(query_plan_uses_index(
         &details,
         "idx_request_logs_method_created_at_id"
@@ -77,15 +129,7 @@ fn method_exact_query_matches_composite_index() {
 fn key_exact_query_matches_composite_index() {
     let storage = Storage::open_in_memory().expect("open");
     storage.init().expect("init");
-    let details = collect_query_plan_details(
-        &storage,
-        "EXPLAIN QUERY PLAN
-         SELECT key_id, account_id, request_path, method, model, reasoning_effort, upstream_url, status_code, error, created_at
-         FROM request_logs
-         WHERE key_id = 'gk_1'
-         ORDER BY created_at DESC, id DESC
-         LIMIT 100",
-    );
+    let details = request_log_list_plan_for_query(&storage, Some("key:=gk_1"), None, None, None);
     assert!(query_plan_uses_index(
         &details,
         "idx_request_logs_key_id_created_at_id"
@@ -96,15 +140,7 @@ fn key_exact_query_matches_composite_index() {
 fn model_exact_query_matches_composite_index() {
     let storage = Storage::open_in_memory().expect("open");
     storage.init().expect("init");
-    let details = collect_query_plan_details(
-        &storage,
-        "EXPLAIN QUERY PLAN
-         SELECT key_id, account_id, request_path, method, model, reasoning_effort, upstream_url, status_code, error, created_at
-         FROM request_logs
-         WHERE model = 'gpt-5'
-         ORDER BY created_at DESC, id DESC
-         LIMIT 100",
-    );
+    let details = request_log_list_plan_for_query(&storage, Some("model:=gpt-5"), None, None, None);
     assert!(query_plan_uses_index(
         &details,
         "idx_request_logs_model_created_at_id"
@@ -115,14 +151,12 @@ fn model_exact_query_matches_composite_index() {
 fn route_strategy_exact_query_matches_composite_index() {
     let storage = Storage::open_in_memory().expect("open");
     storage.init().expect("init");
-    let details = collect_query_plan_details(
+    let details = request_log_list_plan_for_query(
         &storage,
-        "EXPLAIN QUERY PLAN
-         SELECT key_id, account_id, request_path, method, model, reasoning_effort, upstream_url, status_code, error, created_at
-         FROM request_logs
-         WHERE route_strategy = 'balanced'
-         ORDER BY created_at DESC, id DESC
-         LIMIT 100",
+        Some("route_strategy:=balanced"),
+        None,
+        None,
+        None,
     );
     assert!(query_plan_uses_index(
         &details,
@@ -134,14 +168,12 @@ fn route_strategy_exact_query_matches_composite_index() {
 fn actual_source_id_exact_query_matches_composite_index() {
     let storage = Storage::open_in_memory().expect("open");
     storage.init().expect("init");
-    let details = collect_query_plan_details(
+    let details = request_log_list_plan_for_query(
         &storage,
-        "EXPLAIN QUERY PLAN
-         SELECT key_id, account_id, request_path, method, model, reasoning_effort, upstream_url, status_code, error, created_at
-         FROM request_logs
-         WHERE actual_source_id = 'acc_1'
-         ORDER BY created_at DESC, id DESC
-         LIMIT 100",
+        Some("actual_source_id:=acc_1"),
+        None,
+        None,
+        None,
     );
     assert!(query_plan_uses_index(
         &details,
@@ -153,15 +185,8 @@ fn actual_source_id_exact_query_matches_composite_index() {
 fn count_query_without_token_search_avoids_token_stats_join() {
     let storage = Storage::open_in_memory().expect("open");
     storage.init().expect("init");
-    let details = collect_query_plan_details(
-        &storage,
-        "EXPLAIN QUERY PLAN
-         SELECT COUNT(1)
-         FROM request_logs r
-         WHERE r.status_code >= 200 AND r.status_code <= 299
-           AND r.created_at >= 1000
-           AND r.created_at < 2000",
-    );
+    let details =
+        request_log_count_plan_for_query(&storage, None, Some("2xx"), Some(1000), Some(2000));
 
     assert!(query_plan_uses_index(
         &details,
@@ -192,14 +217,13 @@ fn request_log_status_count_does_not_join_accounts_when_account_fields_are_unuse
     );
     assert!(!filters.uses_account_lookup);
 
-    let details = collect_query_plan_details(
+    let details = collect_query_plan_details_with_params(
         &storage,
-        "EXPLAIN QUERY PLAN
-         SELECT COUNT(1)
-         FROM request_logs r
-         WHERE r.status_code >= 200 AND r.status_code <= 299
-           AND r.created_at >= 1000
-           AND r.created_at < 2000",
+        &format!(
+            "EXPLAIN QUERY PLAN {}",
+            super::request_log_count_sql(&filters)
+        ),
+        filters.params.clone(),
     );
     assert!(
         !details.iter().any(|detail| detail.contains("accounts")),
@@ -211,21 +235,25 @@ fn request_log_status_count_does_not_join_accounts_when_account_fields_are_unuse
 fn paginated_list_filters_logs_before_joining_token_stats() {
     let storage = Storage::open_in_memory().expect("open");
     storage.init().expect("init");
-    let details = collect_query_plan_details(
+    let filters = request_log_filters::build_request_log_filters(
+        Some("method:=POST"),
+        None,
+        None,
+        None,
+        storage.has_table("accounts").expect("check accounts table"),
+        None,
+        false,
+    );
+    let mut params = filters.params.clone();
+    params.push(Value::Integer(20));
+    params.push(Value::Integer(0));
+    let details = collect_query_plan_details_with_params(
         &storage,
-        "EXPLAIN QUERY PLAN
-         WITH page_ids AS (
-             SELECT r.id
-             FROM request_logs r
-             WHERE r.method = 'POST'
-             ORDER BY r.created_at DESC, r.id DESC
-             LIMIT 20 OFFSET 0
-         )
-         SELECT r.trace_id, t.total_tokens
-         FROM page_ids p
-         JOIN request_logs r ON r.id = p.id
-         LEFT JOIN request_token_stats t ON t.request_log_id = r.id
-         ORDER BY r.created_at DESC, r.id DESC",
+        &format!(
+            "EXPLAIN QUERY PLAN {}",
+            super::request_log_list_sql(&filters)
+        ),
+        params,
     );
 
     assert!(query_plan_uses_index(
@@ -241,15 +269,7 @@ fn paginated_list_filters_logs_before_joining_token_stats() {
 fn global_search_count_keeps_token_stats_join() {
     let storage = Storage::open_in_memory().expect("open");
     storage.init().expect("init");
-    let details = collect_query_plan_details(
-        &storage,
-        "EXPLAIN QUERY PLAN
-         SELECT COUNT(1)
-         FROM request_logs r
-         LEFT JOIN request_token_stats t ON t.request_log_id = r.id
-         WHERE r.request_path LIKE '%42%'
-            OR IFNULL(CAST(t.total_tokens AS TEXT),'') LIKE '%42%'",
-    );
+    let details = request_log_count_plan_for_query(&storage, Some("42"), None, None, None);
 
     assert!(details
         .iter()
@@ -880,6 +900,27 @@ fn request_log_queries_short_circuit_empty_time_ranges() {
             .expect("summarize keyed empty range")
             .count,
         0
+    );
+}
+
+#[test]
+fn request_log_prune_helper_uses_created_at_index() {
+    let storage = Storage::open_in_memory().expect("open");
+    storage.init().expect("init");
+
+    let details = collect_query_plan_details_with_params(
+        &storage,
+        &format!(
+            "EXPLAIN QUERY PLAN {}",
+            super::prune_request_logs_before_sql()
+        ),
+        vec![Value::Integer(1_000)],
+    );
+
+    assert!(
+        query_plan_uses_index(&details, "idx_request_logs_created_at_id")
+            || query_plan_uses_index(&details, "idx_request_logs_created_at"),
+        "request log prune should use a created_at index, got {details:?}"
     );
 }
 

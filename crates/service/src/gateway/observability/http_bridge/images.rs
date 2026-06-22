@@ -1,0 +1,235 @@
+use serde_json::{json, Value};
+
+pub(super) fn mime_type_from_codex_output_format(output_format: Option<&str>) -> &'static str {
+    match output_format
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("webp") => "image/webp",
+        Some("png") | None => "image/png",
+        _ => "image/png",
+    }
+}
+
+fn image_generation_data_url_from_item(item: &Value) -> Option<String> {
+    if item.get("type").and_then(Value::as_str) != Some("image_generation_call") {
+        return None;
+    }
+    let b64 = item
+        .get("result")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    let mime_type =
+        mime_type_from_codex_output_format(item.get("output_format").and_then(Value::as_str));
+    Some(format!("data:{mime_type};base64,{b64}"))
+}
+
+fn image_generation_partial_data_url_from_event(event: &Value) -> Option<String> {
+    if event.get("type").and_then(Value::as_str)
+        != Some("response.image_generation_call.partial_image")
+    {
+        return None;
+    }
+    let b64 = event
+        .get("partial_image_b64")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    let mime_type =
+        mime_type_from_codex_output_format(event.get("output_format").and_then(Value::as_str));
+    Some(format!("data:{mime_type};base64,{b64}"))
+}
+
+pub(super) fn collect_image_generation_data_urls(value: &Value) -> Vec<String> {
+    match value {
+        Value::Array(items) => items
+            .iter()
+            .flat_map(collect_image_generation_data_urls)
+            .collect(),
+        Value::Object(obj) => {
+            let mut images = Vec::new();
+            if let Some(image) = image_generation_data_url_from_item(value) {
+                images.push(image);
+            }
+            if let Some(image) = image_generation_partial_data_url_from_event(value) {
+                images.push(image);
+            }
+            for field in ["response", "output", "item", "output_item"] {
+                if let Some(child) = obj.get(field) {
+                    images.extend(collect_image_generation_data_urls(child));
+                }
+            }
+            images
+        }
+        _ => Vec::new(),
+    }
+}
+
+pub(super) fn chat_image_payload(url: String, index: usize) -> Value {
+    json!({
+        "type": "image_url",
+        "index": index,
+        "image_url": {
+            "url": url
+        }
+    })
+}
+
+pub(super) fn collect_image_generation_chat_images(value: &Value) -> Vec<Value> {
+    collect_image_generation_data_urls(value)
+        .into_iter()
+        .enumerate()
+        .map(|(index, url)| chat_image_payload(url, index))
+        .collect()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ImagesResponseFormat {
+    B64Json,
+    Url,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct ImageGenerationResult {
+    result: String,
+    revised_prompt: Option<String>,
+    output_format: Option<String>,
+    size: Option<String>,
+    background: Option<String>,
+    quality: Option<String>,
+}
+
+fn image_generation_result_from_item(item: &Value) -> Option<ImageGenerationResult> {
+    if item.get("type").and_then(Value::as_str) != Some("image_generation_call") {
+        return None;
+    }
+    let result = item
+        .get("result")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?
+        .to_string();
+    Some(ImageGenerationResult {
+        result,
+        revised_prompt: trimmed_string_field(item, "revised_prompt"),
+        output_format: trimmed_string_field(item, "output_format"),
+        size: trimmed_string_field(item, "size"),
+        background: trimmed_string_field(item, "background"),
+        quality: trimmed_string_field(item, "quality"),
+    })
+}
+
+fn trimmed_string_field(value: &Value, field: &str) -> Option<String> {
+    value
+        .get(field)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+pub(super) fn collect_image_generation_results(value: &Value) -> Vec<ImageGenerationResult> {
+    match value {
+        Value::Array(items) => items
+            .iter()
+            .flat_map(collect_image_generation_results)
+            .collect(),
+        Value::Object(obj) => {
+            let mut results = Vec::new();
+            if let Some(result) = image_generation_result_from_item(value) {
+                results.push(result);
+            }
+            for field in ["response", "output", "item", "output_item"] {
+                if let Some(child) = obj.get(field) {
+                    results.extend(collect_image_generation_results(child));
+                }
+            }
+            results
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn images_created_timestamp(response: &Value) -> i64 {
+    response
+        .get("created_at")
+        .or_else(|| response.get("created"))
+        .and_then(Value::as_i64)
+        .filter(|value| *value > 0)
+        .unwrap_or_else(|| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_secs() as i64)
+                .unwrap_or(0)
+        })
+}
+
+pub(super) fn images_usage_value(response: &Value) -> Option<Value> {
+    response
+        .get("tool_usage")
+        .and_then(|value| value.get("image_gen"))
+        .cloned()
+        .or_else(|| response.get("usage").cloned())
+}
+
+pub(super) fn image_generation_result_payload(
+    result: &ImageGenerationResult,
+    response_format: ImagesResponseFormat,
+) -> Value {
+    let mut item = serde_json::Map::new();
+    match response_format {
+        ImagesResponseFormat::Url => {
+            let mime_type = mime_type_from_codex_output_format(result.output_format.as_deref());
+            item.insert(
+                "url".to_string(),
+                Value::String(format!("data:{mime_type};base64,{}", result.result)),
+            );
+        }
+        ImagesResponseFormat::B64Json => {
+            item.insert("b64_json".to_string(), Value::String(result.result.clone()));
+        }
+    }
+    if let Some(revised_prompt) = result.revised_prompt.as_ref() {
+        item.insert(
+            "revised_prompt".to_string(),
+            Value::String(revised_prompt.clone()),
+        );
+    }
+    Value::Object(item)
+}
+
+pub(super) fn build_images_api_response(
+    response: &Value,
+    response_format: ImagesResponseFormat,
+) -> Value {
+    let results = collect_image_generation_results(response);
+    let mut out = json!({
+        "created": images_created_timestamp(response),
+        "data": results
+            .iter()
+            .map(|result| image_generation_result_payload(result, response_format))
+            .collect::<Vec<_>>()
+    });
+    if let Some(first) = results.first() {
+        if let Some(background) = first.background.as_ref() {
+            out["background"] = Value::String(background.clone());
+        }
+        if let Some(output_format) = first.output_format.as_ref() {
+            out["output_format"] = Value::String(output_format.clone());
+        }
+        if let Some(quality) = first.quality.as_ref() {
+            out["quality"] = Value::String(quality.clone());
+        }
+        if let Some(size) = first.size.as_ref() {
+            out["size"] = Value::String(size.clone());
+        }
+    }
+    if let Some(usage) = images_usage_value(response) {
+        out["usage"] = usage;
+    }
+    out
+}

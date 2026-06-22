@@ -1,4 +1,4 @@
-use super::{ApiKey, Storage};
+use super::{api_key_summaries_for_ids_chunk_sql, api_keys_for_ids_chunk_sql, ApiKey, Storage};
 use crate::storage::ApiKeyOwner;
 
 /// 函数 `make_test_api_key`
@@ -125,15 +125,43 @@ fn api_key_id_chunk_queries_defer_final_ordering_to_rust() {
     let storage = Storage::open_in_memory().expect("open");
     storage.init().expect("init");
 
-    let mut stmt = storage
-        .conn
-        .prepare(
-            "EXPLAIN QUERY PLAN
-             SELECT k.id
-             FROM api_keys k
-             WHERE k.id IN ('key-a', 'key-b')",
-        )
-        .expect("prepare explain");
+    let full_key_plan = collect_query_plan(
+        &storage,
+        &format!(
+            "EXPLAIN QUERY PLAN {}",
+            api_keys_for_ids_chunk_sql("k.id IN ('key-a', 'key-b')")
+        ),
+    );
+    assert!(
+        full_key_plan.contains("sqlite_autoindex_api_keys_1")
+            || full_key_plan.contains("USING INDEX"),
+        "API key chunk query should use key id lookup index, got {full_key_plan}"
+    );
+    assert!(
+        !full_key_plan.contains("USE TEMP B-TREE FOR ORDER BY"),
+        "API key chunk query should avoid per-chunk ORDER BY temp sorting, got {full_key_plan}"
+    );
+
+    let summary_plan = collect_query_plan(
+        &storage,
+        &format!(
+            "EXPLAIN QUERY PLAN {}",
+            api_key_summaries_for_ids_chunk_sql("k.id IN ('key-a', 'key-b')")
+        ),
+    );
+    assert!(
+        summary_plan.contains("sqlite_autoindex_api_keys_1")
+            || summary_plan.contains("USING INDEX"),
+        "API key summary chunk query should use key id lookup index, got {summary_plan}"
+    );
+    assert!(
+        !summary_plan.contains("USE TEMP B-TREE FOR ORDER BY"),
+        "API key summary chunk query should avoid per-chunk ORDER BY temp sorting, got {summary_plan}"
+    );
+}
+
+fn collect_query_plan(storage: &Storage, sql: &str) -> String {
+    let mut stmt = storage.conn.prepare(sql).expect("prepare explain");
     let mut rows = stmt.query([]).expect("query explain");
     let mut plan = String::new();
     while let Some(row) = rows.next().expect("read explain row") {
@@ -141,13 +169,23 @@ fn api_key_id_chunk_queries_defer_final_ordering_to_rust() {
         plan.push_str(&detail);
         plan.push('\n');
     }
-
-    assert!(
-        !plan.contains("USE TEMP B-TREE FOR ORDER BY"),
-        "API key id chunk query should avoid per-chunk ORDER BY temp sorting, got {plan}"
-    );
+    plan
 }
 
+fn collect_query_plan_with_params<P>(storage: &Storage, sql: &str, params: P) -> String
+where
+    P: rusqlite::Params,
+{
+    let mut stmt = storage.conn.prepare(sql).expect("prepare explain");
+    let mut rows = stmt.query(params).expect("query explain");
+    let mut plan = String::new();
+    while let Some(row) = rows.next().expect("read explain row") {
+        let detail: String = row.get(3).expect("plan detail");
+        plan.push_str(&detail);
+        plan.push('\n');
+    }
+    plan
+}
 #[test]
 fn api_key_summaries_read_quota_list_fields() {
     let storage = Storage::open_in_memory().expect("open");
@@ -360,16 +398,10 @@ fn api_key_summaries_for_user_use_owner_lookup_index() {
 
     let mut stmt = storage
         .conn
-        .prepare(
-            "EXPLAIN QUERY PLAN
-             SELECT k.id
-             FROM api_keys k
-             INNER JOIN api_key_owners owner
-                ON owner.key_id = k.id
-               AND owner.owner_kind = 'user'
-               AND owner.owner_user_id = ?1
-             ORDER BY k.created_at DESC, k.id ASC",
-        )
+        .prepare(&format!(
+            "EXPLAIN QUERY PLAN {}",
+            super::api_key_summary_for_user_sql()
+        ))
         .expect("prepare explain");
     let mut rows = stmt.query(["user-1"]).expect("query explain");
     let mut plan = String::new();
@@ -392,12 +424,10 @@ fn api_key_base_lists_use_created_id_order_index() {
 
     let mut stmt = storage
         .conn
-        .prepare(
-            "EXPLAIN QUERY PLAN
-             SELECT k.id
-             FROM api_keys k
-             ORDER BY k.created_at DESC, k.id ASC",
-        )
+        .prepare(&format!(
+            "EXPLAIN QUERY PLAN {}",
+            super::api_key_summary_list_sql()
+        ))
         .expect("prepare explain");
     let mut rows = stmt.query([]).expect("query explain");
     let mut plan = String::new();
@@ -417,6 +447,219 @@ fn api_key_base_lists_use_created_id_order_index() {
     );
 }
 
+#[test]
+fn api_key_specialized_lists_use_created_id_order_index() {
+    let storage = Storage::open_in_memory().expect("open");
+    storage.init().expect("init");
+
+    for sql in [
+        super::api_key_quota_summary_list_sql(),
+        super::api_key_codex_profile_candidate_list_sql(),
+    ] {
+        let plan = collect_query_plan(&storage, &format!("EXPLAIN QUERY PLAN {sql}"));
+        assert!(
+            plan.contains("idx_api_keys_list_order"),
+            "expected API key list order index in plan, got {plan}"
+        );
+        assert!(
+            !plan.contains("USE TEMP B-TREE FOR ORDER BY"),
+            "expected specialized API key list query to avoid a temp sort, got {plan}"
+        );
+    }
+}
+
+#[test]
+fn api_key_lookup_helpers_use_expected_indexes() {
+    let storage = Storage::open_in_memory().expect("open");
+    storage.init().expect("init");
+
+    let by_hash_plan = collect_query_plan_with_params(
+        &storage,
+        &format!("EXPLAIN QUERY PLAN {}", super::api_key_by_hash_sql()),
+        ["hash-0001"],
+    );
+    assert!(
+        by_hash_plan.contains("idx_api_keys_key_hash"),
+        "expected API key hash lookup index in plan, got {by_hash_plan}"
+    );
+
+    let by_id_plan = collect_query_plan_with_params(
+        &storage,
+        &format!("EXPLAIN QUERY PLAN {}", super::api_key_by_id_sql()),
+        ["key-0001"],
+    );
+    assert!(
+        by_id_plan.contains("sqlite_autoindex_api_keys_1"),
+        "expected API key primary-key lookup index in plan, got {by_id_plan}"
+    );
+
+    let status_plan = collect_query_plan_with_params(
+        &storage,
+        &format!("EXPLAIN QUERY PLAN {}", super::api_key_status_by_id_sql()),
+        ["key-0001"],
+    );
+    assert!(
+        status_plan.contains("sqlite_autoindex_api_keys_1"),
+        "expected status lookup to use API key primary key, got {status_plan}"
+    );
+
+    let exists_plan = collect_query_plan_with_params(
+        &storage,
+        &format!("EXPLAIN QUERY PLAN {}", super::api_key_exists_sql()),
+        ["key-0001"],
+    );
+    assert!(
+        exists_plan.contains("sqlite_autoindex_api_keys_1"),
+        "expected exists lookup to use API key primary key, got {exists_plan}"
+    );
+
+    let hash_exists_plan = collect_query_plan_with_params(
+        &storage,
+        &format!("EXPLAIN QUERY PLAN {}", super::api_key_hash_exists_sql()),
+        ["hash-0001"],
+    );
+    assert!(
+        hash_exists_plan.contains("idx_api_keys_key_hash"),
+        "expected hash exists lookup to use hash index, got {hash_exists_plan}"
+    );
+
+    let touch_last_used_plan = collect_query_plan(
+        &storage,
+        &format!(
+            "EXPLAIN QUERY PLAN {}",
+            super::api_key_touch_last_used_by_hash_sql()
+                .replace("?1", "1")
+                .replace("?2", "'hash-0001'")
+        ),
+    );
+    assert!(
+        touch_last_used_plan.contains("idx_api_keys_key_hash"),
+        "expected last-used hash update to use hash index, got {touch_last_used_plan}"
+    );
+
+    let id_update_plans = [
+        (
+            "status update",
+            super::api_key_update_status_by_id_sql()
+                .replace("?1", "'active'")
+                .replace("?2", "'key-0001'"),
+        ),
+        (
+            "rotation config update",
+            super::api_key_update_rotation_config_by_id_sql()
+                .replace("?1", "'account_rotation'")
+                .replace("?2", "NULL")
+                .replace("?3", "NULL")
+                .replace("?4", "'key-0001'"),
+        ),
+        (
+            "name update",
+            super::api_key_update_name_by_id_sql()
+                .replace("?1", "'Key 1'")
+                .replace("?2", "'key-0001'"),
+        ),
+        (
+            "model slug update",
+            super::api_key_update_model_slug_by_id_sql()
+                .replace("?1", "'gpt-5'")
+                .replace("?2", "'key-0001'"),
+        ),
+        (
+            "model config update",
+            super::api_key_update_model_config_by_id_sql()
+                .replace("?1", "'gpt-5'")
+                .replace("?2", "'medium'")
+                .replace("?3", "'key-0001'"),
+        ),
+    ];
+    for (label, sql) in id_update_plans {
+        let plan = collect_query_plan(&storage, &format!("EXPLAIN QUERY PLAN {sql}"));
+        assert!(
+            plan.contains("sqlite_autoindex_api_keys_1"),
+            "expected {label} to use API key primary key, got {plan}"
+        );
+    }
+
+    let secret_plan = collect_query_plan_with_params(
+        &storage,
+        &format!("EXPLAIN QUERY PLAN {}", super::api_key_secret_by_id_sql()),
+        ["key-0001"],
+    );
+    assert!(
+        secret_plan.contains("sqlite_autoindex_api_key_secrets_1"),
+        "expected secret lookup to use secret primary key, got {secret_plan}"
+    );
+
+    let quota_delete_plan = collect_query_plan(
+        &storage,
+        &format!(
+            "EXPLAIN QUERY PLAN {}",
+            super::delete_api_key_quota_limit_by_key_sql().replace("?1", "'key-0001'")
+        ),
+    );
+    assert!(
+        quota_delete_plan.contains("sqlite_autoindex_api_key_quota_limits_1"),
+        "expected quota delete to use quota primary key, got {quota_delete_plan}"
+    );
+
+    let secret_delete_plan = collect_query_plan(
+        &storage,
+        &format!(
+            "EXPLAIN QUERY PLAN {}",
+            super::delete_api_key_secret_by_id_sql().replace("?1", "'key-0001'")
+        ),
+    );
+    assert!(
+        secret_delete_plan.contains("sqlite_autoindex_api_key_secrets_1"),
+        "expected secret delete to use secret primary key, got {secret_delete_plan}"
+    );
+
+    let api_key_delete_plan = collect_query_plan(
+        &storage,
+        &format!(
+            "EXPLAIN QUERY PLAN {}",
+            super::delete_api_key_by_id_sql().replace("?1", "'key-0001'")
+        ),
+    );
+    assert!(
+        api_key_delete_plan.contains("sqlite_autoindex_api_keys_1"),
+        "expected API key delete to use API key primary key, got {api_key_delete_plan}"
+    );
+
+    let gateway_plan = collect_query_plan_with_params(
+        &storage,
+        &format!(
+            "EXPLAIN QUERY PLAN {}",
+            super::api_key_gateway_auth_by_id_sql()
+        ),
+        ["key-0001"],
+    );
+    assert!(
+        gateway_plan.contains("sqlite_autoindex_api_keys_1"),
+        "expected gateway auth lookup to use API key primary key, got {gateway_plan}"
+    );
+    assert!(
+        gateway_plan.contains("sqlite_autoindex_api_key_secrets_1"),
+        "expected gateway auth lookup to use secret primary key, got {gateway_plan}"
+    );
+
+    let profile_plan = collect_query_plan_with_params(
+        &storage,
+        &format!(
+            "EXPLAIN QUERY PLAN {}",
+            super::api_key_profile_config_by_id_sql()
+        ),
+        ["key-0001"],
+    );
+    assert!(
+        profile_plan.contains("sqlite_autoindex_api_keys_1"),
+        "expected profile config lookup to use API key primary key, got {profile_plan}"
+    );
+    assert!(
+        profile_plan.contains("sqlite_autoindex_api_key_profiles_1"),
+        "expected profile config lookup to use profile primary key, got {profile_plan}"
+    );
+}
 #[test]
 fn api_key_exists_helpers_read_minimal_key_state() {
     let storage = Storage::open_in_memory().expect("open");

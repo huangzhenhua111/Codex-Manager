@@ -225,6 +225,137 @@ fn stable_proxy_index_is_deterministic() {
     assert!(idx1.expect("index") < 5);
 }
 
+#[test]
+fn upstream_client_pool_builds_matching_blocking_and_async_clients() {
+    let _guard = crate::test_env_guard();
+    let _global_proxy_guard = EnvGuard::clear(ENV_UPSTREAM_PROXY_URL);
+    let _proxy_list_guard = EnvGuard::set(
+        ENV_PROXY_LIST,
+        "http://pool-a.example:8080,http://pool-b.example:8080",
+    );
+
+    reload_from_env();
+
+    let pool = crate::lock_utils::read_recover(upstream_client_pool_lock(), "test_pool");
+    assert_eq!(pool.proxies.len(), 2);
+    assert_eq!(pool.clients.len(), pool.proxies.len());
+    assert_eq!(pool.async_clients.len(), pool.proxies.len());
+    assert_eq!(pool.retry_clients.len(), pool.proxies.len());
+    assert_eq!(pool.async_retry_clients.len(), pool.proxies.len());
+
+    let account_id = "account-42";
+    assert!(pool.client_for_account(account_id).is_some());
+    assert!(pool.async_client_for_account(account_id).is_some());
+    assert!(pool.retry_client_for_account(account_id).is_some());
+    assert!(pool.async_retry_client_for_account(account_id).is_some());
+    assert_eq!(
+        pool.proxy_for_account(account_id),
+        Some(pool.proxies[stable_proxy_index(account_id, pool.proxies.len()).unwrap()].as_str())
+    );
+}
+
+#[test]
+fn upstream_client_reuses_cached_default_client() {
+    let _guard = crate::test_env_guard();
+    let _proxy_guard = EnvGuard::clear(ENV_UPSTREAM_PROXY_URL);
+    let _proxy_list_guard = EnvGuard::clear(ENV_PROXY_LIST);
+
+    reload_from_env();
+    reset_upstream_client_build_count_for_test();
+
+    let first = upstream_client();
+    let after_first = upstream_client_build_count_for_test();
+    let second = upstream_client();
+
+    assert_eq!(upstream_client_build_count_for_test(), after_first);
+    drop(first);
+    drop(second);
+
+    let fresh = fresh_upstream_client_for_account("account-42");
+    let another_fresh = fresh_upstream_client_for_account("account-42");
+    assert_eq!(upstream_client_build_count_for_test(), after_first);
+    drop(fresh);
+    drop(another_fresh);
+}
+
+#[test]
+fn async_upstream_client_for_account_reuses_cached_default_client() {
+    let _guard = crate::test_env_guard();
+    let _proxy_guard = EnvGuard::clear(ENV_UPSTREAM_PROXY_URL);
+    let _proxy_list_guard = EnvGuard::clear(ENV_PROXY_LIST);
+
+    reload_from_env();
+    reset_async_upstream_client_build_count_for_test();
+
+    let first = async_upstream_client_for_account("account-42");
+    let after_first = async_upstream_client_build_count_for_test();
+    let second = async_upstream_client_for_account("account-42");
+
+    assert_eq!(async_upstream_client_build_count_for_test(), after_first);
+    drop(first);
+    drop(second);
+
+    let fresh = fresh_async_upstream_client_for_account("account-42");
+    let another_fresh = fresh_async_upstream_client_for_account("account-42");
+    assert_eq!(async_upstream_client_build_count_for_test(), after_first);
+    drop(fresh);
+    drop(another_fresh);
+}
+
+#[test]
+fn upstream_client_for_account_reuses_cached_proxy_pool_retry_client() {
+    let _guard = crate::test_env_guard();
+    let _global_proxy_guard = EnvGuard::clear(ENV_UPSTREAM_PROXY_URL);
+    let _proxy_list_guard = EnvGuard::set(
+        ENV_PROXY_LIST,
+        "http://pool-a.example:8080,http://pool-b.example:8080",
+    );
+
+    reload_from_env();
+    reset_upstream_client_build_count_for_test();
+
+    let first = upstream_client_for_account("account-42");
+    let after_first = upstream_client_build_count_for_test();
+    let second = upstream_client_for_account("account-42");
+
+    assert_eq!(upstream_client_build_count_for_test(), after_first);
+    drop(first);
+    drop(second);
+
+    let fresh = fresh_upstream_client_for_account("account-42");
+    let another_fresh = fresh_upstream_client_for_account("account-42");
+    assert_eq!(upstream_client_build_count_for_test(), after_first);
+    drop(fresh);
+    drop(another_fresh);
+}
+
+#[test]
+fn async_upstream_client_for_account_reuses_cached_proxy_pool_client() {
+    let _guard = crate::test_env_guard();
+    let _global_proxy_guard = EnvGuard::clear(ENV_UPSTREAM_PROXY_URL);
+    let _proxy_list_guard = EnvGuard::set(
+        ENV_PROXY_LIST,
+        "http://pool-a.example:8080,http://pool-b.example:8080",
+    );
+
+    reload_from_env();
+    reset_async_upstream_client_build_count_for_test();
+
+    let first = async_upstream_client_for_account("account-42");
+    let after_first = async_upstream_client_build_count_for_test();
+    let second = async_upstream_client_for_account("account-42");
+
+    assert_eq!(async_upstream_client_build_count_for_test(), after_first);
+    drop(first);
+    drop(second);
+
+    let fresh = fresh_async_upstream_client_for_account("account-42");
+    let another_fresh = fresh_async_upstream_client_for_account("account-42");
+    assert_eq!(async_upstream_client_build_count_for_test(), after_first);
+    drop(fresh);
+    drop(another_fresh);
+}
+
 /// 函数 `set_upstream_proxy_url_updates_env_and_cache`
 ///
 /// 作者: gaohongshun

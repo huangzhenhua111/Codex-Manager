@@ -1,5 +1,17 @@
 use super::{Event, Storage};
 
+fn collect_query_plan(storage: &Storage, sql: &str) -> String {
+    let mut stmt = storage.conn.prepare(sql).expect("prepare explain");
+    let mut rows = stmt.query([]).expect("query explain");
+    let mut plan = String::new();
+    while let Some(row) = rows.next().expect("read explain row") {
+        let detail: String = row.get(3).expect("plan detail");
+        plan.push_str(&detail);
+        plan.push('\n');
+    }
+    plan
+}
+
 /// 函数 `latest_account_status_reasons_returns_latest_reason_per_account`
 ///
 /// 作者: gaohongshun
@@ -140,37 +152,14 @@ fn latest_account_status_blocked_ids_defers_final_ordering_to_rust() {
     let storage = Storage::open_in_memory().expect("open");
     storage.init().expect("init");
 
-    let mut stmt = storage
-        .conn
-        .prepare(
-            "EXPLAIN QUERY PLAN
-             WITH ranked AS (
-                SELECT
-                    account_id,
-                    LOWER(TRIM(SUBSTR(message, INSTR(message, ' reason=') + LENGTH(' reason=')))) AS reason,
-                    ROW_NUMBER() OVER (
-                        PARTITION BY account_id
-                        ORDER BY created_at DESC, id DESC
-                    ) AS rn
-                FROM events
-                WHERE type = 'account_status_update'
-                  AND INSTR(message, ' reason=') > 0
-                  AND account_id IN ('acc-a', 'acc-b')
-             )
-             SELECT account_id
-             FROM ranked
-             WHERE rn = 1
-               AND reason IN ('account_deactivated', 'workspace_deactivated')",
-        )
-        .expect("prepare explain");
-    let mut rows = stmt.query([]).expect("query explain");
-    let mut plan = String::new();
-    while let Some(row) = rows.next().expect("read explain row") {
-        let detail: String = row.get(3).expect("plan detail");
-        plan.push_str(&detail);
-        plan.push('\n');
-    }
+    let sql =
+        super::latest_account_status_blocked_ids_chunk_sql("account_id IN ('acc-a', 'acc-b')");
+    let plan = collect_query_plan(&storage, &format!("EXPLAIN QUERY PLAN {sql}"));
 
+    assert!(
+        plan.contains("idx_events_account_status_lookup"),
+        "expected blocked status chunk lookup to use account status index, got {plan}"
+    );
     assert!(
         !plan.contains("USE TEMP B-TREE FOR ORDER BY"),
         "blocked status chunk output should not require an outer per-chunk sort, got {plan}"
@@ -182,20 +171,8 @@ fn latest_account_status_reasons_uses_lookup_index() {
     let storage = Storage::open_in_memory().expect("open");
     storage.init().expect("init");
 
-    let plan = storage
-        .conn
-        .query_row(
-            "EXPLAIN QUERY PLAN
-             SELECT account_id, message
-             FROM events
-             WHERE type = 'account_status_update'
-               AND account_id = ?1
-             ORDER BY created_at DESC, id DESC
-             LIMIT 1",
-            ["acc-index"],
-            |row| row.get::<_, String>(3),
-        )
-        .expect("explain plan");
+    let sql = super::latest_account_status_reasons_chunk_sql("account_id = 'acc-index'");
+    let plan = collect_query_plan(&storage, &format!("EXPLAIN QUERY PLAN {sql}"));
 
     assert!(
         plan.contains("idx_events_account_status_lookup"),
@@ -211,9 +188,10 @@ fn account_event_cleanup_uses_account_cleanup_index() {
     let plan = storage
         .conn
         .query_row(
-            "EXPLAIN QUERY PLAN
-             DELETE FROM events
-             WHERE account_id = ?1",
+            &format!(
+                "EXPLAIN QUERY PLAN {}",
+                super::delete_events_for_account_sql()
+            ),
             ["acc-index"],
             |row| row.get::<_, String>(3),
         )

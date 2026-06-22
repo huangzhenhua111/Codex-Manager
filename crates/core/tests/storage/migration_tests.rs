@@ -23,6 +23,41 @@ fn temp_db_path(name: &str) -> PathBuf {
     std::env::temp_dir().join(format!("codexmanager-{name}-{}-{nanos}.db", process::id()))
 }
 
+#[test]
+fn open_in_memory_configures_temp_store_for_query_workloads() {
+    let storage = Storage::open_in_memory().expect("open in memory");
+
+    let temp_store: i64 = storage
+        .conn
+        .query_row("PRAGMA temp_store", [], |row| row.get(0))
+        .expect("read temp_store pragma");
+
+    assert_eq!(temp_store, 2, "expected temp_store=MEMORY");
+}
+
+#[test]
+fn open_file_configures_wal_and_temp_store() {
+    let path = temp_db_path("connection-config");
+    let storage = Storage::open(&path).expect("open file storage");
+
+    let journal_mode: String = storage
+        .conn
+        .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+        .expect("read journal_mode pragma");
+    let temp_store: i64 = storage
+        .conn
+        .query_row("PRAGMA temp_store", [], |row| row.get(0))
+        .expect("read temp_store pragma");
+
+    assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
+    assert_eq!(temp_store, 2, "expected temp_store=MEMORY");
+
+    drop(storage);
+    let _ = fs::remove_file(&path);
+    let _ = fs::remove_file(path.with_extension("db-wal"));
+    let _ = fs::remove_file(path.with_extension("db-shm"));
+}
+
 /// 函数 `init_tracks_schema_migrations_and_is_idempotent`
 ///
 /// 作者: gaohongshun
